@@ -1,5 +1,10 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  requirements.txt — XAU/USD SMC Trading Bot (FIXED)                    ║
+# ║  Pin major versions for reproducible Docker builds                     ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
 # ── MetaTrader 5 Python bridge ────────────────────────────────────────────────
-# ማሳሰቢያ፡ በሊኑክስ ላይ በቀጥታ ስለማይጫን ለጊዜው ተዘግቷል
+# [span_2](start_span)[span_3](start_span)ማሳሰቢያ፡ MetaTrader5 በሊኑክስ ላይ በቀጥታ ስለማይጫን ለጊዜው ተዘግቷል[span_2](end_span)[span_3](end_span)
 # MetaTrader5>=5.0.45
 
 # ── Data manipulation ─────────────────────────────────────────────────────────
@@ -7,6 +12,7 @@ pandas>=2.0.0
 numpy>=1.24.0
 
 # ── Gemini AI (Free Tier) ─────────────────────────────────────────────────────
+# pip name: google-generativeai
 google-generativeai>=0.7.0
 
 # ── HTTP requests (Telegram Bot API) ─────────────────────────────────────────
