@@ -1,11 +1,5 @@
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  requirements.txt — XAU/USD SMC Trading Bot                            ║
-# ║  Pin major versions for reproducible Docker builds                     ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
 # ── MetaTrader 5 Python bridge ────────────────────────────────────────────────
-# Communicates with the MT5 terminal running under Wine on Linux
-# ማሳሰቢያ፡ MetaTrader5 በሊኑክስ ላይ በቀጥታ ስለማይጫን ለጊዜው ተዘግቷል
+# MetaTrader5 በሊኑክስ ላይ በቀጥታ ስለማይጫን ለጊዜው ተዘግቷል
 # MetaTrader5>=5.0.45
 
 # ── Data manipulation ─────────────────────────────────────────────────────────
@@ -13,13 +7,11 @@ pandas>=2.0.0
 numpy>=1.24.0
 
 # ── Gemini AI (Free Tier) ─────────────────────────────────────────────────────
-# pip name: google-generativeai
-# Get free API key: https://aistudio.google.com/app/apikey
 google-generativeai>=0.7.0
 
 # ── HTTP requests (Telegram Bot API) ─────────────────────────────────────────
 requests>=2.31.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-python-dotenv>=1.0.0       # Optional: load .env file for local development
-pytz>=2024.1               # Timezone handling
+python-dotenv>=1.0.0
+pytz>=2024.1
