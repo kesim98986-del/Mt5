@@ -1,19 +1,20 @@
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  XAU/USD SMC Trading Bot — Dockerfile (FIXED)                          ║
-# ║  Target  : Railway / Koyeb / Render                                     ║
+# ║  XAU/USD SMC Trading Bot — Dockerfile                                   ║
+# ║  Strategy: Install Wine to run the Windows MT5 terminal on Linux        ║
+# ║  Base    : Ubuntu 22.04 (stable Wine support)                           ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 FROM ubuntu:22.04
 
-# Prevent interactive prompts
+# Prevent interactive prompts during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# ── 1. Setup Architecture & Update ──────────────────────────────────────────
-# ይህ መስመር wine32 እንዲጫን የግድ መቅደም አለበት
+# ── የተስተካከለው የቅደም ተከተል ክፍል (Fixed Architecture Setup) ──────────────────
+# በመጀመሪያ i386 አርክቴክቸር መጨመር አለበት፣ ከዚያ update መደረግ አለበት።
 RUN dpkg --add-architecture i386 && apt-get update
 
-# ── 2. Install System Packages ───────────────────────────────────────────────
+# ── System packages ────────────────────────────────────────────────────────────
 RUN apt-get install -y --no-install-recommends \
     wget curl gnupg software-properties-common ca-certificates \
     python3.11 python3.11-venv python3-pip \
@@ -23,45 +24,64 @@ RUN apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── 3. Python Setup ──────────────────────────────────────────────────────────
+# ── Python symlink ─────────────────────────────────────────────────────────────
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
+# ── Wine environment ───────────────────────────────────────────────────────────
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV DISPLAY=:99
 
+# ── Create working directory ───────────────────────────────────────────────────
 WORKDIR /app
 
-# ── 4. Dependencies ──────────────────────────────────────────────────────────
+# ── Copy requirements first (layer caching) ───────────────────────────────────
 COPY requirements.txt .
+
+# ── Install Python dependencies ────────────────────────────────────────────────
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# ── 5. MT5 Setup ─────────────────────────────────────────────────────────────
+# ── Download MT5 Windows terminal installer ────────────────────────────────────
 RUN wget -q "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" \
          -O /tmp/mt5setup.exe
 
-# Initialize Wine and Install MT5
+# ── Initialize Wine prefix ────────────────────────────────────────────────────
 RUN Xvfb :99 -screen 0 1024x768x16 & \
-    sleep 5 && \
+    sleep 3 && \
     winecfg /v win10 && \
     wineboot --init && \
     winetricks -q vcrun2019 && \
-    wine /tmp/mt5setup.exe /auto && \
-    sleep 15
+    winetricks -q dotnet48 && \
+    echo "Wine initialized"
 
-# ── 6. App Files ─────────────────────────────────────────────────────────────
+# ── Install MT5 silently under Wine ───────────────────────────────────────────
+RUN Xvfb :99 -screen 0 1024x768x16 & \
+    sleep 3 && \
+    wine /tmp/mt5setup.exe /auto && \
+    sleep 10 && \
+    echo "MT5 installed"
+
+# ── Copy application code ──────────────────────────────────────────────────────
 COPY main.py .
 COPY entrypoint.sh .
+
 RUN chmod +x entrypoint.sh
 
-# ── 7. Runtime Config ────────────────────────────────────────────────────────
+# ── Health check ───────────────────────────────────────────────────────────────
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD pgrep -f "main.py" > /dev/null || exit 1
+
+# ── Environment variable placeholders ──────────────────────────────────────────
 ENV MT5_LOGIN=""
 ENV MT5_PASSWORD=""
 ENV MT5_SERVER=""
 ENV GEMINI_API_KEY=""
 ENV TELEGRAM_BOT_TOKEN=""
+ENV TELEGRAM_CHAT_ID=""
 
 EXPOSE 8080
+
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
 ENTRYPOINT ["./entrypoint.sh"]
