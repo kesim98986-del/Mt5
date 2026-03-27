@@ -1,0 +1,47 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  docker-compose.yml — Local development & testing                      ║
+# ║  Usage: docker-compose up --build                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+version: "3.9"
+
+services:
+  xauusd-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xauusd_smc_bot
+
+    # ── Load secrets from .env file (never commit .env to git) ──────────────
+    env_file:
+      - .env
+
+    # ── Or set inline (override .env values) ──────────────────────────────────
+    environment:
+      - TZ=UTC
+      - DISPLAY=:99
+
+    # ── Persist logs across container restarts ────────────────────────────────
+    volumes:
+      - ./logs:/app/logs
+
+    # ── Health endpoint ────────────────────────────────────────────────────────
+    ports:
+      - "8080:8080"
+
+    # ── Restart policy: always restart on crash ────────────────────────────────
+    restart: unless-stopped
+
+    # ── Resource limits (free tier safe) ──────────────────────────────────────
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+
+    # ── Logging ────────────────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
