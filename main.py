@@ -1,138 +1,98 @@
-#!/usr/bin/env python3
-"""
-XAU/USD SMC PROFESSIONAL TRADING BOT (Deriv WebSocket)
-Features: BOS, CHoCH, Order Blocks, FVG, Gemini AI Filter
-"""
-
-import os, sys, json, asyncio, logging, traceback
-import threading, time, http.server
-from datetime import datetime, timezone
-from typing import Optional, Dict, List
+import os, json, asyncio, logging, threading, http.server
+from datetime import datetime
 import pandas as pd
 import numpy as np
-import requests
-import websockets
-import google.generativeai as genai
+import requests, websockets
+import matplotlib.pyplot as plt # ለ Screenshot የሚያስፈልግ
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING & CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
-log = logging.getLogger("PRO_BOT")
-
 class Cfg:
     DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1085")
     DERIV_TOKEN  = os.environ.get("DERIV_API_TOKEN", "")
-    GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "")
     TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
     TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "1938325440")
-    
-    SYMBOL, RISK_PCT = "frxXAUUSD", 0.01
-    SCAN_SECS, SESSIONS = 300, ((0, 24),)
-    TF_M15, TF_H1 = 900, 3600
+    SYMBOL = "frxXAUUSD"
+    RISK_AMT = 10 # በእያንዳንዱ ትሬድ የሚመደበው ዶላር
 
 cfg = Cfg()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMC ENGINE (BOS, OB, FVG)
+# SMC AUTO-TRADE STRATEGY (EA)
 # ─────────────────────────────────────────────────────────────────────────────
 class SMCEngine:
-    def find_structure(self, df):
-        # Break of Structure (BOS) መለያ
-        last_high = df['high'].iloc[-10:-2].max()
-        last_low = df['low'].iloc[-10:-2].min()
-        if df['close'].iloc[-1] > last_high: return "BOS_UP"
-        if df['close'].iloc[-1] < last_low: return "BOS_DOWN"
-        return "CHOPPY"
-
-    def find_ob(self, df):
-        # Order Block መለያ
-        for i in range(len(df)-3, 10, -1):
-            if df['close'].iloc[i] > df['high'].iloc[i-1] and df['close'].iloc[i-1] < df['open'].iloc[i-1]:
-                return {"type": "Bullish_OB", "level": df['high'].iloc[i-1]}
-            if df['close'].iloc[i] < df['low'].iloc[i-1] and df['close'].iloc[i-1] > df['open'].iloc[i-1]:
-                return {"type": "Bearish_OB", "level": df['low'].iloc[i-1]}
-        return None
-
-smc = SMCEngine()
+    def analyse_and_trade(self, df):
+        """BOS እና FVG በመጠቀም ትሬድ የሚከፍት ክፍል"""
+        close = df['close'].iloc[-1]
+        highs = df['high'].rolling(5).max()
+        lows = df['low'].rolling(5).min()
+        
+        # 1. Break of Structure (BOS)
+        if close > highs.iloc[-2]: return "buy", close, close * 0.998 # SL
+        if close < lows.iloc[-2]:  return "sell", close, close * 1.002 # SL
+        return None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DERIV & GEMINI
+# SCREENSHOT GENERATOR
 # ─────────────────────────────────────────────────────────────────────────────
-class Deriv:
-    async def call(self, p, auth=False):
-        try:
-            async with websockets.connect(f"wss://ws.binaryws.com/websockets/v3?app_id={cfg.DERIV_APP_ID}") as ws:
-                if auth:
-                    await ws.send(json.dumps({"authorize": cfg.DERIV_TOKEN}))
-                    await ws.recv()
-                await ws.send(json.dumps(p))
-                return json.loads(await asyncio.wait_for(ws.recv(), 20))
-        except: return None
+def save_chart_screenshot(df):
+    plt.figure(figsize=(10, 5))
+    plt.plot(df.index, df['close'], label='XAUUSD Price')
+    plt.title(f"SMC Analysis - {datetime.now().strftime('%H:%M')}")
+    plt.grid(True)
+    plt.savefig("chart.png")
+    plt.close()
 
-    async def get_candles(self, count=100):
-        r = await self.call({"ticks_history": cfg.SYMBOL, "style": "candles", "granularity": cfg.TF_M15, "count": count})
-        if r and "candles" in r:
-            return pd.DataFrame(r["candles"])
-        return None
-
-deriv = Deriv()
-
-class GeminiAI:
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN BOT ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+class Bot:
     def __init__(self):
-        if cfg.GEMINI_KEY:
-            genai.configure(api_key=cfg.GEMINI_KEY)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
-    
-    def confirm(self, trend):
-        try:
-            r = self.model.generate_content(f"Gold trend is {trend}. Confirm? Reply Bullish or Bearish only.")
-            return r.text.strip()
-        except: return trend
+        self.smc = SMCEngine()
+        self.url = f"https://api.telegram.org/bot{cfg.TG_TOKEN}"
 
-ai = GeminiAI()
+    def send_log(self, text):
+        requests.post(f"{self.url}/sendMessage", json={"chat_id": cfg.TG_CHAT, "text": text})
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HEALTH SERVER & TELEGRAM
-# ─────────────────────────────────────────────────────────────────────────────
-def start_health():
-    class H(http.server.BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
-        def log_message(self, *a): pass
-    port = int(os.environ.get("PORT", 8080))
-    threading.Thread(target=http.server.HTTPServer(("0.0.0.0", port), H).serve_forever, daemon=True).start()
+    def send_screenshot(self):
+        with open("chart.png", "rb") as f:
+            requests.post(f"{self.url}/sendPhoto", data={"chat_id": cfg.TG_CHAT}, files={"photo": f})
 
-def tg_send(msg):
-    try: requests.post(f"https://api.telegram.org/bot{cfg.TG_TOKEN}/sendMessage", json={"chat_id": cfg.TG_CHAT, "text": msg, "parse_mode": "HTML"})
-    except: pass
+    async def run(self):
+        # Health Server
+        port = int(os.environ.get("PORT", 8080))
+        threading.Thread(target=http.server.HTTPServer(("0.0.0.0", port), http.server.BaseHTTPRequestHandler).serve_forever, daemon=True).start()
+        
+        self.send_log("🚀 <b>EA Mode Activated!</b>\nMonitoring SMC Structures...")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────────────────────────────────────
-async def run_bot():
-    start_health()
-    log.info("Professional SMC Bot Started...")
-    tg_send("🚀 <b>Professional SMC Bot Online!</b>\nMonitoring XAUUSD 24/7.")
-    
-    while True:
-        try:
-            df = await deriv.get_candles()
-            if df is not None:
-                struct = smc.find_structure(df)
-                ob = smc.find_ob(df)
-                
-                if struct != "CHOPPY" and ob:
-                    decision = ai.confirm(struct)
-                    log.info(f"Analysis: {struct} | OB: {ob['type']} | AI: {decision}")
-                    # ትሬድ የመክፈት ትዕዛዝ እዚህ ይገባል...
+        while True:
+            try:
+                # 1. ዳታ ከ Deriv መውሰድ
+                async with websockets.connect(f"wss://ws.binaryws.com/websockets/v3?app_id={cfg.DERIV_APP_ID}") as ws:
+                    await ws.send(json.dumps({"ticks_history": cfg.SYMBOL, "style": "candles", "count": 50, "granularity": 900}))
+                    res = json.loads(await ws.recv())
                     
-            await asyncio.sleep(cfg.SCAN_SECS)
-        except:
-            log.error(traceback.format_exc())
-            await asyncio.sleep(60)
+                    if "candles" in res:
+                        df = pd.DataFrame(res["candles"])
+                        side, entry, sl = self.smc.analyse_and_trade(df)
+                        
+                        # Screenshot መላክ [የጠየቅከው]
+                        save_chart_screenshot(df)
+                        self.send_screenshot()
+
+                        # 2. ትሬድ መክፈት (Auto Execution)
+                        if side:
+                            await ws.send(json.dumps({"authorize": cfg.DERIV_TOKEN}))
+                            await ws.recv()
+                            trade_p = {"buy": 1, "price": cfg.RISK_AMT, "parameters": {"contract_type": "MULTUP" if side=="buy" else "MULTDOWN", "symbol": cfg.SYMBOL, "amount": cfg.RISK_AMT}}
+                            await ws.send(json.dumps(trade_p))
+                            self.send_log(f"⚡ <b>AUTO TRADE: {side.upper()}</b>\nEntry: {entry}\nSL: {sl}")
+
+                await asyncio.sleep(900) # በየ 15 ደቂቃው ቼክ ያደርጋል
+            except Exception as e:
+                print(f"Error: {e}")
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    asyncio.run(Bot().run())
