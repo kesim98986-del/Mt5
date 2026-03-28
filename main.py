@@ -990,27 +990,51 @@ async def get_account_info():
 
 
 async def subscribe_pair(symbol: str):
-    """Subscribe H1/M15/M5 for the given Deriv symbol."""
+    """Subscribe H1/M15/M5 and immediately load historical candles."""
     state.h1_candles.clear()
     state.m15_candles.clear()
     state.m5_candles.clear()
-    state.last_signal  = None
-    state.active_ob    = None
-    state.active_fvg   = None
-    state.active_trap  = None
-    state.active_idm   = None
+    state.last_signal   = None
+    state.active_ob     = None
+    state.active_fvg    = None
+    state.active_trap   = None
+    state.active_idm    = None
     state.current_price = 0.0
     state.trend_bias    = "NEUTRAL"
     state.ob_score      = 0
 
+    gran_map = {3600: "H1", 900: "M15", 300: "M5"}
     for gran in (3600, 900, 300):
-        await send_request({
-            "ticks_history": symbol, "end": "latest",
-            "count": 200, "granularity": gran,
-            "style": "candles", "subscribe": 1,
-        })
+        try:
+            resp = await send_request({
+                "ticks_history": symbol, "end": "latest",
+                "count": 200, "granularity": gran,
+                "style": "candles", "subscribe": 1,
+            })
+            # The bulk candles response carries req_id so handle_message routes
+            # it to the pending_requests future — we get it back here directly.
+            # Unpack the candles NOW so buffers are filled immediately.
+            candles_raw = resp.get("candles", [])
+            if candles_raw:
+                rows = [
+                    (int(c["epoch"]), float(c["open"]), float(c["high"]),
+                     float(c["low"]),  float(c["close"]))
+                    for c in candles_raw
+                ]
+                _update_candles(gran, rows)
+                log.info(f"Loaded {len(rows)} {gran_map[gran]} candles for {symbol}")
+            else:
+                log.warning(f"No candles in response gran={gran}: {list(resp.keys())}")
+        except Exception as e:
+            log.error(f"subscribe_pair gran={gran}: {e}")
+
     state.subscribed_pair = symbol
-    log.info(f"Subscribed → {symbol}")
+    log.info(
+        f"Subscribed {symbol} | "
+        f"H1:{len(state.h1_candles)} "
+        f"M15:{len(state.m15_candles)} "
+        f"M5:{len(state.m5_candles)}"
+    )
 
 
 async def open_contract(direction: str, amount: float):
@@ -1099,7 +1123,8 @@ async def handle_message(msg: dict):
     mtype = msg.get("msg_type", "")
 
     if mtype == "ohlc":
-        gran = msg["ohlc"].get("granularity", 0)
+        # granularity may arrive as int or string — normalize to int
+        gran = int(msg["ohlc"].get("granularity", 0))
         c    = msg["ohlc"]
         _update_candles(gran, [(
             int(c["epoch"]), float(c["open"]), float(c["high"]),
@@ -1107,12 +1132,14 @@ async def handle_message(msg: dict):
         )])
 
     elif mtype == "candles":
-        gran = msg.get("echo_req",{}).get("granularity",0)
+        # This branch handles unsolicited candle pushes (no req_id)
+        gran = int(msg.get("echo_req", {}).get("granularity", 0))
         rows = [(int(c["epoch"]), float(c["open"]), float(c["high"]),
                  float(c["low"]), float(c["close"]))
-                for c in msg.get("candles",[])]
+                for c in msg.get("candles", [])]
         if rows:
             _update_candles(gran, rows)
+            log.debug(f"candles msg: gran={gran} rows={len(rows)}")
 
     elif mtype == "tick":
         state.current_price = float(msg["tick"]["quote"])
@@ -1385,6 +1412,7 @@ async def _cmd(cmd: str):
 
     # ── Chart ──
     elif cmd in ("/chart","cmd_chart"):
+        m15_count = len(state.m15_candles)
         path = generate_chart(state.m15_candles, "M15", chart_type="live")
         if path:
             pd_e = "🟢" if state.premium_discount=="DISCOUNT" \
@@ -1396,11 +1424,28 @@ async def _cmd(cmd: str):
                 f"Zone: {pd_e}`{state.premium_discount}`  "
                 f"OB Score: `{state.ob_score}/100`\n"
                 f"IDM swept: {'✅' if state.active_idm and state.active_idm.get('swept') else '⏳'}\n"
-                f"Trap swept: {'✅' if state.active_trap and state.active_trap.get('swept') else '⏳'}",
+                f"Trap swept: {'✅' if state.active_trap and state.active_trap.get('swept') else '⏳'}\n"
+                f"Bars loaded: `H1:{len(state.h1_candles)} M15:{m15_count} M5:{len(state.m5_candles)}`",
                 photo_path=path, reply_markup=kb_main()
             )
+        elif m15_count == 0:
+            await tg_async(
+                f"⚠️ *No candle data received yet.*\n\n"
+                f"H1: `{len(state.h1_candles)}` bars\n"
+                f"M15: `{m15_count}` bars\n"
+                f"M5: `{len(state.m5_candles)}` bars\n"
+                f"Price: `{state.current_price}`\n\n"
+                f"WS connected: `{'Yes' if state.ws else 'No'}`\n"
+                f"Subscribed: `{state.subscribed_pair or 'None'}`\n\n"
+                f"Please wait 10–20 seconds after startup, then try again.",
+                reply_markup=kb_main()
+            )
         else:
-            await tg_async("⚠️ Not enough data yet.", reply_markup=kb_main())
+            await tg_async(
+                f"⚠️ Only `{m15_count}` M15 bars loaded (need 20+).\n"
+                f"Wait a moment and try again.",
+                reply_markup=kb_main()
+            )
 
     # ── History ──
     elif cmd in ("/history","cmd_history"):
