@@ -1,17 +1,6 @@
-# ── MetaTrader 5 Python bridge ────────────────────────────────────────────────
-# MetaTrader5 በሊኑክስ ላይ በቀጥታ ስለማይጫን ለጊዜው ተዘግቷል
-# MetaTrader5>=5.0.45
-
-# ── Data manipulation ─────────────────────────────────────────────────────────
+websockets>=12.0
+google-generativeai>=0.7.0
 pandas>=2.0.0
 numpy>=1.24.0
-
-# ── Gemini AI (Free Tier) ─────────────────────────────────────────────────────
-google-generativeai>=0.7.0
-
-# ── HTTP requests (Telegram Bot API) ─────────────────────────────────────────
 requests>=2.31.0
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
-pytz>=2024.1
