@@ -1,6 +1,7 @@
 """
 XAU/USD Smart Money Concepts EA — Deriv WebSocket API
 Production-Grade | SMC + HFT | Railway-Compatible
+Upgrades: Telegram conflict fix, real-time chart loop, trade history screenshots
 """
 
 import asyncio
@@ -11,7 +12,6 @@ import time
 import traceback
 from collections import deque
 from datetime import datetime, timezone
-from io import BytesIO
 from typing import Optional
 
 import matplotlib
@@ -25,7 +25,7 @@ import websockets
 from aiohttp import web
 
 # ─────────────────────────────────────────────
-# CONFIG — all from environment variables
+# CONFIG
 # ─────────────────────────────────────────────
 DERIV_APP_ID       = os.getenv("DERIV_APP_ID", "1089")
 DERIV_API_TOKEN    = os.getenv("DERIV_API_TOKEN", "")
@@ -33,15 +33,15 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8080"))
 SYMBOL             = os.getenv("SYMBOL", "frxXAUUSD")
-RISK_PCT           = float(os.getenv("RISK_PCT", "0.01"))          # 1%
+RISK_PCT           = float(os.getenv("RISK_PCT", "0.01"))
 TP1_R              = float(os.getenv("TP1_R", "2"))
 TP2_R              = float(os.getenv("TP2_R", "4"))
 TP3_R              = float(os.getenv("TP3_R", "6"))
 SWING_LOOKBACK     = int(os.getenv("SWING_LOOKBACK", "5"))
-DERIV_WS_URL       = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 OB_LOOKBACK        = int(os.getenv("OB_LOOKBACK", "20"))
-FVG_THRESHOLD      = float(os.getenv("FVG_THRESHOLD", "0.05"))     # % gap
-TRADE_DURATION     = int(os.getenv("TRADE_DURATION", "3600"))      # seconds
+FVG_THRESHOLD      = float(os.getenv("FVG_THRESHOLD", "0.05"))
+CHART_INTERVAL     = int(os.getenv("CHART_INTERVAL", "300"))   # auto-chart every 5 min
+DERIV_WS_URL       = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,48 +59,57 @@ class BotState:
         self.paused           = False
         self.account_balance  = 0.0
         self.account_currency = "USD"
-        self.open_contracts   = {}          # contract_id → info dict
+        self.open_contracts   = {}
         self.h1_candles       = deque(maxlen=200)
         self.m15_candles      = deque(maxlen=200)
         self.m5_candles       = deque(maxlen=200)
         self.current_price    = 0.0
-        self.trend_bias       = "NEUTRAL"   # BULLISH / BEARISH / NEUTRAL
-        self.last_signal      = None        # dict with signal details
+        self.trend_bias       = "NEUTRAL"
+        self.last_signal      = None
         self.ws               : Optional[websockets.WebSocketClientProtocol] = None
         self.req_id           = 1
-        self.pending_requests = {}          # req_id → asyncio.Future
-        self.active_ob        = None        # last identified OB
+        self.pending_requests = {}
+        self.active_ob        = None
         self.active_fvg       = None
         self.active_trap      = None
         self.trade_count      = 0
         self.wins             = 0
         self.losses           = 0
+        self.total_pnl        = 0.0
+        # Trade history: list of dicts
+        self.trade_history    = []   # max 50 entries
 
 state = BotState()
 
-
 # ─────────────────────────────────────────────
-# TELEGRAM HELPERS
+# INLINE KEYBOARD
 # ─────────────────────────────────────────────
 INLINE_KB = {
     "inline_keyboard": [
         [
-            {"text": "💰 Check Balance",  "callback_data": "cmd_balance"},
-            {"text": "📊 Get Chart",       "callback_data": "cmd_chart"},
+            {"text": "💰 Balance",      "callback_data": "cmd_balance"},
+            {"text": "📊 Chart",         "callback_data": "cmd_chart"},
         ],
         [
-            {"text": "⚡ Bot Status",       "callback_data": "cmd_status"},
-            {"text": "🛑 Emergency Stop",   "callback_data": "cmd_stop"},
+            {"text": "⚡ Status",        "callback_data": "cmd_status"},
+            {"text": "📋 History",       "callback_data": "cmd_history"},
+        ],
+        [
+            {"text": "🛑 Emergency Stop","callback_data": "cmd_stop"},
+            {"text": "▶️ Resume",        "callback_data": "cmd_resume"},
         ],
     ]
 }
 
-
+# ─────────────────────────────────────────────
+# TELEGRAM HELPERS
+# ─────────────────────────────────────────────
 def tg_send(text: str, photo_path: str = None, reply_markup=None):
-    """Fire-and-forget Telegram message (sync, runs in executor)."""
+    """Sync Telegram sender — always run via run_in_executor."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    markup = reply_markup if reply_markup is not None else INLINE_KB
     try:
         if photo_path:
             with open(photo_path, "rb") as f:
@@ -109,11 +118,11 @@ def tg_send(text: str, photo_path: str = None, reply_markup=None):
                     data={
                         "chat_id": TELEGRAM_CHAT_ID,
                         "caption": text[:1024],
-                        "reply_markup": json.dumps(reply_markup or INLINE_KB),
+                        "reply_markup": json.dumps(markup),
                         "parse_mode": "Markdown",
                     },
                     files={"photo": f},
-                    timeout=15,
+                    timeout=20,
                 )
         else:
             r = requests.post(
@@ -121,19 +130,18 @@ def tg_send(text: str, photo_path: str = None, reply_markup=None):
                 json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": text,
-                    "reply_markup": reply_markup or INLINE_KB,
+                    "reply_markup": markup,
                     "parse_mode": "Markdown",
                 },
                 timeout=10,
             )
-        if r.status_code != 200:
-            log.warning(f"Telegram error: {r.text}")
+        if r.status_code not in (200, 201):
+            log.warning(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+        log.error(f"tg_send failed: {type(e).__name__}: {e}")
 
 
 def tg_answer_callback(callback_query_id: str, text: str = ""):
-    """Answer a callback query to remove the spinner on the button."""
     if not TELEGRAM_TOKEN:
         return
     try:
@@ -147,24 +155,28 @@ def tg_answer_callback(callback_query_id: str, text: str = ""):
 
 
 async def tg_send_async(text: str, photo_path: str = None, reply_markup=None):
-    """Non-blocking async wrapper for tg_send — safe to call from async code."""
+    """Non-blocking async wrapper — safe anywhere in async code."""
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None, lambda: tg_send(text, photo_path, reply_markup)
-    )
+    await loop.run_in_executor(None, lambda: tg_send(text, photo_path, reply_markup))
 
 
 # ─────────────────────────────────────────────
-# CHART GENERATION
+# CHART GENERATION  (enhanced with history panel)
 # ─────────────────────────────────────────────
-def generate_chart(candles: deque, timeframe="M15") -> str:
-    """Generate and save chart.png with OBs, FVGs, traps, and entry lines."""
+def generate_chart(candles: deque, timeframe: str = "M15",
+                   entry_price: float = None, exit_price: float = None,
+                   direction: str = None, pnl: float = None,
+                   chart_type: str = "live") -> Optional[str]:
+    """
+    chart_type: 'live' | 'entry' | 'exit'
+    Returns path to saved PNG or None.
+    """
     if len(candles) < 20:
         return None
 
     df = pd.DataFrame(list(candles)[-80:])
     df.columns = ["time", "open", "high", "low", "close"]
-    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df.reset_index(drop=True, inplace=True)
 
     fig, ax = plt.subplots(figsize=(16, 8), facecolor="#0d1117")
     ax.set_facecolor("#0d1117")
@@ -183,77 +195,157 @@ def generate_chart(candles: deque, timeframe="M15") -> str:
     # ── Order Block ──
     if state.active_ob:
         ob = state.active_ob
-        color = "#00bcd4" if ob["type"] == "BULL" else "#ff9800"
-        idx_start = max(0, len(df) - 30)
-        ax.axhspan(ob["low"], ob["high"], xmin=idx_start / len(df),
-                   alpha=0.18, color=color, label=f"{ob['type']} OB")
-        ax.axhline(ob["high"], color=color, linestyle="--", linewidth=0.7, alpha=0.6)
-        ax.axhline(ob["low"],  color=color, linestyle="--", linewidth=0.7, alpha=0.6)
-        ax.text(2, ob["high"], f" {ob['type']} OB", color=color, fontsize=7,
-                va="bottom", fontfamily="monospace")
+        ob_color = "#00bcd4" if ob["type"] == "BULL" else "#ff9800"
+        idx_s = max(0, len(df) - 30)
+        ax.axhspan(ob["low"], ob["high"], xmin=idx_s / len(df),
+                   alpha=0.18, color=ob_color, label=f"{ob['type']} OB")
+        ax.axhline(ob["high"], color=ob_color, linestyle="--", linewidth=0.7, alpha=0.7)
+        ax.axhline(ob["low"],  color=ob_color, linestyle="--", linewidth=0.7, alpha=0.7)
+        ax.text(1, ob["high"], f"  {ob['type']} OB", color=ob_color,
+                fontsize=7, va="bottom", fontfamily="monospace")
 
     # ── FVG ──
     if state.active_fvg:
         fvg = state.active_fvg
-        ax.axhspan(fvg["low"], fvg["high"], alpha=0.12, color="#e040fb",
-                   label="FVG / Imbalance")
-        ax.text(2, fvg["high"], " FVG", color="#e040fb", fontsize=7,
-                va="bottom", fontfamily="monospace")
-
-    # ── Trap ──
-    if state.active_trap:
-        trap = state.active_trap
-        ax.axhline(trap["level"], color="#ffeb3b", linestyle=":", linewidth=1.2,
-                   alpha=0.9, label="Liquidity Trap")
-        ax.text(2, trap["level"], f" TRAP {trap['side']}", color="#ffeb3b",
+        ax.axhspan(fvg["low"], fvg["high"], alpha=0.13, color="#e040fb",
+                   label="FVG Imbalance")
+        ax.text(1, fvg["high"], "  FVG", color="#e040fb",
                 fontsize=7, va="bottom", fontfamily="monospace")
 
-    # ── Signal ──
+    # ── Liquidity Trap ──
+    if state.active_trap:
+        trap = state.active_trap
+        ax.axhline(trap["level"], color="#ffeb3b", linestyle=":",
+                   linewidth=1.3, alpha=0.9, label="Liq. Trap")
+        ax.text(1, trap["level"], f"  TRAP {trap['side']}", color="#ffeb3b",
+                fontsize=7, va="bottom", fontfamily="monospace")
+
+    # ── Active Signal Lines ──
     if state.last_signal:
         sig = state.last_signal
-        entry_color = "#00e676" if sig["direction"] == "BUY" else "#ff1744"
-        ax.axhline(sig["entry"], color=entry_color, linewidth=1.4,
-                   linestyle="-", label=f"Entry ({sig['direction']})")
-        ax.axhline(sig["sl"],    color="#f44336", linewidth=0.9,
-                   linestyle="--", label="Stop Loss")
-        for tp_key, tp_color in [("tp1", "#69f0ae"), ("tp2", "#40c4ff"), ("tp3", "#b388ff")]:
-            if tp_key in sig:
-                ax.axhline(sig[tp_key], color=tp_color, linewidth=0.8,
-                           linestyle="-.", label=tp_key.upper())
+        e_color = "#00e676" if sig["direction"] == "BUY" else "#ff1744"
+        ax.axhline(sig["entry"], color=e_color, linewidth=1.5,
+                   linestyle="-", label=f"Entry {sig['direction']}")
+        ax.axhline(sig["sl"],    color="#f44336", linewidth=1.0,
+                   linestyle="--", label="SL")
+        for tp_k, tp_c in [("tp1","#69f0ae"),("tp2","#40c4ff"),("tp3","#b388ff")]:
+            if tp_k in sig:
+                ax.axhline(sig[tp_k], color=tp_c, linewidth=0.8,
+                           linestyle="-.", label=tp_k.upper())
 
-    # ── Swing H/L ──
-    highs, lows = detect_swing_points(df)
-    for idx in highs:
-        ax.plot(idx, df.iloc[idx]["high"] * 1.0002, "^", color="#00e676",
-                markersize=5, alpha=0.7)
-    for idx in lows:
-        ax.plot(idx, df.iloc[idx]["low"] * 0.9998, "v", color="#ff1744",
-                markersize=5, alpha=0.7)
+    # ── Entry/Exit overlay for trade screenshots ──
+    if entry_price:
+        e_col = "#00e676" if direction == "BUY" else "#ff1744"
+        ax.axhline(entry_price, color=e_col, linewidth=2.0,
+                   linestyle="-", alpha=0.9, label=f"ENTRY {direction}")
+        ax.annotate(f" ▶ ENTRY {entry_price:.2f}",
+                    xy=(len(df)-1, entry_price), color=e_col,
+                    fontsize=8, fontfamily="monospace",
+                    xytext=(len(df)-10, entry_price))
 
-    # ── Trend label ──
-    trend_clr = {"BULLISH": "#00e676", "BEARISH": "#ff1744", "NEUTRAL": "#90a4ae"}
-    bias_color = trend_clr.get(state.trend_bias, "#90a4ae")
+    if exit_price:
+        ex_col = "#00e676" if (pnl and pnl > 0) else "#ff1744"
+        ax.axhline(exit_price, color=ex_col, linewidth=2.0,
+                   linestyle="--", alpha=0.9, label=f"EXIT")
+        pnl_str = f"+{pnl:.2f}" if pnl and pnl > 0 else f"{pnl:.2f}"
+        ax.annotate(f" ◀ EXIT {exit_price:.2f}  P&L: {pnl_str}",
+                    xy=(len(df)-1, exit_price), color=ex_col,
+                    fontsize=8, fontfamily="monospace",
+                    xytext=(len(df)-18, exit_price))
+
+    # ── Swing markers ──
+    swh, swl = detect_swing_points(df)
+    for idx in swh:
+        ax.plot(idx, df.iloc[idx]["high"] * 1.0002, "^",
+                color="#00e676", markersize=4, alpha=0.6)
+    for idx in swl:
+        ax.plot(idx, df.iloc[idx]["low"] * 0.9998, "v",
+                color="#ff1744", markersize=4, alpha=0.6)
+
+    # ── Title & labels ──
+    trend_clr = {"BULLISH":"#00e676","BEARISH":"#ff1744","NEUTRAL":"#90a4ae"}
+    t_color = trend_clr.get(state.trend_bias, "#90a4ae")
+
+    type_labels = {"live":"📡 LIVE","entry":"🎯 ENTRY","exit":"🏁 CLOSED"}
+    type_label  = type_labels.get(chart_type, "")
+
     ax.set_title(
-        f"XAU/USD  ·  {timeframe}  ·  Trend: {state.trend_bias}  ·  "
+        f"{type_label}  XAU/USD · {timeframe} · Trend: {state.trend_bias} · "
         f"Price: {state.current_price:.2f}",
-        color=bias_color, fontsize=11, fontfamily="monospace", pad=10
+        color=t_color, fontsize=11, fontfamily="monospace", pad=10
     )
-
-    # ── Style ──
+    ax.set_ylabel("Price (USD)", color="#90a4ae", fontsize=9)
     ax.tick_params(colors="#90a4ae", labelsize=8)
     for spine in ax.spines.values():
         spine.set_edgecolor("#1e2a38")
     ax.set_xlim(-1, len(df))
-    ax.set_ylabel("Price (USD)", color="#90a4ae", fontsize=9)
     ax.legend(loc="upper left", fontsize=7, facecolor="#161b22",
               edgecolor="#30363d", labelcolor="#cdd9e5")
     ax.grid(axis="y", color="#1e2a38", linewidth=0.5, alpha=0.5)
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(0.99, 0.01, f"SMC-EA  ·  {ts}", color="#444d56",
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    fig.text(0.99, 0.01, f"SMC-EA · {ts}", color="#444d56",
              fontsize=7, ha="right", fontfamily="monospace")
 
-    path = "/tmp/chart.png"
+    path = f"/tmp/chart_{chart_type}.png"
+    plt.tight_layout()
+    plt.savefig(path, dpi=130, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return path
+
+
+def generate_history_chart() -> Optional[str]:
+    """Generate a bar chart of recent trade P&L history."""
+    history = state.trade_history[-20:]
+    if not history:
+        return None
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
+                                    facecolor="#0d1117",
+                                    gridspec_kw={"height_ratios": [2, 1]})
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#0d1117")
+        ax.tick_params(colors="#90a4ae", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#1e2a38")
+
+    # ── P&L bars ──
+    labels = [f"#{t['num']}" for t in history]
+    pnls   = [t["pnl"] for t in history]
+    colors = ["#00e676" if p > 0 else "#ff1744" for p in pnls]
+    bars = ax1.bar(labels, pnls, color=colors, alpha=0.85, edgecolor="#1e2a38")
+    ax1.axhline(0, color="#444d56", linewidth=0.8)
+    for bar, val in zip(bars, pnls):
+        sign = "+" if val > 0 else ""
+        ax1.text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + (0.05 if val >= 0 else -0.15),
+                 f"{sign}{val:.2f}", ha="center", va="bottom",
+                 color="#cdd9e5", fontsize=7, fontfamily="monospace")
+    ax1.set_title(
+        f"📋 Trade History  ·  {state.wins}W / {state.losses}L  ·  "
+        f"Total P&L: {state.total_pnl:+.2f} {state.account_currency}  ·  "
+        f"Balance: {state.account_balance:.2f}",
+        color="#cdd9e5", fontsize=10, fontfamily="monospace", pad=8
+    )
+    ax1.set_ylabel("P&L (USD)", color="#90a4ae", fontsize=9)
+    ax1.grid(axis="y", color="#1e2a38", linewidth=0.5, alpha=0.5)
+
+    # ── Cumulative P&L line ──
+    cumulative = np.cumsum(pnls)
+    cum_color  = "#00e676" if cumulative[-1] >= 0 else "#ff1744"
+    ax2.plot(labels, cumulative, color=cum_color, linewidth=1.8,
+             marker="o", markersize=4)
+    ax2.fill_between(labels, cumulative, alpha=0.15, color=cum_color)
+    ax2.axhline(0, color="#444d56", linewidth=0.8)
+    ax2.set_ylabel("Cumulative P&L", color="#90a4ae", fontsize=8)
+    ax2.grid(axis="y", color="#1e2a38", linewidth=0.5, alpha=0.5)
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    fig.text(0.99, 0.01, f"SMC-EA History · {ts}", color="#444d56",
+             fontsize=7, ha="right", fontfamily="monospace")
+
+    path = "/tmp/chart_history.png"
     plt.tight_layout()
     plt.savefig(path, dpi=130, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
@@ -265,295 +357,226 @@ def generate_chart(candles: deque, timeframe="M15") -> str:
 # SMC ANALYSIS ENGINE
 # ─────────────────────────────────────────────
 def detect_swing_points(df: pd.DataFrame, n=None):
-    """Return indices of swing highs and swing lows."""
     n = n or SWING_LOOKBACK
     highs, lows = [], []
     for i in range(n, len(df) - n):
-        window_h = df["high"].iloc[i - n:i + n + 1]
-        window_l = df["low"].iloc[i - n:i + n + 1]
-        if df["high"].iloc[i] == window_h.max():
+        if df["high"].iloc[i] == df["high"].iloc[i-n:i+n+1].max():
             highs.append(i)
-        if df["low"].iloc[i] == window_l.min():
+        if df["low"].iloc[i] == df["low"].iloc[i-n:i+n+1].min():
             lows.append(i)
     return highs, lows
 
 
 def detect_bos_choch(df: pd.DataFrame):
-    """
-    Detect BOS (Break of Structure) and CHoCH (Change of Character).
-    Returns: dict with 'type' ('BOS'/'CHoCH'), 'direction', 'level', 'index'
-    """
     highs, lows = detect_swing_points(df)
     if len(highs) < 2 or len(lows) < 2:
         return None
-
-    last_sh = highs[-1]
-    prev_sh = highs[-2]
-    last_sl = lows[-1]
-    prev_sl = lows[-2]
-
+    last_sh, prev_sh = highs[-1], highs[-2]
+    last_sl, prev_sl = lows[-1],  lows[-2]
     last_close = df["close"].iloc[-1]
-    last_open  = df["open"].iloc[-1]
 
-    result = None
-
-    # Bullish BOS: price breaks above last swing high
     if last_close > df["high"].iloc[last_sh] and last_sh > prev_sh:
-        result = {"type": "BOS", "direction": "BULLISH",
-                  "level": df["high"].iloc[last_sh], "index": len(df) - 1}
-
-    # Bearish BOS: price breaks below last swing low
-    elif last_close < df["low"].iloc[last_sl] and last_sl > prev_sl:
-        result = {"type": "BOS", "direction": "BEARISH",
-                  "level": df["low"].iloc[last_sl], "index": len(df) - 1}
-
-    # CHoCH: structure flip
-    elif (df["high"].iloc[last_sh] < df["high"].iloc[prev_sh] and
-          last_close > df["high"].iloc[last_sh]):
-        result = {"type": "CHoCH", "direction": "BULLISH",
-                  "level": df["high"].iloc[last_sh], "index": len(df) - 1}
-
-    elif (df["low"].iloc[last_sl] > df["low"].iloc[prev_sl] and
-          last_close < df["low"].iloc[last_sl]):
-        result = {"type": "CHoCH", "direction": "BEARISH",
-                  "level": df["low"].iloc[last_sl], "index": len(df) - 1}
-
-    return result
+        return {"type":"BOS","direction":"BULLISH","level":df["high"].iloc[last_sh]}
+    if last_close < df["low"].iloc[last_sl] and last_sl > prev_sl:
+        return {"type":"BOS","direction":"BEARISH","level":df["low"].iloc[last_sl]}
+    if (df["high"].iloc[last_sh] < df["high"].iloc[prev_sh] and
+            last_close > df["high"].iloc[last_sh]):
+        return {"type":"CHoCH","direction":"BULLISH","level":df["high"].iloc[last_sh]}
+    if (df["low"].iloc[last_sl] > df["low"].iloc[prev_sl] and
+            last_close < df["low"].iloc[last_sl]):
+        return {"type":"CHoCH","direction":"BEARISH","level":df["low"].iloc[last_sl]}
+    return None
 
 
 def identify_order_block(df: pd.DataFrame, direction: str):
-    """
-    Find the last valid Order Block before a BOS.
-    Bull OB: last bearish candle before bullish impulse.
-    Bear OB: last bullish candle before bearish impulse.
-    """
     lookback = min(OB_LOOKBACK, len(df) - 2)
     recent = df.iloc[-lookback:]
-
     if direction == "BULLISH":
-        # Find last down candle followed by strong up move
-        for i in range(len(recent) - 3, 0, -1):
-            candle = recent.iloc[i]
-            next_c = recent.iloc[i + 1]
-            if candle["close"] < candle["open"]:     # bearish candle
-                if next_c["close"] > candle["high"]:  # next breaks up
-                    return {
-                        "type": "BULL",
-                        "high": candle["high"],
-                        "low":  candle["low"],
-                        "index": i,
-                    }
-
+        for i in range(len(recent)-3, 0, -1):
+            c, nc = recent.iloc[i], recent.iloc[i+1]
+            if c["close"] < c["open"] and nc["close"] > c["high"]:
+                return {"type":"BULL","high":c["high"],"low":c["low"],"index":i}
     elif direction == "BEARISH":
-        for i in range(len(recent) - 3, 0, -1):
-            candle = recent.iloc[i]
-            next_c = recent.iloc[i + 1]
-            if candle["close"] > candle["open"]:     # bullish candle
-                if next_c["close"] < candle["low"]:  # next breaks down
-                    return {
-                        "type": "BEAR",
-                        "high": candle["high"],
-                        "low":  candle["low"],
-                        "index": i,
-                    }
+        for i in range(len(recent)-3, 0, -1):
+            c, nc = recent.iloc[i], recent.iloc[i+1]
+            if c["close"] > c["open"] and nc["close"] < c["low"]:
+                return {"type":"BEAR","high":c["high"],"low":c["low"],"index":i}
     return None
 
 
 def identify_fvg(df: pd.DataFrame, ob: dict):
-    """
-    Fair Value Gap: 3-candle imbalance.
-    Bull FVG: candle[i].high < candle[i+2].low → gap between them.
-    Bear FVG: candle[i].low  > candle[i+2].high → gap between them.
-    """
     if ob is None:
         return None
-
-    lookback = min(OB_LOOKBACK, len(df) - 3)
+    lookback = min(OB_LOOKBACK, len(df)-3)
     recent = df.iloc[-lookback:]
-
     if ob["type"] == "BULL":
-        for i in range(len(recent) - 3, 0, -1):
-            c1, c3 = recent.iloc[i], recent.iloc[i + 2]
+        for i in range(len(recent)-3, 0, -1):
+            c1, c3 = recent.iloc[i], recent.iloc[i+2]
             gap_pct = (c3["low"] - c1["high"]) / c1["high"] * 100
             if c1["high"] < c3["low"] and gap_pct >= FVG_THRESHOLD:
-                return {"type": "BULL", "high": c3["low"],
-                        "low": c1["high"], "gap_pct": gap_pct}
-
+                return {"type":"BULL","high":c3["low"],"low":c1["high"],"gap_pct":gap_pct}
     elif ob["type"] == "BEAR":
-        for i in range(len(recent) - 3, 0, -1):
-            c1, c3 = recent.iloc[i], recent.iloc[i + 2]
+        for i in range(len(recent)-3, 0, -1):
+            c1, c3 = recent.iloc[i], recent.iloc[i+2]
             gap_pct = (c1["low"] - c3["high"]) / c1["low"] * 100
             if c1["low"] > c3["high"] and gap_pct >= FVG_THRESHOLD:
-                return {"type": "BEAR", "high": c1["low"],
-                        "low": c3["high"], "gap_pct": gap_pct}
-
+                return {"type":"BEAR","high":c1["low"],"low":c3["high"],"gap_pct":gap_pct}
     return None
 
 
 def detect_liquidity_trap(df: pd.DataFrame):
-    """
-    Equal Highs/Lows and Inducement detection.
-    Equal levels (within 0.05%) → likely liquidity pool.
-    Trap confirmed when price sweeps above/below and closes back inside.
-    """
     if len(df) < 10:
         return None
-
     recent = df.iloc[-20:]
-    tolerance = 0.0005   # 0.05%
-
-    # Equal Highs
+    tol = 0.0005
     highs = recent["high"].values
-    for i in range(len(highs) - 2, 0, -1):
-        for j in range(i - 1, max(i - 6, 0), -1):
-            if abs(highs[i] - highs[j]) / highs[j] < tolerance:
-                level = (highs[i] + highs[j]) / 2
-                # Sweep: current price crossed above then closed below
+    for i in range(len(highs)-2, 0, -1):
+        for j in range(i-1, max(i-6, 0), -1):
+            if abs(highs[i]-highs[j])/highs[j] < tol:
+                level = (highs[i]+highs[j])/2
                 last = df.iloc[-1]
                 if last["high"] > level and last["close"] < level:
-                    return {"side": "SELL", "level": level,
-                            "swept": True, "type": "EQL_HIGHS"}
-
-    # Equal Lows
+                    return {"side":"SELL","level":level,"swept":True,"type":"EQL_HIGHS"}
     lows = recent["low"].values
-    for i in range(len(lows) - 2, 0, -1):
-        for j in range(i - 1, max(i - 6, 0), -1):
-            if abs(lows[i] - lows[j]) / lows[j] < tolerance:
-                level = (lows[i] + lows[j]) / 2
+    for i in range(len(lows)-2, 0, -1):
+        for j in range(i-1, max(i-6, 0), -1):
+            if abs(lows[i]-lows[j])/lows[j] < tol:
+                level = (lows[i]+lows[j])/2
                 last = df.iloc[-1]
                 if last["low"] < level and last["close"] > level:
-                    return {"side": "BUY", "level": level,
-                            "swept": True, "type": "EQL_LOWS"}
-
+                    return {"side":"BUY","level":level,"swept":True,"type":"EQL_LOWS"}
     return None
 
 
 def analyze_h1_trend():
-    """Determine H1 bias: BULLISH, BEARISH, or NEUTRAL."""
     if len(state.h1_candles) < 30:
         return "NEUTRAL"
     df = pd.DataFrame(list(state.h1_candles))
-    df.columns = ["time", "open", "high", "low", "close"]
+    df.columns = ["time","open","high","low","close"]
     result = detect_bos_choch(df)
     if result:
         state.trend_bias = result["direction"]
     else:
-        # Fallback: simple HH/HL or LH/LL count
         closes = df["close"].values[-20:]
-        if np.polyfit(np.arange(len(closes)), closes, 1)[0] > 0:
-            state.trend_bias = "BULLISH"
-        else:
-            state.trend_bias = "BEARISH"
+        state.trend_bias = "BULLISH" if np.polyfit(np.arange(len(closes)), closes, 1)[0] > 0 else "BEARISH"
     return state.trend_bias
 
 
 def compute_signal(timeframe="M15"):
-    """Full SMC pipeline. Returns signal dict or None."""
     candles = state.m15_candles if timeframe == "M15" else state.m5_candles
     if len(candles) < 30:
         return None
-
     df = pd.DataFrame(list(candles))
-    df.columns = ["time", "open", "high", "low", "close"]
+    df.columns = ["time","open","high","low","close"]
 
-    # 1. H1 trend bias
     bias = analyze_h1_trend()
     if bias == "NEUTRAL":
         return None
 
-    # 2. BOS / CHoCH on execution TF
     struct = detect_bos_choch(df)
-    if struct is None:
+    if struct is None or struct["direction"] != bias:
         return None
 
-    # Must align with H1 bias
-    if struct["direction"] != bias:
-        return None
-
-    # 3. Order Block
     ob = identify_order_block(df, bias)
     if ob is None:
         return None
     state.active_ob = ob
 
-    # 4. FVG from OB
     fvg = identify_fvg(df, ob)
     if fvg is None:
         return None
     state.active_fvg = fvg
 
-    # 5. Liquidity trap (sweep before entry)
     trap = detect_liquidity_trap(df)
     state.active_trap = trap
-    # Require a confirmed trap sweep to avoid retail entry
-    if trap is None:
-        return None
-    if trap["side"] != ("BUY" if bias == "BULLISH" else "SELL"):
+    if trap is None or trap["side"] != ("BUY" if bias == "BULLISH" else "SELL"):
         return None
 
-    # 6. Entry, SL, TPs
-    current = state.current_price
     if bias == "BULLISH":
-        entry = ob["high"]          # enter at top of bull OB
-        sl    = ob["low"] * 0.9995  # just below OB
+        entry = ob["high"]
+        sl    = ob["low"] * 0.9995
     else:
-        entry = ob["low"]           # enter at bottom of bear OB
-        sl    = ob["high"] * 1.0005 # just above OB
+        entry = ob["low"]
+        sl    = ob["high"] * 1.0005
 
-    risk  = abs(entry - sl)
-    tp1   = entry + (risk * TP1_R * (1 if bias == "BULLISH" else -1))
-    tp2   = entry + (risk * TP2_R * (1 if bias == "BULLISH" else -1))
-    tp3   = entry + (risk * TP3_R * (1 if bias == "BULLISH" else -1))
-
-    # Size based on 1% account risk
-    if state.account_balance > 0 and risk > 0:
-        risk_amount = state.account_balance * RISK_PCT
-        units = round(risk_amount / risk, 2)
-    else:
-        units = 1.0
+    risk = abs(entry - sl)
+    mult = 1 if bias == "BULLISH" else -1
+    tp1  = entry + risk * TP1_R * mult
+    tp2  = entry + risk * TP2_R * mult
+    tp3  = entry + risk * TP3_R * mult
+    units = round(state.account_balance * RISK_PCT / risk, 2) if risk > 0 and state.account_balance > 0 else 1.0
 
     signal = {
         "direction": "BUY" if bias == "BULLISH" else "SELL",
-        "entry":  round(entry, 3),
-        "sl":     round(sl, 3),
-        "tp1":    round(tp1, 3),
-        "tp2":    round(tp2, 3),
-        "tp3":    round(tp3, 3),
-        "risk_r": round(risk, 4),
-        "units":  units,
-        "struct": struct["type"],
-        "ob":     ob,
-        "fvg":    fvg,
-        "trap":   trap,
-        "tf":     timeframe,
-        "bias":   bias,
-        "ts":     datetime.now(timezone.utc).isoformat(),
+        "entry": round(entry, 3), "sl": round(sl, 3),
+        "tp1": round(tp1, 3), "tp2": round(tp2, 3), "tp3": round(tp3, 3),
+        "risk_r": round(risk, 4), "units": units,
+        "struct": struct["type"], "ob": ob, "fvg": fvg, "trap": trap,
+        "tf": timeframe, "bias": bias,
+        "ts": datetime.now(timezone.utc).isoformat(),
     }
     state.last_signal = signal
     return signal
 
 
 # ─────────────────────────────────────────────
+# TRADE MANAGEMENT (BE + Trailing Stop)
+# ─────────────────────────────────────────────
+def check_trade_management():
+    for cid, info in list(state.open_contracts.items()):
+        sig = info.get("signal")
+        if sig is None:
+            continue
+        price     = state.current_price
+        direction = info["direction"]
+        entry     = sig["entry"]
+        tp1       = sig["tp1"]
+
+        if not info["be_moved"]:
+            triggered = (direction == "BUY" and price >= tp1) or \
+                        (direction == "SELL" and price <= tp1)
+            if triggered:
+                info["be_moved"] = True
+                sig["sl"] = entry
+                log.info(f"[{cid}] BreakEven → SL={entry}")
+                asyncio.ensure_future(tg_send_async(
+                    f"✅ *BreakEven* `{cid}`\nSL moved to entry `{entry}`"
+                ))
+
+        # Trailing stop via last swing
+        if len(state.m15_candles) >= 10:
+            df = pd.DataFrame(list(state.m15_candles)[-30:])
+            df.columns = ["time","open","high","low","close"]
+            swh, swl = detect_swing_points(df, n=3)
+            if direction == "BUY" and swl:
+                t_sl = df["low"].iloc[swl[-1]] * 0.9998
+                if t_sl > sig["sl"]:
+                    sig["sl"] = t_sl
+                    log.info(f"[{cid}] Trailing SL → {t_sl:.3f}")
+            elif direction == "SELL" and swh:
+                t_sl = df["high"].iloc[swh[-1]] * 1.0002
+                if t_sl < sig["sl"]:
+                    sig["sl"] = t_sl
+                    log.info(f"[{cid}] Trailing SL → {t_sl:.3f}")
+
+
+# ─────────────────────────────────────────────
 # DERIV WEBSOCKET ENGINE
 # ─────────────────────────────────────────────
 async def send_request(payload: dict) -> dict:
-    """Send a request to Deriv WS and await the response."""
     if state.ws is None:
         raise RuntimeError("WebSocket not connected")
     req_id = state.req_id
     state.req_id += 1
     payload["req_id"] = req_id
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
+    future = asyncio.get_event_loop().create_future()
     state.pending_requests[req_id] = future
     await state.ws.send(json.dumps(payload))
     try:
         return await asyncio.wait_for(asyncio.shield(future), timeout=20)
     except asyncio.TimeoutError:
         state.pending_requests.pop(req_id, None)
-        raise asyncio.TimeoutError(
-            f"Timeout waiting for response: keys={list(payload.keys())}"
-        )
+        raise asyncio.TimeoutError(f"Timeout: keys={list(payload.keys())}")
 
 
 async def authorize():
@@ -572,71 +595,55 @@ async def get_account_info():
     return resp
 
 
-async def subscribe_candles(symbol: str, granularity: int, style="candles"):
-    """Subscribe to OHLC candle stream."""
+async def subscribe_candles(symbol: str, granularity: int):
     await send_request({
-        "ticks_history": symbol,
-        "end": "latest",
-        "count": 200,
-        "granularity": granularity,
-        "style": style,
-        "subscribe": 1,
+        "ticks_history": symbol, "end": "latest",
+        "count": 200, "granularity": granularity,
+        "style": "candles", "subscribe": 1,
     })
 
 
-async def open_contract(direction: str, amount: float, duration: int = None):
-    """Open MULTUP or MULTDOWN contract on Deriv."""
+async def open_contract(direction: str, amount: float):
     if state.paused:
-        log.info("Bot paused — skipping contract open.")
         return None
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
-    payload = {
-        "buy": 1,
-        "price": round(amount, 2),
-        "parameters": {
-            "contract_type": contract_type,
-            "symbol": SYMBOL,
-            "amount": round(amount, 2),
-            "currency": state.account_currency,
-            "multiplier": 10,
-            "basis": "stake",
-            "stop_out": 1,
-        },
-    }
     try:
-        resp = await send_request(payload)
+        resp = await send_request({
+            "buy": 1, "price": round(amount, 2),
+            "parameters": {
+                "contract_type": contract_type, "symbol": SYMBOL,
+                "amount": round(amount, 2), "currency": state.account_currency,
+                "multiplier": 10, "basis": "stake", "stop_out": 1,
+            },
+        })
         if "error" in resp:
             log.error(f"Buy error: {resp['error']['message']}")
             return None
         contract_id = resp["buy"]["contract_id"]
         state.open_contracts[contract_id] = {
-            "direction": direction,
-            "entry": state.current_price,
-            "amount": amount,
-            "signal": state.last_signal,
-            "be_moved": False,
-            "opened_at": time.time(),
+            "direction": direction, "entry": state.current_price,
+            "amount": amount, "signal": state.last_signal,
+            "be_moved": False, "opened_at": time.time(),
         }
         state.trade_count += 1
         log.info(f"✅ Contract opened: {contract_id} [{direction}] ${amount:.2f}")
         return contract_id
     except Exception as e:
-        log.error(f"open_contract exception: {e}")
+        log.error(f"open_contract: {e}")
         return None
 
 
 async def close_contract(contract_id: str):
-    """Sell/close an open contract."""
     try:
         resp = await send_request({"sell": contract_id, "price": 0})
         if "error" in resp:
             log.error(f"Close error: {resp['error']['message']}")
             return False
         state.open_contracts.pop(contract_id, None)
-        log.info(f"🔴 Contract closed: {contract_id}")
+        log.info(f"🔴 Closed: {contract_id}")
         return True
     except Exception as e:
-        log.error(f"close_contract exception: {e}")
+        log.error(f"close_contract: {e}")
         return False
 
 
@@ -647,96 +654,26 @@ async def close_all_contracts():
     return len(ids)
 
 
-async def subscribe_contract_updates():
-    """Subscribe to proposal_open_contract for live P&L and trailing stop."""
-    for cid in list(state.open_contracts.keys()):
-        await send_request({
-            "proposal_open_contract": 1,
-            "contract_id": cid,
-            "subscribe": 1,
-        })
-
-
-# ─────────────────────────────────────────────
-# TRADE MANAGEMENT (BE + Trailing Stop)
-# ─────────────────────────────────────────────
-def check_trade_management():
-    """Check each open trade for TP1 BE trigger and trailing stop."""
-    for cid, info in list(state.open_contracts.items()):
-        sig = info.get("signal")
-        if sig is None:
-            continue
-        price = state.current_price
-        direction = info["direction"]
-        entry  = sig["entry"]
-        risk_r = sig["risk_r"]
-        tp1    = sig["tp1"]
-        sl     = sig["sl"]
-
-        # Break-Even: move SL to entry once TP1 is reached
-        if not info["be_moved"]:
-            if direction == "BUY"  and price >= tp1:
-                info["be_moved"] = True
-                sig["sl"] = entry
-                log.info(f"[{cid}] BreakEven triggered — SL moved to {entry}")
-                asyncio.get_event_loop().call_soon_threadsafe(
-                    lambda: asyncio.ensure_future(
-                        tg_send_async(f"✅ *BreakEven* triggered for `{cid}`\nSL moved to entry: `{entry}`")
-                    )
-                )
-
-            elif direction == "SELL" and price <= tp1:
-                info["be_moved"] = True
-                sig["sl"] = entry
-                log.info(f"[{cid}] BreakEven triggered — SL moved to {entry}")
-                asyncio.get_event_loop().call_soon_threadsafe(
-                    lambda: asyncio.ensure_future(
-                        tg_send_async(f"✅ *BreakEven* triggered for `{cid}`\nSL moved to entry: `{entry}`")
-                    )
-                )
-
-        # Dynamic Trailing Stop using last swing
-        if len(state.m15_candles) >= 10:
-            df = pd.DataFrame(list(state.m15_candles)[-30:])
-            df.columns = ["time", "open", "high", "low", "close"]
-            swh, swl = detect_swing_points(df, n=3)
-            if direction == "BUY" and swl:
-                trailing_sl = df["low"].iloc[swl[-1]] * 0.9998
-                if trailing_sl > sig["sl"]:
-                    sig["sl"] = trailing_sl
-                    log.info(f"[{cid}] Trailing SL → {trailing_sl:.3f}")
-
-            elif direction == "SELL" and swh:
-                trailing_sl = df["high"].iloc[swh[-1]] * 1.0002
-                if trailing_sl < sig["sl"]:
-                    sig["sl"] = trailing_sl
-                    log.info(f"[{cid}] Trailing SL → {trailing_sl:.3f}")
-
-
 # ─────────────────────────────────────────────
 # WEBSOCKET MESSAGE HANDLER
 # ─────────────────────────────────────────────
-def parse_candle(msg: dict) -> Optional[tuple]:
-    """Extract OHLCV tuple from WS candle message."""
+def parse_candle(msg: dict):
     if "candles" in msg:
-        return [
-            (c["epoch"], c["open"], c["high"], c["low"], c["close"])
-            for c in msg["candles"]
-        ]
+        return [(c["epoch"], float(c["open"]), float(c["high"]),
+                 float(c["low"]), float(c["close"])) for c in msg["candles"]]
     if "ohlc" in msg:
         c = msg["ohlc"]
-        return [(c["epoch"], float(c["open"]), float(c["high"]),
+        return [(int(c["epoch"]), float(c["open"]), float(c["high"]),
                  float(c["low"]), float(c["close"]))]
     return None
 
 
 async def handle_message(msg: dict):
-    """Dispatch incoming WebSocket messages."""
     req_id = msg.get("req_id")
     if req_id and req_id in state.pending_requests:
-        future = state.pending_requests.pop(req_id)
-        if not future.done():
-            future.set_result(msg)
+        fut = state.pending_requests.pop(req_id)
+        if not fut.done():
+            fut.set_result(msg)
         return
 
     mtype = msg.get("msg_type", "")
@@ -749,10 +686,10 @@ async def handle_message(msg: dict):
                 state.h1_candles.extend(candle)
             elif gran == 900:
                 state.m15_candles.extend(candle)
-                state.current_price = float(msg["ohlc"]["close"])
+                state.current_price = candle[-1][4]
             elif gran == 300:
                 state.m5_candles.extend(candle)
-                state.current_price = float(msg["ohlc"]["close"])
+                state.current_price = candle[-1][4]
 
     elif mtype == "candles":
         gran = msg.get("echo_req", {}).get("granularity", 0)
@@ -772,81 +709,178 @@ async def handle_message(msg: dict):
         poc = msg.get("proposal_open_contract", {})
         cid = str(poc.get("contract_id", ""))
         if cid in state.open_contracts:
-            profit = poc.get("profit", 0)
+            profit = float(poc.get("profit", 0))
             status = poc.get("status", "")
+            exit_spot = float(poc.get("exit_tick", state.current_price) or state.current_price)
+
             if status in ("sold", "expired"):
+                info = state.open_contracts.pop(cid, {})
                 if profit > 0:
                     state.wins += 1
                 else:
                     state.losses += 1
-                state.open_contracts.pop(cid, None)
-                asyncio.ensure_future(tg_send_async(
-                    f"{'✅ WIN' if profit > 0 else '❌ LOSS'}  Contract `{cid}`\n"
-                    f"P&L: `{profit:.2f}` {state.account_currency}\n"
-                    f"Record: {state.wins}W / {state.losses}L",
-                ))
+                state.total_pnl += profit
+
+                # Record history
+                trade_num = state.trade_count
+                history_entry = {
+                    "num":       trade_num,
+                    "id":        cid,
+                    "direction": info.get("direction","?"),
+                    "entry":     info.get("entry", 0),
+                    "exit":      exit_spot,
+                    "pnl":       round(profit, 2),
+                    "win":       profit > 0,
+                    "ts":        datetime.now(timezone.utc).strftime("%m/%d %H:%M"),
+                }
+                state.trade_history.append(history_entry)
+                if len(state.trade_history) > 50:
+                    state.trade_history.pop(0)
+
+                # Generate exit chart screenshot
+                exit_chart = generate_chart(
+                    state.m15_candles, "M15",
+                    entry_price=info.get("entry"),
+                    exit_price=exit_spot,
+                    direction=info.get("direction"),
+                    pnl=profit,
+                    chart_type="exit"
+                )
+                result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
+                pnl_str = f"+{profit:.2f}" if profit > 0 else f"{profit:.2f}"
+                msg_text = (
+                    f"{result_emoji}  Trade `#{trade_num}` Closed\n\n"
+                    f"Contract: `{cid}`\n"
+                    f"Direction: `{info.get('direction','?')}`\n"
+                    f"Entry: `{info.get('entry', 0):.2f}`\n"
+                    f"Exit:  `{exit_spot:.2f}`\n"
+                    f"P&L:   `{pnl_str} {state.account_currency}`\n\n"
+                    f"Record: `{state.wins}W / {state.losses}L`\n"
+                    f"Total P&L: `{state.total_pnl:+.2f} {state.account_currency}`\n"
+                    f"Balance: `{state.account_balance:.2f} {state.account_currency}`"
+                )
+                asyncio.ensure_future(
+                    tg_send_async(msg_text, photo_path=exit_chart)
+                )
+                log.info(f"Trade #{trade_num} closed. PnL={pnl_str}")
 
     elif mtype == "balance":
         state.account_balance  = msg["balance"]["balance"]
         state.account_currency = msg["balance"]["currency"]
 
     elif "error" in msg:
-        log.warning(f"WS error msg: {msg['error']}")
+        log.warning(f"WS API error: {msg['error'].get('message','?')}")
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM POLLING LOOP
+# REAL-TIME CHART LOOP
+# ─────────────────────────────────────────────
+async def chart_broadcast_loop():
+    """Send a live chart screenshot to Telegram every CHART_INTERVAL seconds."""
+    await asyncio.sleep(30)  # Wait for initial data
+    while state.running:
+        try:
+            if state.current_price > 0 and len(state.m15_candles) >= 20:
+                path = generate_chart(state.m15_candles, "M15", chart_type="live")
+                if path:
+                    bias_e = "📈" if state.trend_bias=="BULLISH" else "📉" if state.trend_bias=="BEARISH" else "➡️"
+                    open_n = len(state.open_contracts)
+                    caption = (
+                        f"{bias_e} *XAU/USD Real-Time · M15*\n"
+                        f"Price: `{state.current_price:.2f}`  Bias: `{state.trend_bias}`\n"
+                        f"OB: {'✅' if state.active_ob else '—'}  "
+                        f"FVG: {'✅' if state.active_fvg else '—'}  "
+                        f"Trap: {'✅' if state.active_trap else '—'}\n"
+                        f"Open Trades: `{open_n}`  "
+                        f"Balance: `{state.account_balance:.2f} {state.account_currency}`"
+                    )
+                    await tg_send_async(caption, photo_path=path)
+                    log.info("📊 Auto chart sent to Telegram")
+        except Exception as e:
+            log.error(f"Chart broadcast error: {e}")
+        await asyncio.sleep(CHART_INTERVAL)
+
+
+# ─────────────────────────────────────────────
+# TELEGRAM POLLING — Conflict-safe
 # ─────────────────────────────────────────────
 async def telegram_poll_loop():
-    """Long-poll Telegram for commands and callback queries (non-blocking)."""
     if not TELEGRAM_TOKEN:
-        log.warning("TELEGRAM_TOKEN not set — Telegram polling disabled.")
+        log.warning("TELEGRAM_TOKEN not set — Telegram disabled.")
         return
-    offset = 0
+
+    # ── Delete webhook + drop pending to clear any conflict ──
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     loop = asyncio.get_event_loop()
+    try:
+        def clear_webhook():
+            requests.post(f"{base}/deleteWebhook",
+                          json={"drop_pending_updates": True}, timeout=10)
+        await loop.run_in_executor(None, clear_webhook)
+        log.info("Telegram webhook cleared (conflict prevention)")
+    except Exception as e:
+        log.warning(f"Webhook clear failed: {e}")
+
+    await asyncio.sleep(2)  # Give Telegram time to release any other poller
+
+    offset = 0
+    CONSECUTIVE_ERRORS = 0
 
     while state.running:
         try:
             def do_poll():
                 return requests.get(
                     f"{base}/getUpdates",
-                    params={"offset": offset, "timeout": 20},
+                    params={"offset": offset, "timeout": 20, "allowed_updates": ["message","callback_query"]},
                     timeout=25,
                 )
             r = await loop.run_in_executor(None, do_poll)
             data = r.json()
+
             if not data.get("ok"):
-                log.error(f"Telegram getUpdates error: {data.get('description', data)}")
-                await asyncio.sleep(10)
+                desc = data.get("description", str(data))
+                log.error(f"Telegram poll error: {desc}")
+                # If still conflict, wait longer then retry
+                if "Conflict" in desc:
+                    log.warning("Conflict detected — waiting 30s before retry...")
+                    await asyncio.sleep(30)
+                    # Try clearing webhook again
+                    await loop.run_in_executor(None, clear_webhook)
+                    await asyncio.sleep(5)
+                else:
+                    await asyncio.sleep(10)
+                CONSECUTIVE_ERRORS += 1
                 continue
+
+            CONSECUTIVE_ERRORS = 0
             updates = data.get("result", [])
             for update in updates:
                 offset = update["update_id"] + 1
                 await handle_telegram_update(update)
+
         except Exception as e:
-            log.error(f"Telegram poll error: {type(e).__name__}: {e}")
-            await asyncio.sleep(5)
-        await asyncio.sleep(1)
+            CONSECUTIVE_ERRORS += 1
+            log.error(f"Telegram poll exception: {type(e).__name__}: {e}")
+            wait = min(5 * CONSECUTIVE_ERRORS, 60)
+            await asyncio.sleep(wait)
+            continue
+
+        await asyncio.sleep(0.5)
 
 
 async def handle_telegram_update(update: dict):
-    """Process a Telegram update (message or callback query)."""
-    # Text commands
     if "message" in update:
-        text = update["message"].get("text", "").strip()
+        text    = update["message"].get("text", "").strip()
         chat_id = str(update["message"]["chat"]["id"])
-        if chat_id != TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID:
+        if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
             return
         await process_command(text)
-
-    # Inline keyboard callbacks
     elif "callback_query" in update:
-        cq = update["callback_query"]
-        data = cq.get("data", "")
-        cqid = cq["id"]
+        cq      = update["callback_query"]
+        data    = cq.get("data", "")
+        cqid    = cq["id"]
         chat_id = str(cq["message"]["chat"]["id"])
-        if chat_id != TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID:
+        if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
             tg_answer_callback(cqid, "Unauthorized")
             return
         tg_answer_callback(cqid)
@@ -854,86 +888,109 @@ async def handle_telegram_update(update: dict):
 
 
 async def process_command(cmd: str):
-    """Handle a bot command (text or callback)."""
     cmd = cmd.lower().strip()
 
     if cmd in ("/start", "/help"):
         await tg_send_async(
             "🤖 *SMC-EA XAU/USD Bot*\n\n"
             "Smart Money Concepts Expert Advisor\n"
-            f"Symbol: `{SYMBOL}` | Risk: `{RISK_PCT*100:.0f}%`\n\n"
-            "Use the buttons below to interact:",
+            f"Symbol: `{SYMBOL}` | Risk: `{RISK_PCT*100:.0f}%`\n"
+            f"Auto-chart every `{CHART_INTERVAL//60}` min\n\n"
+            "Use the buttons below:"
         )
 
     elif cmd in ("/balance", "cmd_balance"):
         if state.ws is not None:
-            await get_account_info()
+            try:
+                await get_account_info()
+            except Exception:
+                pass
         await tg_send_async(
             f"💰 *Account Balance*\n"
             f"`{state.account_balance:.2f} {state.account_currency}`\n"
-            f"Trades: {state.trade_count} | W/L: {state.wins}/{state.losses}",
+            f"Trades: `{state.trade_count}`  W/L: `{state.wins}/{state.losses}`\n"
+            f"Total P&L: `{state.total_pnl:+.2f} {state.account_currency}`"
         )
 
     elif cmd in ("/chart", "cmd_chart"):
-        path = generate_chart(state.m15_candles, "M15")
+        path = generate_chart(state.m15_candles, "M15", chart_type="live")
         if path:
-            bias_emoji = "📈" if state.trend_bias == "BULLISH" else "📉" if state.trend_bias == "BEARISH" else "➡️"
-            caption = (
-                f"{bias_emoji} *XAU/USD M15 Chart*\n"
-                f"Bias: `{state.trend_bias}`  |  Price: `{state.current_price:.2f}`\n"
-                f"OB: {'✅' if state.active_ob else '❌'}  "
-                f"FVG: {'✅' if state.active_fvg else '❌'}  "
-                f"Trap: {'✅' if state.active_trap else '❌'}"
+            bias_e = "📈" if state.trend_bias=="BULLISH" else "📉" if state.trend_bias=="BEARISH" else "➡️"
+            await tg_send_async(
+                f"{bias_e} *XAU/USD M15 Live Chart*\n"
+                f"Bias: `{state.trend_bias}`  Price: `{state.current_price:.2f}`\n"
+                f"OB: {'✅' if state.active_ob else '—'}  "
+                f"FVG: {'✅' if state.active_fvg else '—'}  "
+                f"Trap: {'✅' if state.active_trap else '—'}",
+                photo_path=path
             )
-            await tg_send_async(caption, photo_path=path)
         else:
-            await tg_send_async("⚠️ Not enough data to generate chart yet.")
+            await tg_send_async("⚠️ Not enough data yet. Please wait...")
+
+    elif cmd in ("/history", "cmd_history"):
+        if not state.trade_history:
+            await tg_send_async("📋 No trade history yet.")
+            return
+        path = generate_history_chart()
+        # Build text summary
+        lines = ["📋 *Trade History (last 10)*\n"]
+        for t in state.trade_history[-10:]:
+            icon = "✅" if t["win"] else "❌"
+            sign = "+" if t["pnl"] > 0 else ""
+            lines.append(
+                f"{icon} `#{t['num']}` {t['direction']} "
+                f"@ `{t['entry']:.2f}` → `{t['exit']:.2f}`  "
+                f"`{sign}{t['pnl']:.2f}`  _{t['ts']}_"
+            )
+        lines.append(
+            f"\n*Total P&L:* `{state.total_pnl:+.2f} {state.account_currency}`\n"
+            f"*W/L:* `{state.wins}/{state.losses}`"
+        )
+        await tg_send_async("\n".join(lines), photo_path=path)
 
     elif cmd in ("/status", "cmd_status"):
-        open_c = len(state.open_contracts)
         mode = "🛑 PAUSED" if state.paused else "🟢 SCANNING"
-        signal_info = ""
+        open_c = len(state.open_contracts)
+        sig_info = ""
         if state.last_signal:
             s = state.last_signal
-            signal_info = (
+            sig_info = (
                 f"\n\n*Last Signal*\n"
-                f"Dir: `{s['direction']}` | Entry: `{s['entry']}`\n"
-                f"SL: `{s['sl']}` | TP1: `{s['tp1']}`\n"
-                f"Struct: `{s['struct']}` | TF: `{s['tf']}`"
+                f"`{s['direction']}` Entry:`{s['entry']}` SL:`{s['sl']}`\n"
+                f"Struct:`{s['struct']}` TF:`{s['tf']}`"
             )
         await tg_send_async(
             f"⚡ *Bot Status*\n"
             f"Mode: {mode}\n"
             f"Price: `{state.current_price:.2f}`\n"
             f"Trend: `{state.trend_bias}`\n"
-            f"Open Contracts: `{open_c}`\n"
-            f"Balance: `{state.account_balance:.2f} {state.account_currency}`"
-            + signal_info,
+            f"Open: `{open_c}` contract(s)\n"
+            f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n"
+            f"W/L: `{state.wins}/{state.losses}`  P&L: `{state.total_pnl:+.2f}`"
+            + sig_info
         )
 
     elif cmd in ("/close_all", "cmd_stop"):
         state.paused = True
         n = await close_all_contracts()
         await tg_send_async(
-            f"🛑 *Emergency Stop Activated*\n"
-            f"Closed `{n}` contract(s).\n"
-            f"Bot is now *PAUSED*.\n"
-            f"Send /resume to restart scanning.",
+            f"🛑 *Emergency Stop*\n"
+            f"Closed `{n}` contract(s). Bot *PAUSED*.\n"
+            f"Press ▶️ Resume or send /resume to restart."
         )
 
-    elif cmd == "/resume":
+    elif cmd in ("/resume", "cmd_resume"):
         state.paused = False
-        await tg_send_async("✅ Bot *RESUMED* — scanning for setups.")
+        await tg_send_async("▶️ Bot *RESUMED* — scanning for setups.")
 
 
 # ─────────────────────────────────────────────
 # MAIN TRADING LOOP
 # ─────────────────────────────────────────────
 async def trading_loop():
-    """Core scanning loop — runs every 30 seconds."""
-    await asyncio.sleep(15)  # Let candles populate
+    await asyncio.sleep(20)
     last_signal_ts = 0
-    SIGNAL_COOLDOWN = 300    # seconds between signals
+    SIGNAL_COOLDOWN = 300
 
     while state.running:
         try:
@@ -943,93 +1000,91 @@ async def trading_loop():
 
             check_trade_management()
 
-            # Don't spam signals
             if time.time() - last_signal_ts < SIGNAL_COOLDOWN:
                 await asyncio.sleep(30)
                 continue
 
-            # M15 primary signal
             signal = compute_signal("M15")
-
-            # Confirm on M5 if M15 gives a signal
             if signal:
-                m5_signal = compute_signal("M5")
-                if m5_signal and m5_signal["direction"] == signal["direction"]:
+                m5_sig = compute_signal("M5")
+                if m5_sig and m5_sig["direction"] == signal["direction"]:
                     log.info(
-                        f"🎯 SIGNAL: {signal['direction']} | "
-                        f"Entry: {signal['entry']} | SL: {signal['sl']} | "
-                        f"TP1: {signal['tp1']} | Struct: {signal['struct']}"
+                        f"🎯 SIGNAL {signal['direction']} "
+                        f"Entry:{signal['entry']} SL:{signal['sl']} TP1:{signal['tp1']}"
                     )
-                    # Generate chart
-                    chart_path = generate_chart(state.m15_candles, "M15")
-
-                    # Telegram notification
+                    # Entry chart screenshot
+                    entry_chart = generate_chart(
+                        state.m15_candles, "M15",
+                        entry_price=signal["entry"],
+                        direction=signal["direction"],
+                        chart_type="entry"
+                    )
                     tg_msg = (
                         f"🎯 *NEW SIGNAL — XAU/USD*\n\n"
                         f"Direction: `{signal['direction']}`\n"
-                        f"Entry:  `{signal['entry']}`\n"
-                        f"SL:     `{signal['sl']}`\n"
+                        f"Entry:    `{signal['entry']}`\n"
+                        f"SL:       `{signal['sl']}`\n"
                         f"TP1 (2R): `{signal['tp1']}`\n"
                         f"TP2 (4R): `{signal['tp2']}`\n"
                         f"TP3 (6R): `{signal['tp3']}`\n\n"
-                        f"H1 Bias: `{signal['bias']}`\n"
-                        f"Structure: `{signal['struct']}`\n"
-                        f"OB: `{signal['ob']['type']}` @ `{signal['ob']['high']:.2f}–{signal['ob']['low']:.2f}`\n"
-                        f"FVG Gap: `{signal['fvg']['gap_pct']:.3f}%`\n"
-                        f"Trap: `{signal['trap']['type']}` swept ✅\n"
-                        f"Stake: `{signal['units']:.2f} {state.account_currency}`"
+                        f"H1 Bias:  `{signal['bias']}`\n"
+                        f"Struct:   `{signal['struct']}`\n"
+                        f"OB: `{signal['ob']['type']}` "
+                        f"`{signal['ob']['high']:.2f}–{signal['ob']['low']:.2f}`\n"
+                        f"FVG Gap:  `{signal['fvg']['gap_pct']:.3f}%`\n"
+                        f"Trap:     `{signal['trap']['type']}` ✅\n"
+                        f"Stake:    `{signal['units']:.2f} {state.account_currency}`"
                     )
-                    if chart_path:
-                        await tg_send_async(tg_msg, photo_path=chart_path)
-                    else:
-                        await tg_send_async(tg_msg)
+                    await tg_send_async(tg_msg, photo_path=entry_chart)
 
-                    # Execute trade
+                    # Execute
                     if state.account_balance > 0:
                         stake = max(1.0, round(state.account_balance * RISK_PCT, 2))
-                        await open_contract(signal["direction"], stake)
-                        last_signal_ts = time.time()
+                        cid = await open_contract(signal["direction"], stake)
+                        if cid:
+                            last_signal_ts = time.time()
+                            await send_request({
+                                "proposal_open_contract": 1,
+                                "contract_id": cid, "subscribe": 1
+                            })
 
         except Exception as e:
-            log.error(f"Trading loop error: {e}\n{traceback.format_exc()}")
+            log.error(f"Trading loop: {e}\n{traceback.format_exc()}")
 
         await asyncio.sleep(30)
 
 
 # ─────────────────────────────────────────────
-# WEBSOCKET CONNECTION MANAGER
+# WEBSOCKET ENGINE
 # ─────────────────────────────────────────────
 async def ws_reader_loop(ws):
-    """Read all incoming WS messages and dispatch them."""
     async for raw in ws:
         try:
-            msg = json.loads(raw)
-            await handle_message(msg)
+            await handle_message(json.loads(raw))
         except Exception as e:
-            log.error(f"Message handler error: {type(e).__name__}: {e}")
+            log.error(f"Handler error: {type(e).__name__}: {e}")
 
 
 async def ws_setup_and_run(ws):
-    """Run auth+subscriptions concurrently with the reader so responses arrive."""
     state.ws = ws
 
     async def setup():
-        await asyncio.sleep(0.1)  # yield so reader task starts first
+        await asyncio.sleep(0.1)
         log.info("Running authorize...")
         await authorize()
         log.info("Authorize OK. Getting balance...")
         await get_account_info()
         log.info("Subscribing candles...")
-        await subscribe_candles(SYMBOL, 3600)   # H1
-        await subscribe_candles(SYMBOL, 900)    # M15
-        await subscribe_candles(SYMBOL, 300)    # M5
+        await subscribe_candles(SYMBOL, 3600)
+        await subscribe_candles(SYMBOL, 900)
+        await subscribe_candles(SYMBOL, 300)
         log.info(f"✅ Subscribed | Balance: {state.account_balance} {state.account_currency}")
         await tg_send_async(
             f"🤖 *SMC-EA Online*\n"
             f"Symbol: `{SYMBOL}`\n"
             f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n"
-            f"Risk: `{RISK_PCT*100:.0f}%` per trade\n"
-            f"TPs: `{TP1_R}R / {TP2_R}R / {TP3_R}R`",
+            f"Risk: `{RISK_PCT*100:.0f}%`  TPs: `{TP1_R}R/{TP2_R}R/{TP3_R}R`\n"
+            f"Auto-chart: every `{CHART_INTERVAL//60}` min"
         )
 
     setup_task = asyncio.ensure_future(setup())
@@ -1044,45 +1099,39 @@ async def ws_setup_and_run(ws):
 
 
 async def ws_connect_loop():
-    """Maintain persistent WebSocket connection with auto-reconnect."""
     retry_delay = 5
     while state.running:
         try:
-            log.info(f"Connecting to Deriv WebSocket: {DERIV_WS_URL}")
+            log.info(f"Connecting: {DERIV_WS_URL}")
             async with websockets.connect(
                 DERIV_WS_URL,
-                ping_interval=25,
-                ping_timeout=10,
-                close_timeout=10,
-                open_timeout=15,
+                ping_interval=25, ping_timeout=10,
+                close_timeout=10, open_timeout=15,
             ) as ws:
-                retry_delay = 5  # reset on successful connect
+                retry_delay = 5
                 await ws_setup_and_run(ws)
-
         except websockets.ConnectionClosed as e:
-            log.warning(f"WS closed: {type(e).__name__}: {e}. Reconnecting in {retry_delay}s…")
+            log.warning(f"WS closed: {e}. Retry in {retry_delay}s")
         except asyncio.TimeoutError as e:
-            log.error(f"WS timeout: {e}. Reconnecting in {retry_delay}s…")
+            log.error(f"WS timeout: {e}. Retry in {retry_delay}s")
         except Exception as e:
-            log.error(f"WS error: {type(e).__name__}: {e}. Reconnecting in {retry_delay}s…")
+            log.error(f"WS error: {type(e).__name__}: {e}. Retry in {retry_delay}s")
             log.error(traceback.format_exc())
         finally:
             state.ws = None
-            # Cancel all pending futures so nothing hangs
             for fut in state.pending_requests.values():
                 if not fut.done():
                     fut.cancel()
             state.pending_requests.clear()
-
         await asyncio.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 60)  # exponential backoff
+        retry_delay = min(retry_delay * 2, 60)
 
 
 # ─────────────────────────────────────────────
-# HEALTH SERVER (Railway)
+# HEALTH SERVER
 # ─────────────────────────────────────────────
 async def health_handler(request):
-    data = {
+    return web.json_response({
         "status":   "running" if state.running else "stopped",
         "paused":   state.paused,
         "balance":  state.account_balance,
@@ -1092,11 +1141,12 @@ async def health_handler(request):
         "trades":   state.trade_count,
         "wins":     state.wins,
         "losses":   state.losses,
+        "total_pnl":state.total_pnl,
         "open":     len(state.open_contracts),
+        "history":  len(state.trade_history),
         "h1_bars":  len(state.h1_candles),
         "m15_bars": len(state.m15_candles),
-    }
-    return web.json_response(data)
+    })
 
 
 async def start_health_server():
@@ -1105,9 +1155,8 @@ async def start_health_server():
     app.router.add_get("/health", health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info(f"Health server on port {PORT}")
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info(f"Health server on :{PORT}")
 
 
 # ─────────────────────────────────────────────
@@ -1117,16 +1166,15 @@ async def main():
     log.info("=" * 55)
     log.info("  SMC-EA  |  XAU/USD  |  Deriv WebSocket  ")
     log.info("=" * 55)
-
     if not DERIV_API_TOKEN:
         log.error("DERIV_API_TOKEN not set. Exiting.")
         return
-
     await asyncio.gather(
         start_health_server(),
         ws_connect_loop(),
         trading_loop(),
         telegram_poll_loop(),
+        chart_broadcast_loop(),
     )
 
 
