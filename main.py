@@ -42,11 +42,20 @@ log = logging.getLogger("SMC-ELITE")
 # PAIR REGISTRY
 # Symbol → (Deriv symbol, pip value, min_stake, display)
 # ══════════════════════════════════════════════════════
+# Primary symbols (real/forex accounts)
+# OTC symbols work on virtual/demo accounts (markets closed or no forex access)
 PAIR_REGISTRY = {
-    "XAUUSD":  ("frxXAUUSD",  0.01,  1.0,  "XAU/USD 🥇"),
-    "EURUSD":  ("frxEURUSD",  0.0001, 1.0,  "EUR/USD 🇪🇺"),
-    "GBPUSD":  ("frxGBPUSD",  0.0001, 1.0,  "GBP/USD 🇬🇧"),
-    "US100":   ("OTC_NDX",    0.1,   1.0,  "NASDAQ 💻"),
+    "XAUUSD":  ("frxXAUUSD",  0.01,   1.0, "XAU/USD 🥇"),
+    "EURUSD":  ("frxEURUSD",  0.0001, 1.0, "EUR/USD 🇪🇺"),
+    "GBPUSD":  ("frxGBPUSD",  0.0001, 1.0, "GBP/USD 🇬🇧"),
+    "US100":   ("frxUS100",   0.1,    1.0, "NASDAQ 💻"),
+}
+# OTC fallback symbols (always available on demo/virtual accounts)
+PAIR_OTC_FALLBACK = {
+    "XAUUSD":  "OTC_XAUUSD",
+    "EURUSD":  "OTC_EURUSD",
+    "GBPUSD":  "OTC_GBPUSD",
+    "US100":   "OTC_NDX",
 }
 
 # ══════════════════════════════════════════════════════
@@ -989,6 +998,34 @@ async def get_account_info():
     return resp
 
 
+async def _try_symbol_variants(base_key: str) -> str:
+    """
+    Deriv has different symbol names depending on account type:
+    - Real/financial accounts: frxXAUUSD, frxEURUSD etc.
+    - Virtual/demo accounts: may need OTC_ prefix or different name
+    Try the primary symbol first, then OTC fallback.
+    """
+    primary = PAIR_REGISTRY[base_key][0]
+    fallback = PAIR_OTC_FALLBACK.get(base_key, primary)
+    # Quick test: request 1 candle to check if symbol is valid
+    for sym in [primary, fallback]:
+        try:
+            test = await send_request({
+                "ticks_history": sym, "end": "latest",
+                "count": 1, "granularity": 900, "style": "candles",
+            })
+            if "candles" in test:
+                log.info(f"Symbol {sym} is valid ✅")
+                return sym
+            else:
+                err = test.get("error", {})
+                log.warning(f"Symbol {sym} rejected: {err.get('message','?')}")
+        except Exception as e:
+            log.warning(f"Symbol test {sym}: {e}")
+    log.error(f"No valid symbol found for {base_key}, using primary anyway")
+    return primary
+
+
 async def subscribe_pair(symbol: str):
     """Subscribe H1/M15/M5 and immediately load historical candles."""
     state.h1_candles.clear()
@@ -1024,9 +1061,38 @@ async def subscribe_pair(symbol: str):
                 _update_candles(gran, rows)
                 log.info(f"Loaded {len(rows)} {gran_map[gran]} candles for {symbol}")
             else:
-                log.warning(f"No candles in response gran={gran}: {list(resp.keys())}")
+                err = resp.get("error", {})
+                log.warning(
+                    f"No candles gran={gran} symbol={symbol}: "
+                    f"error={err.get('message','?')} code={err.get('code','?')} "
+                    f"keys={list(resp.keys())}"
+                )
+                # Try fallback: request without subscribe first
+                try:
+                    resp2 = await send_request({
+                        "ticks_history": symbol, "end": "latest",
+                        "count": 100, "granularity": gran,
+                        "style": "candles",
+                    })
+                    candles_raw2 = resp2.get("candles", [])
+                    if candles_raw2:
+                        rows2 = [
+                            (int(c["epoch"]), float(c["open"]), float(c["high"]),
+                             float(c["low"]),  float(c["close"]))
+                            for c in candles_raw2
+                        ]
+                        _update_candles(gran, rows2)
+                        log.info(f"Fallback loaded {len(rows2)} {gran_map[gran]} candles")
+                    else:
+                        err2 = resp2.get("error", {})
+                        log.error(
+                            f"Fallback also failed gran={gran}: "
+                            f"{err2.get('message','?')} code={err2.get('code','?')}"
+                        )
+                except Exception as e2:
+                    log.error(f"Fallback exception gran={gran}: {e2}")
         except Exception as e:
-            log.error(f"subscribe_pair gran={gran}: {e}")
+            log.error(f"subscribe_pair gran={gran}: {type(e).__name__}: {e}")
 
     state.subscribed_pair = symbol
     log.info(
@@ -1521,10 +1587,13 @@ async def _cmd(cmd: str):
             # Re-subscribe if WS is live
             if state.ws and state.subscribed_pair != state.pair_symbol:
                 try:
-                    await subscribe_pair(state.pair_symbol)
+                    valid_sym = await _try_symbol_variants(state.pair_key)
+                    await subscribe_pair(valid_sym)
+                    m15 = len(state.m15_candles)
                     await tg_async(
                         f"💱 Pair changed to `{state.pair_display}`\n"
-                        f"Re-subscribed to live data ✅",
+                        f"Symbol: `{valid_sym}`\n"
+                        f"M15 bars loaded: `{m15}` ✅",
                         reply_markup=kb_main()
                     )
                 except Exception as e:
@@ -1619,7 +1688,9 @@ async def ws_setup_and_run(ws):
         await authorize()
         await get_account_info()
         log.info(f"Balance: {state.account_balance} {state.account_currency}")
-        await subscribe_pair(state.pair_symbol)
+        # Auto-detect correct symbol for this account type
+        valid_sym = await _try_symbol_variants(state.pair_key)
+        await subscribe_pair(valid_sym)
         await tg_async(
             f"🤖 *SMC ELITE EA Online*\n"
             f"Pair: `{state.pair_display}`\n"
