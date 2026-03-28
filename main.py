@@ -146,6 +146,14 @@ def tg_answer_callback(callback_query_id: str, text: str = ""):
         pass
 
 
+async def tg_send_async(text: str, photo_path: str = None, reply_markup=None):
+    """Non-blocking async wrapper for tg_send — safe to call from async code."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: tg_send(text, photo_path, reply_markup)
+    )
+
+
 # ─────────────────────────────────────────────
 # CHART GENERATION
 # ─────────────────────────────────────────────
@@ -664,15 +672,21 @@ def check_trade_management():
                 info["be_moved"] = True
                 sig["sl"] = entry
                 log.info(f"[{cid}] BreakEven triggered — SL moved to {entry}")
-                tg_send(f"✅ *BreakEven* triggered for `{cid}`\nSL moved to entry: `{entry}`",
-                        reply_markup=INLINE_KB)
+                asyncio.get_event_loop().call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        tg_send_async(f"✅ *BreakEven* triggered for `{cid}`\nSL moved to entry: `{entry}`")
+                    )
+                )
 
             elif direction == "SELL" and price <= tp1:
                 info["be_moved"] = True
                 sig["sl"] = entry
                 log.info(f"[{cid}] BreakEven triggered — SL moved to {entry}")
-                tg_send(f"✅ *BreakEven* triggered for `{cid}`\nSL moved to entry: `{entry}`",
-                        reply_markup=INLINE_KB)
+                asyncio.get_event_loop().call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        tg_send_async(f"✅ *BreakEven* triggered for `{cid}`\nSL moved to entry: `{entry}`")
+                    )
+                )
 
         # Dynamic Trailing Stop using last swing
         if len(state.m15_candles) >= 10:
@@ -759,12 +773,11 @@ async def handle_message(msg: dict):
                 else:
                     state.losses += 1
                 state.open_contracts.pop(cid, None)
-                tg_send(
+                asyncio.ensure_future(tg_send_async(
                     f"{'✅ WIN' if profit > 0 else '❌ LOSS'}  Contract `{cid}`\n"
                     f"P&L: `{profit:.2f}` {state.account_currency}\n"
                     f"Record: {state.wins}W / {state.losses}L",
-                    reply_markup=INLINE_KB
-                )
+                ))
 
     elif mtype == "balance":
         state.account_balance  = msg["balance"]["balance"]
@@ -778,25 +791,35 @@ async def handle_message(msg: dict):
 # TELEGRAM POLLING LOOP
 # ─────────────────────────────────────────────
 async def telegram_poll_loop():
-    """Long-poll Telegram for commands and callback queries."""
+    """Long-poll Telegram for commands and callback queries (non-blocking)."""
     if not TELEGRAM_TOKEN:
+        log.warning("TELEGRAM_TOKEN not set — Telegram polling disabled.")
         return
     offset = 0
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    loop = asyncio.get_event_loop()
 
     while state.running:
         try:
-            r = requests.get(
-                f"{base}/getUpdates",
-                params={"offset": offset, "timeout": 25},
-                timeout=30,
-            )
-            updates = r.json().get("result", [])
+            def do_poll():
+                return requests.get(
+                    f"{base}/getUpdates",
+                    params={"offset": offset, "timeout": 20},
+                    timeout=25,
+                )
+            r = await loop.run_in_executor(None, do_poll)
+            data = r.json()
+            if not data.get("ok"):
+                log.error(f"Telegram getUpdates error: {data.get('description', data)}")
+                await asyncio.sleep(10)
+                continue
+            updates = data.get("result", [])
             for update in updates:
                 offset = update["update_id"] + 1
                 await handle_telegram_update(update)
         except Exception as e:
-            log.error(f"Telegram poll error: {e}")
+            log.error(f"Telegram poll error: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
         await asyncio.sleep(1)
 
 
@@ -828,21 +851,19 @@ async def process_command(cmd: str):
     cmd = cmd.lower().strip()
 
     if cmd in ("/start", "/help"):
-        tg_send(
+        await tg_send_async(
             "🤖 *SMC-EA XAU/USD Bot*\n\n"
             "Smart Money Concepts Expert Advisor\n"
             f"Symbol: `{SYMBOL}` | Risk: `{RISK_PCT*100:.0f}%`\n\n"
             "Use the buttons below to interact:",
-            reply_markup=INLINE_KB,
         )
 
     elif cmd in ("/balance", "cmd_balance"):
         await get_account_info()
-        tg_send(
+        await tg_send_async(
             f"💰 *Account Balance*\n"
             f"`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Trades: {state.trade_count} | W/L: {state.wins}/{state.losses}",
-            reply_markup=INLINE_KB,
         )
 
     elif cmd in ("/chart", "cmd_chart"):
@@ -856,9 +877,9 @@ async def process_command(cmd: str):
                 f"FVG: {'✅' if state.active_fvg else '❌'}  "
                 f"Trap: {'✅' if state.active_trap else '❌'}"
             )
-            tg_send(caption, photo_path=path, reply_markup=INLINE_KB)
+            await tg_send_async(caption, photo_path=path)
         else:
-            tg_send("⚠️ Not enough data to generate chart yet.", reply_markup=INLINE_KB)
+            await tg_send_async("⚠️ Not enough data to generate chart yet.")
 
     elif cmd in ("/status", "cmd_status"):
         open_c = len(state.open_contracts)
@@ -872,7 +893,7 @@ async def process_command(cmd: str):
                 f"SL: `{s['sl']}` | TP1: `{s['tp1']}`\n"
                 f"Struct: `{s['struct']}` | TF: `{s['tf']}`"
             )
-        tg_send(
+        await tg_send_async(
             f"⚡ *Bot Status*\n"
             f"Mode: {mode}\n"
             f"Price: `{state.current_price:.2f}`\n"
@@ -880,23 +901,21 @@ async def process_command(cmd: str):
             f"Open Contracts: `{open_c}`\n"
             f"Balance: `{state.account_balance:.2f} {state.account_currency}`"
             + signal_info,
-            reply_markup=INLINE_KB,
         )
 
     elif cmd in ("/close_all", "cmd_stop"):
         state.paused = True
         n = await close_all_contracts()
-        tg_send(
+        await tg_send_async(
             f"🛑 *Emergency Stop Activated*\n"
             f"Closed `{n}` contract(s).\n"
             f"Bot is now *PAUSED*.\n"
             f"Send /resume to restart scanning.",
-            reply_markup=INLINE_KB,
         )
 
     elif cmd == "/resume":
         state.paused = False
-        tg_send("✅ Bot *RESUMED* — scanning for setups.", reply_markup=INLINE_KB)
+        await tg_send_async("✅ Bot *RESUMED* — scanning for setups.")
 
 
 # ─────────────────────────────────────────────
@@ -953,9 +972,9 @@ async def trading_loop():
                         f"Stake: `{signal['units']:.2f} {state.account_currency}`"
                     )
                     if chart_path:
-                        tg_send(tg_msg, photo_path=chart_path, reply_markup=INLINE_KB)
+                        await tg_send_async(tg_msg, photo_path=chart_path)
                     else:
-                        tg_send(tg_msg, reply_markup=INLINE_KB)
+                        await tg_send_async(tg_msg)
 
                     # Execute trade
                     if state.account_balance > 0:
@@ -997,13 +1016,12 @@ async def ws_connect_loop():
                 await subscribe_candles(SYMBOL, 300)    # M5
 
                 log.info(f"✅ Subscribed to {SYMBOL} | Balance: {state.account_balance} {state.account_currency}")
-                tg_send(
+                await tg_send_async(
                     f"🤖 *SMC-EA Online*\n"
                     f"Symbol: `{SYMBOL}`\n"
                     f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n"
                     f"Risk: `{RISK_PCT*100:.0f}%` per trade\n"
                     f"TPs: `{TP1_R}R / {TP2_R}R / {TP3_R}R`",
-                    reply_markup=INLINE_KB,
                 )
 
                 async for raw in ws:
@@ -1011,9 +1029,10 @@ async def ws_connect_loop():
                     await handle_message(msg)
 
         except websockets.ConnectionClosed as e:
-            log.warning(f"WS closed: {e}. Reconnecting in {retry_delay}s…")
+            log.warning(f"WS closed: {type(e).__name__}: {e}. Reconnecting in {retry_delay}s…")
         except Exception as e:
-            log.error(f"WS error: {e}. Reconnecting in {retry_delay}s…")
+            log.error(f"WS error: {type(e).__name__}: {e}. Reconnecting in {retry_delay}s…")
+            log.error(traceback.format_exc())
         finally:
             state.ws = None
 
