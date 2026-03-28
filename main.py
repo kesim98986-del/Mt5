@@ -543,10 +543,17 @@ async def send_request(payload: dict) -> dict:
     req_id = state.req_id
     state.req_id += 1
     payload["req_id"] = req_id
-    future = asyncio.get_event_loop().create_future()
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
     state.pending_requests[req_id] = future
     await state.ws.send(json.dumps(payload))
-    return await asyncio.wait_for(future, timeout=15)
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout=20)
+    except asyncio.TimeoutError:
+        state.pending_requests.pop(req_id, None)
+        raise asyncio.TimeoutError(
+            f"Timeout waiting for response: keys={list(payload.keys())}"
+        )
 
 
 async def authorize():
@@ -859,7 +866,8 @@ async def process_command(cmd: str):
         )
 
     elif cmd in ("/balance", "cmd_balance"):
-        await get_account_info()
+        if state.ws is not None:
+            await get_account_info()
         await tg_send_async(
             f"💰 *Account Balance*\n"
             f"`{state.account_balance:.2f} {state.account_currency}`\n"
@@ -991,6 +999,50 @@ async def trading_loop():
 # ─────────────────────────────────────────────
 # WEBSOCKET CONNECTION MANAGER
 # ─────────────────────────────────────────────
+async def ws_reader_loop(ws):
+    """Read all incoming WS messages and dispatch them."""
+    async for raw in ws:
+        try:
+            msg = json.loads(raw)
+            await handle_message(msg)
+        except Exception as e:
+            log.error(f"Message handler error: {type(e).__name__}: {e}")
+
+
+async def ws_setup_and_run(ws):
+    """Run auth+subscriptions concurrently with the reader so responses arrive."""
+    state.ws = ws
+
+    async def setup():
+        await asyncio.sleep(0.1)  # yield so reader task starts first
+        log.info("Running authorize...")
+        await authorize()
+        log.info("Authorize OK. Getting balance...")
+        await get_account_info()
+        log.info("Subscribing candles...")
+        await subscribe_candles(SYMBOL, 3600)   # H1
+        await subscribe_candles(SYMBOL, 900)    # M15
+        await subscribe_candles(SYMBOL, 300)    # M5
+        log.info(f"✅ Subscribed | Balance: {state.account_balance} {state.account_currency}")
+        await tg_send_async(
+            f"🤖 *SMC-EA Online*\n"
+            f"Symbol: `{SYMBOL}`\n"
+            f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n"
+            f"Risk: `{RISK_PCT*100:.0f}%` per trade\n"
+            f"TPs: `{TP1_R}R / {TP2_R}R / {TP3_R}R`",
+        )
+
+    setup_task = asyncio.ensure_future(setup())
+    try:
+        await ws_reader_loop(ws)
+    finally:
+        setup_task.cancel()
+        try:
+            await setup_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 async def ws_connect_loop():
     """Maintain persistent WebSocket connection with auto-reconnect."""
     retry_delay = 5
@@ -1002,39 +1054,25 @@ async def ws_connect_loop():
                 ping_interval=25,
                 ping_timeout=10,
                 close_timeout=10,
+                open_timeout=15,
             ) as ws:
-                state.ws = ws
                 retry_delay = 5  # reset on successful connect
-
-                # Auth & subscriptions
-                await authorize()
-                await get_account_info()
-
-                # Subscribe to candles: H1, M15, M5
-                await subscribe_candles(SYMBOL, 3600)   # H1
-                await subscribe_candles(SYMBOL, 900)    # M15
-                await subscribe_candles(SYMBOL, 300)    # M5
-
-                log.info(f"✅ Subscribed to {SYMBOL} | Balance: {state.account_balance} {state.account_currency}")
-                await tg_send_async(
-                    f"🤖 *SMC-EA Online*\n"
-                    f"Symbol: `{SYMBOL}`\n"
-                    f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n"
-                    f"Risk: `{RISK_PCT*100:.0f}%` per trade\n"
-                    f"TPs: `{TP1_R}R / {TP2_R}R / {TP3_R}R`",
-                )
-
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    await handle_message(msg)
+                await ws_setup_and_run(ws)
 
         except websockets.ConnectionClosed as e:
             log.warning(f"WS closed: {type(e).__name__}: {e}. Reconnecting in {retry_delay}s…")
+        except asyncio.TimeoutError as e:
+            log.error(f"WS timeout: {e}. Reconnecting in {retry_delay}s…")
         except Exception as e:
             log.error(f"WS error: {type(e).__name__}: {e}. Reconnecting in {retry_delay}s…")
             log.error(traceback.format_exc())
         finally:
             state.ws = None
+            # Cancel all pending futures so nothing hangs
+            for fut in state.pending_requests.values():
+                if not fut.done():
+                    fut.cancel()
+            state.pending_requests.clear()
 
         await asyncio.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, 60)  # exponential backoff
