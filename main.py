@@ -50,7 +50,8 @@ class Cfg:
     TP2_RR          = 4.0
     OB_LOOKBACK     = 30
     SCAN_SECS       = 300
-    SESSIONS =      = ((0, 24),)
+        SESSIONS = ((0, 24),)
+
     GEMINI_MODEL    = "gemini-1.5-flash"
 
     # የWebSocket URL ከApp ID ጋር ተስተካክሏል
