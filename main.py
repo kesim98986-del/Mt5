@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  SMC SNIPER EA  v5.0  —  Fully Autonomous Trading Bot               ║
+║  SMC SNIPER EA  v5.1  —  Multi-Strategy Autonomous Trading Bot      ║
 ║  Senior Quant SMC | Sniper Brain | News Shield | Broker Connect     ║
 ║  Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready        ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -58,6 +58,7 @@ GRAN_FALLBACKS = {
     3600: [3600, 7200],
     900:  [900,  600,  1800],
     300:  [300,  180,  600],
+    60:   [60,   120],
 }
 
 # Forex sessions in UTC hours
@@ -86,7 +87,6 @@ PRE_NEWS_BLOCK  = 30 * 60   # seconds
 POST_NEWS_WAIT  = 15 * 60
 NEWS_INTERVAL   = 12 * 3600
 CHART_INTERVAL  = int(os.getenv("CHART_INTERVAL", "300"))
-MIN_SCORE       = int(os.getenv("MIN_SCORE", "75"))   # 75/100 ≈ 8/10
 PORT            = int(os.getenv("PORT", "8080"))
 
 DERIV_APP_ID    = os.getenv("DERIV_APP_ID", "1089")
@@ -135,7 +135,7 @@ class TradeReason:
             f"Score: `{self.score}/100`",
             "",
             f"*Multi-Timeframe Analysis:*",
-            f"• H1 Trend:    `{self.h1_trend}`",
+            f"• Trend:       `{self.h1_trend}`",
             f"• Structure:   `{self.structure}`",
             f"• Zone:        `{self.pd_zone}`",
             "",
@@ -162,7 +162,7 @@ class TradeReason:
         return (
             f"🤖 *ቦቱ ዝርዝር ምክንያት:*\n"
             f"አቅጣጫ: `{arrow}`\n"
-            f"• H1 ዝንባሌ: `{self.h1_trend}`\n"
+            f"• ዋና ዝንባሌ: `{self.h1_trend}`\n"
             f"• IDM ተወስዷል: `{self.idm_sweep}`\n"
             f"• ወጥመድ ተወስዷል: `{self.trap_sweep}`\n"
             f"• OB ዓይነት: `{self.ob_type}`\n"
@@ -193,6 +193,13 @@ class BotState:
         self.block_trading    = False
         self.block_reason     = ""
 
+        # ── Multi-Strategy Toggle ──
+        self.trading_mode     = "SNIPER"    # "SNIPER" or "SCALPER"
+        self.min_score        = int(os.getenv("MIN_SCORE", "75"))
+        self.trend_tf         = "H1"
+        self.exec_tf          = "M15"
+        self.conf_tf          = "M5"
+
         # ── Pair settings ──
         self.pair_key         = "XAUUSD"
         self.active_symbol    = ""
@@ -206,7 +213,8 @@ class BotState:
         self.h1_candles       = deque(maxlen=300)
         self.m15_candles      = deque(maxlen=300)
         self.m5_candles       = deque(maxlen=300)
-        self.gran_actual      = {3600:3600, 900:900, 300:300}
+        self.m1_candles       = deque(maxlen=300)
+        self.gran_actual      = {3600:3600, 900:900, 300:300, 60:60}
 
         # ── Price & analysis ──
         self.current_price    = 0.0
@@ -324,13 +332,22 @@ def kb_main():
 def kb_settings():
     r  = state.risk_pct * 100
     sm = "✅" if state.small_acc_mode else "○"
+    md = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
     return {"inline_keyboard": [
+        [{"text": f"🎛 Mode: {md}",           "callback_data": "cmd_mode_menu"}],
         [{"text": "💱 Select Pair",            "callback_data": "cmd_pair_menu"}],
         [{"text": f"{sm} 💎 Small Acc ($10)",  "callback_data": "cmd_small_acc"}],
         [{"text": f"{'✅' if r==1 else '○'} 1% Risk",  "callback_data": "cmd_risk_1"},
          {"text": f"{'✅' if r==3 else '○'} 3% Risk",  "callback_data": "cmd_risk_3"},
          {"text": f"{'✅' if r==5 else '○'} 5% Risk",  "callback_data": "cmd_risk_5"}],
         [{"text": "⬅️ Back",                   "callback_data": "cmd_back"}],
+    ]}
+
+def kb_mode():
+    return {"inline_keyboard": [
+        [{"text": "🎯 Switch to Sniper (H1/M15/M5)",  "callback_data": "cmd_mode_sniper"}],
+        [{"text": "⚡ Switch to Scalper (M15/M5/M1)", "callback_data": "cmd_mode_scalper"}],
+        [{"text": "⬅️ Back",                          "callback_data": "cmd_settings"}],
     ]}
 
 def kb_pair_menu():
@@ -712,10 +729,10 @@ def generate_chart(candles:deque, tf:str="M15",
            if nxt and nxt.dt_utc else"")
     score_s=f"Score:{state.ob_score}/100  " if state.ob_score else""
     al.text(.01,.5,
-        f"SMC SNIPER v5  ·  {state.pair_display}  sym:{state.active_symbol}  "
+        f"SMC SNIPER v5.1 [{state.trading_mode}]  ·  {state.pair_display}  sym:{state.active_symbol}  "
         f"Bal:{state.account_balance:.2f}{state.account_currency}  "
         f"Risk:{state.risk_pct*100:.0f}%  {score_s}"
-        f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} M5:{len(state.m5_candles)}"
+        f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
         f"{nxt_s}  {ts}",
         color="#444d56",fontsize=6,va="center",fontfamily="monospace")
 
@@ -759,7 +776,7 @@ def generate_history_chart() -> Optional[str]:
     ax2.fill_between(labels,cum,alpha=.12,color=cc)
     ax2.axhline(0,color=GR,lw=.8); ax2.set_ylabel("Cumulative",color="#90a4ae",fontsize=8)
     ts=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99,.01,f"SMC SNIPER v5 · {ts}",color="#444d56",fontsize=7,ha="right")
+    fig.text(.99,.01,f"SMC SNIPER v5.1 · {ts}",color="#444d56",fontsize=7,ha="right")
     path="/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path,dpi=120,bbox_inches="tight",facecolor=fig.get_facecolor())
@@ -862,9 +879,14 @@ def _pd_zone(df:pd.DataFrame):
     pct=(state.current_price-fl)/(fh-fl)
     return ("DISCOUNT" if pct<.5 else "PREMIUM"),fh,fl
 
-def _h1_trend()->str:
-    if len(state.h1_candles)<30: return "NEUTRAL"
-    df=pd.DataFrame(list(state.h1_candles)); df.columns=["time","open","high","low","close"]
+def _get_trend(tf_name: str)->str:
+    if tf_name == "H1":
+        buf = state.h1_candles
+    else:
+        buf = state.m15_candles
+        
+    if len(buf)<30: return "NEUTRAL"
+    df=pd.DataFrame(list(buf)); df.columns=["time","open","high","low","close"]
     r=_bos_choch(df)
     if r: state.trend_bias=r["direction"]
     else:
@@ -895,11 +917,15 @@ def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type
     return min(s,100), reasons
 
 def compute_signal(tf:str="M15") -> Optional[dict]:
-    buf=state.m15_candles if tf=="M15" else state.m5_candles
+    if tf=="M15": buf = state.m15_candles
+    elif tf=="M5": buf = state.m5_candles
+    elif tf=="M1": buf = state.m1_candles
+    else: return None
+
     if len(buf)<40: return None
     df=pd.DataFrame(list(buf)); df.columns=["time","open","high","low","close"]
 
-    bias=_h1_trend()
+    bias=_get_trend(state.trend_tf)
     if bias=="NEUTRAL": return None
 
     struct=_bos_choch(df)
@@ -947,13 +973,13 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     sc,score_reasons=sniper_score(ob_,fvg_,trap,idm,rsi_now,session,
                                    atr_ok,ema_ok,candle_ok,struct["type"],disp)
     state.ob_score=sc
-    min_sc=MIN_SCORE
+    min_sc=state.min_score
     if sc<min_sc:
         log.info(f"Score {sc}<{min_sc} — skip. Reasons: {score_reasons}")
         return None
 
     reason=TradeReason()
-    reason.h1_trend   =f"H1 {bias}"
+    reason.h1_trend   =f"{state.trend_tf} {bias}"
     reason.structure  =f"{struct['type']} {bias}"
     reason.pd_zone    =pd_zone
     reason.idm_sweep  ="✅ Confirmed" if idm.get("swept") else "⚠️ Partial"
@@ -1008,8 +1034,9 @@ def check_trade_mgmt():
                 asyncio.ensure_future(tg_async(
                     f"✅ *BreakEven* `{cid}`\nSL → Entry `{sig['entry']}`"))
         # Trailing stop
-        if len(state.m15_candles)>=10:
-            df=pd.DataFrame(list(state.m15_candles)[-30:])
+        buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
+        if len(buf)>=10:
+            df=pd.DataFrame(list(buf)[-30:])
             df.columns=["time","open","high","low","close"]
             swh,swl=_swing_pts(df,n=3)
             if d=="BUY"  and swl:
@@ -1063,9 +1090,12 @@ def _store(nom:int,rows:list):
     elif nom==300:
         state.m5_candles.extend(rows)
         if rows: state.current_price=float(rows[-1][4])
+    elif nom==60:
+        state.m1_candles.extend(rows)
+        if rows: state.current_price=float(rows[-1][4])
 
 async def _fetch(sym:str,nom:int)->int:
-    lbl={3600:"H1",900:"M15",300:"M5"}
+    lbl={3600:"H1",900:"M15",300:"M5",60:"M1"}
     for ag in GRAN_FALLBACKS.get(nom,[nom]):
         try:
             r=await send_req({"ticks_history":sym,"end":"latest",
@@ -1095,15 +1125,16 @@ async def _resolve_sym(key:str)->str:
     return pri
 
 async def subscribe_pair(key:str):
-    state.h1_candles.clear(); state.m15_candles.clear(); state.m5_candles.clear()
+    state.h1_candles.clear(); state.m15_candles.clear()
+    state.m5_candles.clear(); state.m1_candles.clear()
     state.last_signal=None; state.active_ob=None; state.active_fvg=None
     state.active_trap=None; state.active_idm=None
     state.current_price=0.; state.trend_bias="NEUTRAL"
     state.ob_score=0; state.premium_discount="NEUTRAL"
     sym=await _resolve_sym(key); state.active_symbol=sym; state.subscribed_sym=sym
-    h=await _fetch(sym,3600); m=await _fetch(sym,900); f=await _fetch(sym,300)
-    log.info(f"subscribe_pair done: {sym} H1:{h} M15:{m} M5:{f}")
-    return h,m,f
+    h=await _fetch(sym,3600); m=await _fetch(sym,900); f=await _fetch(sym,300); o=await _fetch(sym,60)
+    log.info(f"subscribe_pair done: {sym} H1:{h} M15:{m} M5:{f} M1:{o}")
+    return h,m,f,o
 
 async def open_contract(direction:str,amount:float)->Optional[str]:
     if state.paused or state.block_trading: return None
@@ -1183,7 +1214,9 @@ async def handle_msg(msg:dict):
                 "session":sig.get("session","?"),
                 "ts":datetime.now(UTC).strftime("%m/%d %H:%M")})
             if len(state.trade_history)>50: state.trade_history.pop(0)
-            chart=generate_chart(state.m15_candles,"M15",
+            
+            buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
+            chart=generate_chart(buf_for_chart,state.exec_tf,
                 entry_price=info.get("entry"),exit_price=exit_s,
                 direction=info.get("direction"),pnl=profit,chart_type="exit")
             sign="+" if profit>0 else""
@@ -1215,16 +1248,11 @@ async def handle_msg(msg:dict):
 # SILENT BACKGROUND SCANNER (NO TELEGRAM SPAM)
 # ══════════════════════════════════════════════════════════════════════
 async def chart_loop():
-    """ 
-    This loop now ONLY logs to the console/terminal.
-    It WILL NOT send any automatic updates to Telegram anymore.
-    """
     await asyncio.sleep(50)
     while state.running:
         try:
             if state.current_price>0 and len(state.m15_candles)>=20:
-                # Silently scan the market in the background
-                log.info(f"Silent Scan Active: {state.pair_display} | Bias: {state.trend_bias} | Zone: {state.premium_discount} | Score: {state.ob_score}/100")
+                log.info(f"Silent Scan Active: {state.pair_display} | Mode: {state.trading_mode} | Bias: {state.trend_bias} | Zone: {state.premium_discount} | Score: {state.ob_score}/100")
         except Exception as e:
             log.error(f"chart_loop: {e}")
         await asyncio.sleep(CHART_INTERVAL)
@@ -1250,20 +1278,21 @@ async def trading_loop():
             if time.time()-state.last_trade_ts < state.signal_cooldown:
                 await asyncio.sleep(30); continue
 
-            sig=compute_signal("M15")
+            sig=compute_signal(state.exec_tf)
             if sig:
-                sig5=compute_signal("M5")
-                if sig5 and sig5["direction"]==sig["direction"]:
-                    log.info(f"🎯 AUTO EXECUTE {sig['direction']} score:{sig['ob_score']}")
+                sig_conf=compute_signal(state.conf_tf)
+                if sig_conf and sig_conf["direction"]==sig["direction"]:
+                    log.info(f"🎯 AUTO EXECUTE {sig['direction']} score:{sig['ob_score']} Mode:{state.trading_mode}")
                     reason=sig.get("reason")
-                    chart=generate_chart(state.m15_candles,"M15",
+                    buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
+                    chart=generate_chart(buf_for_chart,state.exec_tf,
                         entry_price=sig["entry"],direction=sig["direction"],
                         chart_type="entry",reason=reason)
                     score_txt=" + ".join(sig.get("score_reasons",[])[:5])
                     
-                    # Execution alert
+                    md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
                     await tg_async(
-                        f"🎯 *SNIPER ENTRY — {state.pair_display}*\n"
+                        f"🚀 *{md_lbl} ENTRY — {state.pair_display}*\n"
                         f"Score: `{sig['ob_score']}/100` ✅ Autonomous\n\n"
                         f"Dir:    `{sig['direction']}`\n"
                         f"Entry:  `{sig['entry']}`\n"
@@ -1354,8 +1383,8 @@ async def _process_token(token:str):
             f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n\n"
             f"_Sniper Brain is now active. Scanning for high-quality setups..._",
             reply_markup=kb_main())
-        h,m,f=await subscribe_pair(state.pair_key)
-        log.info(f"Re-subscribed after token: H1:{h} M15:{m} M5:{f}")
+        h,m,f,o=await subscribe_pair(state.pair_key)
+        log.info(f"Re-subscribed after token: H1:{h} M15:{m} M5:{f} M1:{o}")
     except Exception as e:
         await tg_async(f"❌ Authentication failed: `{e}`\n\nPlease check your token and try again.",
                        reply_markup=kb_connect())
@@ -1369,16 +1398,18 @@ async def _cmd(cmd:str):
             else("🛑 PAUSED" if state.paused else"🟢 AUTONOMOUS"))
         conn=("✅ Connected" if state.broker_connected
               else"❌ Not connected — tap 🔗 Connect Broker")
+        md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
         await tg_async(
             f"{mkt}\n\n"
-            f"🤖 *SMC SNIPER EA v5*\n\n"
+            f"🤖 *SMC SNIPER EA v5.1*\n\n"
             f"Status: {bl}\n"
             f"Broker: {conn}\n"
+            f"Strategy: `{md_lbl}`\n"
             f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
             f"Bal: `{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair: `{state.pair_display}`  Risk:`{state.risk_pct*100:.0f}%`\n"
-            f"Min Score: `{MIN_SCORE}/100`\n"
-            f"H1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}`",
+            f"Min Score: `{state.min_score}/100`\n"
+            f"H1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}` M1:`{len(state.m1_candles)}`",
             reply_markup=kb_main())
 
     elif cmd in("/status","cmd_status"):
@@ -1394,10 +1425,12 @@ async def _cmd(cmd:str):
             sig_s=(f"\n\n*Last Setup Detected:*\n"
                    f"`{s['direction']}` @ `{s['entry']}`  SL:`{s['sl']}`\n"
                    f"Score:`{s['ob_score']}/100`  {s['struct']}  {s['pd_zone']}")
+        md_lbl="🎯 SMC Sniper" if state.trading_mode=="SNIPER" else"⚡ Quick Scalper"
         await tg_async(
             f"{mkt}\n\n"
             f"⚡ *Sniper Status*\n"
             f"Mode: {bl}\n"
+            f"Strategy: `{md_lbl}`\n"
             f"Pair: `{state.pair_display}`  Price:`{state.current_price:.5f}`\n"
             f"Bias:`{state.trend_bias}`  Zone:`{state.premium_discount}`\n"
             f"Session:`{state.session_now}`  ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
@@ -1429,15 +1462,18 @@ async def _cmd(cmd:str):
             photo_path=state.news_chart_path, reply_markup=kb_main())
 
     elif cmd in("/chart","cmd_chart"):
-        m15=len(state.m15_candles)
-        if m15>=20:
-            path=generate_chart(state.m15_candles,"M15",chart_type="live")
+        buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
+        chart_tf = state.exec_tf
+        
+        if len(buf_for_chart)>=20:
+            path=generate_chart(buf_for_chart,chart_tf,chart_type="live")
             if path:
                 pe="🟢" if state.premium_discount=="DISCOUNT" else"🔴" if state.premium_discount=="PREMIUM" else"⚪"
                 blk="  🚫NEWS BLOCK" if state.block_trading else""
+                md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
                 await tg_async(
                     f"{market_header()}\n\n"
-                    f"📊 *{state.pair_display}  M15*{blk}\n"
+                    f"📊 *{state.pair_display}  {chart_tf}* [{md_lbl}]{blk}\n"
                     f"Price:`{state.current_price:.5f}`  Bias:`{state.trend_bias}`\n"
                     f"Zone:{pe}`{state.premium_discount}`  Score:`{state.ob_score}/100`\n"
                     f"Session:`{state.session_now}`  ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
@@ -1447,7 +1483,7 @@ async def _cmd(cmd:str):
         await tg_async(
             f"{market_header()}\n\n"
             f"⚠️ *Chart not ready*\n"
-            f"M15:`{m15}` bars (needs 20+)  sym:`{state.active_symbol}`\n"
+            f"{chart_tf}:`{len(buf_for_chart)}` bars (needs 20+)  sym:`{state.active_symbol}`\n"
             f"WS:`{'connected' if state.ws else 'disconnected'}`",
             reply_markup=kb_main())
 
@@ -1503,13 +1539,34 @@ async def _cmd(cmd:str):
             reply_markup=kb_connect())
 
     elif cmd in("/settings","cmd_settings"):
+        md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
         await tg_async(
             f"⚙️ *Settings*\n"
+            f"Strategy:`{md_lbl}`\n"
             f"Pair:`{state.pair_display}`  sym:`{state.active_symbol}`\n"
             f"Risk:`{state.risk_pct*100:.0f}%`  TPs:`{state.tp1_r}R/{state.tp2_r}R/{state.tp3_r}R`\n"
-            f"Min Score:`{MIN_SCORE}/100`\n"
+            f"Min Score:`{state.min_score}/100`\n"
             f"Small Acc:`{'ON 💎' if state.small_acc_mode else 'OFF'}`",
             reply_markup=kb_settings())
+
+    elif cmd in("/mode", "cmd_mode_menu"):
+        await tg_async("🎛 *Select Trading Strategy Mode:*", reply_markup=kb_mode())
+
+    elif cmd == "cmd_mode_sniper":
+        state.trading_mode = "SNIPER"
+        state.min_score    = 75
+        state.trend_tf     = "H1"
+        state.exec_tf      = "M15"
+        state.conf_tf      = "M5"
+        await tg_async("✅ Strategy successfully updated to *🎯 SMC Sniper*.\nTIMEFRAMES: [H1, M15, M5] | Min Score: 75", reply_markup=kb_settings())
+
+    elif cmd == "cmd_mode_scalper":
+        state.trading_mode = "SCALPER"
+        state.min_score    = 60
+        state.trend_tf     = "M15"
+        state.exec_tf      = "M5"
+        state.conf_tf      = "M1"
+        await tg_async("✅ Strategy successfully updated to *⚡ Quick Scalper*.\nTIMEFRAMES: [M15, M5, M1] | Min Score: 60", reply_markup=kb_settings())
 
     elif cmd=="cmd_pair_menu":
         await tg_async("💱 *Select Pair:*", reply_markup=kb_pair_menu())
@@ -1521,8 +1578,8 @@ async def _cmd(cmd:str):
             if state.ws:
                 try:
                     await tg_async(f"⏳ Switching to `{PAIR_REGISTRY[key][4]}`...", reply_markup=kb_main())
-                    h,m,f=await subscribe_pair(key)
-                    await tg_async(f"💱 Switched → `{state.pair_display}`\nH1:`{h}` M15:`{m}` M5:`{f}` ✅",reply_markup=kb_main())
+                    h,m,f,o=await subscribe_pair(key)
+                    await tg_async(f"💱 Switched → `{state.pair_display}`\nH1:`{h}` M15:`{m}` M5:`{f}` M1:`{o}` ✅",reply_markup=kb_main())
                 except Exception as e:
                     state.pair_key=old
                     await tg_async(f"❌ Switch failed: {e}",reply_markup=kb_main())
@@ -1579,16 +1636,18 @@ async def ws_run(ws):
         log.info("Authorizing...")
         await authorize(); await get_balance()
         log.info(f"Bal:{state.account_balance} {state.account_currency} ({state.account_type})")
-        h,m,f=await subscribe_pair(state.pair_key)
+        h,m,f,o=await subscribe_pair(state.pair_key)
         acct_icon="🔴 REAL" if state.account_type=="real" else"🟢 DEMO"
+        md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
         await tg_async(
             f"{market_header()}\n\n"
-            f"🤖 *SMC SNIPER EA v5 Online*\n"
+            f"🤖 *SMC SNIPER EA v5.1 Online*\n"
             f"Broker: {acct_icon} `{state.account_id}`\n"
+            f"Strategy: `{md_lbl}`\n"
             f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair:`{state.pair_display}`  sym:`{state.active_symbol}`\n"
-            f"Risk:`{state.risk_pct*100:.0f}%`  MinScore:`{MIN_SCORE}/100`\n"
-            f"Bars H1:`{h}` M15:`{m}` M5:`{f}` ✅\n\n"
+            f"Risk:`{state.risk_pct*100:.0f}%`  MinScore:`{state.min_score}/100`\n"
+            f"Bars H1:`{h}` M15:`{m}` M5:`{f}` M1:`{o}` ✅\n\n"
             f"_Fetching news... Sniper Brain armed._ 🎯",
             reply_markup=kb_main())
     task=asyncio.ensure_future(setup())
@@ -1625,9 +1684,10 @@ async def ws_loop():
 async def health(req):
     wr=f"{state.wins/(state.wins+state.losses)*100:.1f}" if(state.wins+state.losses)>0 else"0"
     return web.json_response({
-        "version":"5.0","status":"running" if state.running else"stopped",
+        "version":"5.1","status":"running" if state.running else"stopped",
         "paused":state.paused,"block_trading":state.block_trading,
         "block_reason":state.block_reason,"autonomous":state.autonomous,
+        "mode":state.trading_mode,"min_score":state.min_score,
         "market_open":is_market_open(),"session":get_session(),
         "broker_connected":state.broker_connected,
         "account_id":state.account_id,"account_type":state.account_type,
@@ -1635,12 +1695,12 @@ async def health(req):
         "price":state.current_price,"trend":state.trend_bias,
         "zone":state.premium_discount,"session_now":state.session_now,
         "ob_score":state.ob_score,"atr_ok":state.atr_filter_ok,
-        "min_score":MIN_SCORE,"balance":state.account_balance,
+        "balance":state.account_balance,
         "risk_pct":state.risk_pct,"small_acc":state.small_acc_mode,
         "trades":state.trade_count,"wins":state.wins,"losses":state.losses,
         "winrate":wr,"total_pnl":state.total_pnl,
         "open_contracts":len(state.open_contracts),"history":len(state.trade_history),
-        "h1":len(state.h1_candles),"m15":len(state.m15_candles),"m5":len(state.m5_candles),
+        "h1":len(state.h1_candles),"m15":len(state.m15_candles),"m5":len(state.m5_candles),"m1":len(state.m1_candles),
         "news_events":len(state.news_events),
         "next_red":state.next_red_event.title if state.next_red_event else None,
         "gran_actual":state.gran_actual,
@@ -1658,7 +1718,7 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5  ·  Fully Autonomous       ║")
+    log.info("║  SMC SNIPER EA v5.1 ·  Multi-Strategy Auto   ║")
     log.info("║  News Shield | Broker Connect | Post-Reports ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
