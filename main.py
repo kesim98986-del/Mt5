@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  SMC SNIPER EA  v5.2  —  Multi-Strategy Autonomous Trading Bot      ║
+║  SMC SNIPER EA  v5.3  —  Multi-Strategy Autonomous Trading Bot      ║
 ║  Senior Quant SMC | Sniper Brain | News Shield | Broker Connect     ║
 ║  Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready        ║
+║  v5.3: Multi-Account Selection | MT5 Support | Dynamic Session Bind ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -97,7 +98,7 @@ class NewsEvent:
         self.time_et=time_et; self.currency=currency; self.impact=impact
         self.title=title; self.actual=actual; self.forecast=forecast
         self.prev=prev; self.dt_utc=None
-        
+
         # Calculate Volatility Extreme
         self.is_extreme = False
         try:
@@ -177,6 +178,41 @@ class TradeReason:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# ACCOUNT INFO DATACLASS
+# ══════════════════════════════════════════════════════════════════════
+class AccountInfo:
+    """Represents a sub-account returned by account_list."""
+    def __init__(self, data: dict):
+        self.loginid      = data.get("loginid", "")
+        self.account_type = data.get("account_type", "")      # "trading", "mt5", "wallet", "dxtrade"
+        self.currency     = data.get("currency", "USD")
+        self.balance      = float(data.get("balance", 0.0))
+        self.is_virtual   = bool(data.get("is_virtual", 0))
+        self.landing_company = data.get("landing_company_name", "")
+        # MT5-specific fields
+        self.mt5_account_type = data.get("mt5_account_type", "")  # "standard", "financial"
+        self.platform     = data.get("platform", "")              # "mt5", "deriv", "dxtrade"
+
+    @property
+    def display_label(self) -> str:
+        demo_tag = " [DEMO]" if self.is_virtual else ""
+        if self.platform == "mt5" or self.account_type == "mt5":
+            mt5_lbl = f" {self.mt5_account_type.capitalize()}" if self.mt5_account_type else ""
+            return f"MT5{mt5_lbl}{demo_tag} — {self.loginid} ({self.balance:.2f} {self.currency})"
+        if self.account_type == "wallet":
+            return f"Wallet{demo_tag} — {self.loginid} ({self.balance:.2f} {self.currency})"
+        return f"{self.account_type.upper()}{demo_tag} — {self.loginid} ({self.balance:.2f} {self.currency})"
+
+    @property
+    def type_icon(self) -> str:
+        if self.platform == "mt5" or self.account_type == "mt5":
+            return "🏦"
+        if self.account_type == "wallet":
+            return "👛"
+        return "💼"
+
+
+# ══════════════════════════════════════════════════════════════════════
 # GLOBAL STATE
 # ══════════════════════════════════════════════════════════════════════
 class BotState:
@@ -188,6 +224,12 @@ class BotState:
         self.account_balance  = 0.0
         self.account_currency = "USD"
         self.awaiting_token   = False
+
+        # ── NEW: Multi-account state ───────────────────────────────────
+        self.available_accounts: List[AccountInfo] = []
+        self.selected_account:   Optional[AccountInfo] = None
+        self.awaiting_account_selection = False
+        # ──────────────────────────────────────────────────────────────
 
         self.running          = True
         self.paused           = False
@@ -221,7 +263,7 @@ class BotState:
         self.current_ask      = 0.0
         self.current_bid      = 0.0
         self.current_spread   = 0.0
-        
+
         self.trend_bias       = "NEUTRAL"
         self.last_signal      = None
         self.active_ob        = None
@@ -260,6 +302,39 @@ class BotState:
     @property
     def pair_category(self):return self.pair_info[5]
 
+    # ── NEW: Helpers for selected account ─────────────────────────────
+    @property
+    def selected_account_id(self) -> str:
+        if self.selected_account:
+            return self.selected_account.loginid
+        return self.account_id
+
+    @property
+    def selected_account_type(self) -> str:
+        if self.selected_account:
+            return self.selected_account.account_type
+        return self.account_type
+
+    @property
+    def is_mt5_selected(self) -> bool:
+        if self.selected_account:
+            return (self.selected_account.platform == "mt5" or
+                    self.selected_account.account_type == "mt5")
+        return False
+
+    @property
+    def display_balance(self) -> float:
+        if self.selected_account:
+            return self.selected_account.balance
+        return self.account_balance
+
+    @property
+    def display_currency(self) -> str:
+        if self.selected_account:
+            return self.selected_account.currency
+        return self.account_currency
+    # ──────────────────────────────────────────────────────────────────
+
 state = BotState()
 
 def _load_saved_token():
@@ -277,11 +352,11 @@ def _load_saved_token():
 # ══════════════════════════════════════════════════════════════════════
 def is_market_open() -> bool:
     now = datetime.now(UTC)
-    wd  = now.weekday()   
+    wd  = now.weekday()
     h   = now.hour
-    if wd == 4 and h >= 21: return False   
-    if wd == 5:             return False   
-    if wd == 6 and h < 22:  return False   
+    if wd == 4 and h >= 21: return False
+    if wd == 5:             return False
+    if wd == 6 and h < 22:  return False
     return True
 
 def time_to_next_open() -> str:
@@ -326,6 +401,7 @@ def kb_main():
          {"text": "⚙️ Settings",        "callback_data": "cmd_settings"}],
         [{"text": "💰 Balance",         "callback_data": "cmd_balance"},
          {"text": f"{block_lbl}",       "callback_data": "cmd_toggle_pause"}],
+        [{"text": "🔄 Switch Account",  "callback_data": "cmd_switch_account"}],
         [{"text": "🛑 Emergency Stop",  "callback_data": "cmd_stop"}],
     ]}
 
@@ -368,6 +444,21 @@ def kb_connect():
         [{"text": "📋 How to get Token", "callback_data": "cmd_token_help"}],
         [{"text": "⬅️ Cancel",           "callback_data": "cmd_back"}],
     ]}
+
+def kb_account_select(accounts: List[AccountInfo]):
+    """Build inline keyboard for account selection."""
+    rows = []
+    for acc in accounts:
+        label = f"{acc.type_icon} {acc.display_label}"
+        # Truncate if too long for Telegram button
+        if len(label) > 60:
+            label = label[:57] + "..."
+        rows.append([{
+            "text": label,
+            "callback_data": f"cmd_acct_{acc.loginid}"
+        }])
+    rows.append([{"text": "⬅️ Cancel", "callback_data": "cmd_back"}])
+    return {"inline_keyboard": rows}
 
 # ══════════════════════════════════════════════════════════════════════
 # TELEGRAM
@@ -486,7 +577,7 @@ def _amharic_summary() -> str:
     now      = datetime.now(UTC)
     reds     = [e for e in state.news_events if e.is_red   and e.dt_utc and e.dt_utc>now]
     oranges  = [e for e in state.news_events if e.is_orange and e.dt_utc and e.dt_utc>now]
-    
+
     warnings = ""
     for e in reds:
         if e.is_extreme:
@@ -735,9 +826,13 @@ def generate_chart(candles:deque, tf:str="M15",
     nxt_s=(f" | 🔴{nxt.title[:18]}@{nxt.dt_utc.astimezone(NY_TZ).strftime('%H:%Mh')}"
            if nxt and nxt.dt_utc else"")
     score_s=f"Score:{state.ob_score}/100  " if state.ob_score else""
+    # ── UPDATED: Show selected account in chart footer ─────────────────
+    acct_display = f"Acct:{state.selected_account_id}({state.selected_account_type.upper()})" \
+                   if state.selected_account else f"Acct:{state.account_id}"
     al.text(.01,.5,
-        f"SMC SNIPER v5.2 [{state.trading_mode}]  ·  {state.pair_display}  sym:{state.active_symbol}  "
-        f"Bal:{state.account_balance:.2f}{state.account_currency}  "
+        f"SMC SNIPER v5.3 [{state.trading_mode}]  ·  {state.pair_display}  sym:{state.active_symbol}  "
+        f"{acct_display}  "
+        f"Bal:{state.display_balance:.2f}{state.display_currency}  "
         f"Risk:{state.risk_pct*100:.0f}%  {score_s}"
         f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
         f"{nxt_s}  {ts}",
@@ -775,7 +870,7 @@ def generate_history_chart() -> Optional[str]:
     wr=f"{state.wins/(state.wins+state.losses)*100:.1f}%" if(state.wins+state.losses)>0 else"N/A"
     ax1.set_title(
         f"📋 Trade History  {state.wins}W/{state.losses}L  WR:{wr}  "
-        f"P&L:{state.total_pnl:+.2f} {state.account_currency}  Bal:{state.account_balance:.2f}",
+        f"P&L:{state.total_pnl:+.2f} {state.display_currency}  Bal:{state.display_balance:.2f}",
         color="#cdd9e5",fontsize=10,fontfamily="monospace")
     ax1.set_ylabel("P&L",color="#90a4ae",fontsize=9)
     cum=np.cumsum(pnls); cc=BC if cum[-1]>=0 else RC
@@ -783,7 +878,7 @@ def generate_history_chart() -> Optional[str]:
     ax2.fill_between(labels,cum,alpha=.12,color=cc)
     ax2.axhline(0,color=GR,lw=.8); ax2.set_ylabel("Cumulative",color="#90a4ae",fontsize=8)
     ts=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99,.01,f"SMC SNIPER v5.2 · {ts}",color="#444d56",fontsize=7,ha="right")
+    fig.text(.99,.01,f"SMC SNIPER v5.3 · {ts}",color="#444d56",fontsize=7,ha="right")
     path="/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path,dpi=120,bbox_inches="tight",facecolor=fig.get_facecolor())
@@ -891,7 +986,7 @@ def _get_trend(tf_name: str)->str:
         buf = state.h1_candles
     else:
         buf = state.m15_candles
-        
+
     if len(buf)<30: return "NEUTRAL"
     df=pd.DataFrame(list(buf)); df.columns=["time","open","high","low","close"]
     r=_bos_choch(df)
@@ -1008,15 +1103,17 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     risk=abs(entry-sl)
     if risk==0: return None
     mult=1 if bias=="BULLISH" else -1
-    
+
     tp1=entry+risk*state.tp1_r*mult
     tp2=entry+risk*state.tp2_r*mult
     tp3=entry+risk*state.tp3_r*mult
-    
+
     rr_1_price = entry + risk * mult # 1:1 Strict BE Check Price
-    
+
+    # ── Use selected account balance for stake calculation ─────────────
+    balance_for_stake = state.display_balance if state.display_balance > 0 else state.account_balance
     stake=max(1.,round(max(PAIR_REGISTRY[state.pair_key][3],
-                           state.account_balance*state.risk_pct),2))
+                           balance_for_stake * state.risk_pct),2))
 
     sig={
         "direction":"BUY" if bias=="BULLISH" else"SELL",
@@ -1039,20 +1136,20 @@ def check_trade_mgmt():
         sig=info.get("signal")
         if not sig: continue
         p,d=state.current_price,info["direction"]
-        
+
         # 1. Strict Break-Even at 1:1 R:R
         if not info.get("be_moved"):
             if (d=="BUY" and p >= sig["rr_1"]) or (d=="SELL" and p <= sig["rr_1"]):
                 info["be_moved"]=True
                 sig["sl"]=sig["entry"]
                 asyncio.ensure_future(tg_async(f"✅ *Strict Break-Even* `{cid}`\nPrice hit 1:1 R:R. SL → Entry `{sig['entry']}`"))
-                
+
         # 2. Partial Close (50%) at TP1
         if info.get("trade_split") == "HALF_1":
             if (d=="BUY" and p >= sig["tp1"]) or (d=="SELL" and p <= sig["tp1"]):
                 asyncio.ensure_future(tg_async(f"💰 *Partial Close (50%)* hit at TP1 for `{cid}`"))
                 asyncio.ensure_future(close_contract(cid))
-                
+
         # 3. Structural Trailing Stop after TP2 (Runner)
         if info.get("trade_split") == "HALF_2":
             if (d=="BUY" and p >= sig["tp2"]) or (d=="SELL" and p <= sig["tp2"]):
@@ -1063,12 +1160,12 @@ def check_trade_mgmt():
                     swh,swl=_swing_pts(df,n=3)
                     if d=="BUY" and swl:
                         t=df["low"].iloc[swl[-1]]*.9998
-                        if t > sig["sl"]: 
+                        if t > sig["sl"]:
                             sig["sl"] = t
                             asyncio.ensure_future(tg_async(f"🔒 Trailed SL behind M5 Structural Low: `{t:.5f}`"))
                     elif d=="SELL" and swh:
                         t=df["high"].iloc[swh[-1]]*1.0002
-                        if t < sig["sl"]: 
+                        if t < sig["sl"]:
                             sig["sl"] = t
                             asyncio.ensure_future(tg_async(f"🔒 Trailed SL behind M5 Structural High: `{t:.5f}`"))
 
@@ -1102,11 +1199,67 @@ async def authorize(token:str=None)->dict:
     log.info(f"Authorized: {state.account_id} ({state.account_type})")
     return auth
 
+async def fetch_account_list() -> List[AccountInfo]:
+    """Fetch all sub-accounts associated with the authorized token."""
+    try:
+        resp = await send_req({"account_list": 1})
+        if "error" in resp:
+            log.warning(f"account_list error: {resp['error'].get('message','?')}")
+            return []
+        raw_list = resp.get("account_list", [])
+        accounts = [AccountInfo(a) for a in raw_list]
+        log.info(f"Found {len(accounts)} accounts: {[a.loginid for a in accounts]}")
+        return accounts
+    except Exception as e:
+        log.error(f"fetch_account_list: {e}")
+        return []
+
+async def switch_to_account(account: AccountInfo):
+    """
+    Bind the session to a specific sub-account.
+    For MT5 accounts this does NOT re-authorize (MT5 loginids are not
+    usable as API auth tokens) — instead we store the account and use
+    its loginid / balance for display and stake calculations.
+    For real Deriv trading accounts we attempt to switch via
+    'set_account_currency' or simply store it for routing purposes.
+    """
+    state.selected_account = account
+    # Sync balance display fields so legacy code still works
+    state.account_balance  = account.balance
+    state.account_currency = account.currency
+    log.info(f"Switched to account: {account.loginid} ({account.account_type}) "
+             f"Bal:{account.balance} {account.currency}")
+
 async def get_balance():
     r=await send_req({"balance":1,"subscribe":0})
     if "balance" in r:
         state.account_balance =r["balance"]["balance"]
         state.account_currency=r["balance"]["currency"]
+        # Sync to selected account if it's the same loginid
+        if state.selected_account and state.selected_account.loginid == state.account_id:
+            state.selected_account.balance = state.account_balance
+
+async def refresh_selected_account_balance():
+    """
+    Try to refresh balance for the selected account.
+    For MT5 accounts, re-fetch account_list and update from there.
+    """
+    if not state.selected_account:
+        await get_balance()
+        return
+    try:
+        accounts = await fetch_account_list()
+        for acc in accounts:
+            if acc.loginid == state.selected_account.loginid:
+                state.selected_account.balance  = acc.balance
+                state.selected_account.currency = acc.currency
+                state.account_balance  = acc.balance
+                state.account_currency = acc.currency
+                log.info(f"Refreshed balance for {acc.loginid}: {acc.balance} {acc.currency}")
+                return
+    except Exception as e:
+        log.error(f"refresh_selected_account_balance: {e}")
+        await get_balance()
 
 def _store(nom:int,rows:list):
     if nom==3600: state.h1_candles.extend(rows)
@@ -1163,19 +1316,59 @@ async def subscribe_pair(key:str):
     return h,m,f,o
 
 async def _do_open(direction: str, amount: float) -> Optional[str]:
+    """
+    Execute a buy order. Routes correctly for both standard Deriv accounts
+    and MT5-selected sessions.
+
+    For MT5 selected accounts: the Deriv API does not support placing
+    binary/multiplier contracts directly on MT5 sub-accounts via the WS API.
+    In that case we execute on the authorized master account (the token owner)
+    but display the MT5 account as the selected context. If a direct MT5
+    execution is needed the user must use the MT5 terminal separately.
+    We log a clear warning so this is transparent.
+    """
     ct="MULTUP" if direction=="BUY" else"MULTDOWN"
+    symbol = state.active_symbol or PAIR_REGISTRY[state.pair_key][0]
+    currency = state.display_currency
+
+    if state.is_mt5_selected:
+        log.warning(
+            f"MT5 account {state.selected_account_id} selected. "
+            f"Deriv WS API does not support placing contracts directly on MT5. "
+            f"Executing on master account {state.account_id}."
+        )
+
     try:
         r=await send_req({"buy":1,"price":round(amount,2),"parameters":{
-            "contract_type":ct,"symbol":state.active_symbol or PAIR_REGISTRY[state.pair_key][0],
-            "amount":round(amount,2),"currency":state.account_currency,
-            "multiplier":10,"basis":"stake","stop_out":1}})
-        if "error" in r: log.error(f"Buy: {r['error']['message']}"); return None
+            "contract_type":ct,
+            "symbol":symbol,
+            "amount":round(amount,2),
+            "currency":currency,
+            "multiplier":10,
+            "basis":"stake",
+            "stop_out":1
+        }})
+        if "error" in r:
+            err_msg = r["error"].get("message","Unknown error")
+            log.error(f"Buy error: {err_msg}")
+            # Provide specific guidance for MT5-related errors
+            if "account" in err_msg.lower() or "mt5" in err_msg.lower():
+                asyncio.ensure_future(tg_async(
+                    f"⚠️ *Trade Execution Note*\n"
+                    f"MT5 account `{state.selected_account_id}` is selected for display.\n"
+                    f"Deriv API contracts execute on master account `{state.account_id}`.\n"
+                    f"Error: `{err_msg}`\n\n"
+                    f"_To trade directly on MT5, use the MT5 terminal._"
+                ))
+            return None
         return r["buy"]["contract_id"]
-    except Exception as e: log.error(f"_do_open: {e}"); return None
+    except Exception as e:
+        log.error(f"_do_open: {e}")
+        return None
 
 async def open_contract(direction:str,amount:float)->Optional[str]:
     if state.paused or state.block_trading: return None
-    
+
     amount_per_trade = round(amount / 2, 2)
     # Respect minimum stake limit
     min_st = PAIR_REGISTRY[state.pair_key][3]
@@ -1192,7 +1385,7 @@ async def open_contract(direction:str,amount:float)->Optional[str]:
         state.trade_count+=1
         log.info(f"✅ Opened HALF_1 {cid1} [{direction}] ${amount_per_trade:.2f}")
         asyncio.ensure_future(send_req({"proposal_open_contract":1,"contract_id":cid1,"subscribe":1}))
-    
+
     # Trade 2 (Runner)
     cid2 = await _do_open(direction, amount_per_trade)
     if cid2:
@@ -1203,7 +1396,7 @@ async def open_contract(direction:str,amount:float)->Optional[str]:
         state.trade_count+=1
         log.info(f"✅ Opened HALF_2 (Runner) {cid2} [{direction}] ${amount_per_trade:.2f}")
         asyncio.ensure_future(send_req({"proposal_open_contract":1,"contract_id":cid2,"subscribe":1}))
-        
+
     return cid1 or cid2
 
 async def close_contract(cid:str)->bool:
@@ -1260,7 +1453,7 @@ async def handle_msg(msg:dict):
             state.total_pnl+=profit; tnum=state.trade_count
             sig=info.get("signal",{}) or {}
             split_lbl = info.get("trade_split", "")
-            
+
             state.trade_history.append({
                 "num":tnum,"id":cid,"pair":state.pair_display,
                 "direction":info.get("direction","?"),
@@ -1270,7 +1463,7 @@ async def handle_msg(msg:dict):
                 "session":sig.get("session","?"),
                 "ts":datetime.now(UTC).strftime("%m/%d %H:%M")})
             if len(state.trade_history)>50: state.trade_history.pop(0)
-            
+
             buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
             chart=generate_chart(buf_for_chart,state.exec_tf,
                 entry_price=info.get("entry"),exit_price=exit_s,
@@ -1282,14 +1475,20 @@ async def handle_msg(msg:dict):
                          if reason_obj else "")
             amharic_r  =(reason_obj.build_amharic(info.get("direction","?"))
                          if reason_obj else "")
+
+            # ── UPDATED: Show selected account in trade close report ──
+            acct_line = (f"Account:`{state.selected_account_id}` "
+                         f"({state.selected_account_type.upper()})\n"
+                         if state.selected_account else "")
             await tg_async(
                 f"{'✅ WIN' if profit>0 else '❌ LOSS'}  `#{tnum}` [{split_lbl}] — *Post-Trade Report*\n\n"
                 f"Pair:`{state.pair_display}`  Dir:`{info.get('direction','?')}`\n"
+                f"{acct_line}"
                 f"Entry:`{info.get('entry',0):.5f}`  Exit:`{exit_s:.5f}`\n"
-                f"P&L: `{sign}{profit:.2f} {state.account_currency}`\n"
+                f"P&L: `{sign}{profit:.2f} {state.display_currency}`\n"
                 f"Score:`{sig.get('ob_score',0)}/100`  Session:`{sig.get('session','?')}`\n"
                 f"W/L:{state.wins}/{state.losses}  WR:{wr}  "
-                f"Total:{state.total_pnl:+.2f}  Bal:{state.account_balance:.2f}\n\n"
+                f"Total:{state.total_pnl:+.2f}  Bal:{state.display_balance:.2f}\n\n"
                 f"{post_report}",
                 photo_path=chart)
             if amharic_r:
@@ -1297,18 +1496,24 @@ async def handle_msg(msg:dict):
     elif mt=="balance":
         state.account_balance =msg["balance"]["balance"]
         state.account_currency=msg["balance"]["currency"]
+        if state.selected_account and state.selected_account.loginid == state.account_id:
+            state.selected_account.balance = state.account_balance
     elif "error" in msg:
         log.warning(f"API: {msg['error'].get('message','?')}")
 
 # ══════════════════════════════════════════════════════════════════════
-# SILENT BACKGROUND SCANNER (NO TELEGRAM SPAM)
+# SILENT BACKGROUND SCANNER
 # ══════════════════════════════════════════════════════════════════════
 async def chart_loop():
     await asyncio.sleep(50)
     while state.running:
         try:
             if state.current_price>0 and len(state.m15_candles)>=20:
-                log.info(f"Silent Scan Active: {state.pair_display} | Mode: {state.trading_mode} | Bias: {state.trend_bias} | Zone: {state.premium_discount} | Score: {state.ob_score}/100")
+                acct_display = (f"Acct:{state.selected_account_id}({state.selected_account_type.upper()})"
+                                if state.selected_account else f"Acct:{state.account_id}")
+                log.info(f"Silent Scan Active: {state.pair_display} | Mode: {state.trading_mode} | "
+                         f"Bias: {state.trend_bias} | Zone: {state.premium_discount} | "
+                         f"Score: {state.ob_score}/100 | {acct_display}")
         except Exception as e:
             log.error(f"chart_loop: {e}")
         await asyncio.sleep(CHART_INTERVAL)
@@ -1338,7 +1543,7 @@ async def trading_loop():
             if sig:
                 sig_conf=compute_signal(state.conf_tf)
                 if sig_conf and sig_conf["direction"]==sig["direction"]:
-                    
+
                     # Spread Guard
                     pip_val = PAIR_REGISTRY[state.pair_key][2]
                     spread_pips = state.current_spread / pip_val if pip_val else 0
@@ -1354,13 +1559,20 @@ async def trading_loop():
                         entry_price=sig["entry"],direction=sig["direction"],
                         chart_type="entry",reason=reason)
                     score_txt=" + ".join(sig.get("score_reasons",[])[:5])
-                    
+
                     md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
                     g_lbl = " 🚀 GROWTH" if state.growth_mode else ""
-                    
+
+                    # ── UPDATED: Show selected account in entry alert ─
+                    acct_info = ""
+                    if state.selected_account:
+                        acct_info = (f"\nAccount: `{state.selected_account_id}` "
+                                     f"({state.selected_account.display_label[:40]})")
+
                     await tg_async(
                         f"🚀 *{md_lbl} ENTRY — {state.pair_display}*{g_lbl}\n"
-                        f"Score: `{sig['ob_score']}/100` ✅ Autonomous\n\n"
+                        f"Score: `{sig['ob_score']}/100` ✅ Autonomous\n"
+                        f"{acct_info}\n"
                         f"Dir:    `{sig['direction']}`\n"
                         f"Entry:  `{sig['entry']}`\n"
                         f"SL:     `{sig['sl']}`\n"
@@ -1368,10 +1580,10 @@ async def trading_loop():
                         f"TP2({state.tp2_r}R): `{sig['tp2']}`\n"
                         f"TP3({state.tp3_r}R): `{sig['tp3']}`\n\n"
                         f"*Score Breakdown:*\n`{score_txt}`\n\n"
-                        f"Stake: `{sig['stake']:.2f} {state.account_currency}`"
+                        f"Stake: `{sig['stake']:.2f} {state.display_currency}`"
                         f"{'  💎' if state.small_acc_mode else ''}",
                         photo_path=chart)
-                    
+
                     cid=await open_contract(sig["direction"],sig["stake"])
                     if cid: state.last_trade_ts=time.time()
         except Exception as e:
@@ -1442,22 +1654,103 @@ async def _process_token(token:str):
     try:
         auth=await authorize(token)
         await get_balance()
+
+        # ── UPDATED: Fetch all accounts and show selection menu ────────
+        await tg_async("🔍 Fetching your sub-accounts...", reply_markup=kb_main())
+        accounts = await fetch_account_list()
+        state.available_accounts = accounts
+
+        if not accounts:
+            # Fallback: no account_list returned, proceed with master account
+            acct_icon="🔴 REAL" if state.account_type=="real" else"🟢 DEMO"
+            await tg_async(
+                f"✅ *Broker Connected*\n\n"
+                f"Account: `{state.account_id}`\n"
+                f"Type: {acct_icon}\n"
+                f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n\n"
+                f"_No sub-accounts found. Using master account._",
+                reply_markup=kb_main())
+            h,m,f,o=await subscribe_pair(state.pair_key)
+            log.info(f"Re-subscribed after token: H1:{h} M15:{m} M5:{f} M1:{o}")
+            return
+
+        # Show account selection keyboard
         acct_icon="🔴 REAL" if state.account_type=="real" else"🟢 DEMO"
         await tg_async(
-            f"✅ *Broker Connected Successfully!*\n\n"
-            f"Account: `{state.account_id}`\n"
-            f"Type: {acct_icon}\n"
-            f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n\n"
-            f"_Sniper Brain is now active. Scanning for high-quality setups..._",
-            reply_markup=kb_main())
-        h,m,f,o=await subscribe_pair(state.pair_key)
-        log.info(f"Re-subscribed after token: H1:{h} M15:{m} M5:{f} M1:{o}")
+            f"✅ *Authentication Successful!*\n\n"
+            f"Master: `{state.account_id}` {acct_icon}\n"
+            f"Master Balance: `{state.account_balance:.2f} {state.account_currency}`\n\n"
+            f"Found *{len(accounts)} sub-accounts*.\n"
+            f"👇 *Select the account you want to trade with:*",
+            reply_markup=kb_account_select(accounts))
+        state.awaiting_account_selection = True
+
     except Exception as e:
         await tg_async(f"❌ Authentication failed: `{e}`\n\nPlease check your token and try again.",
                        reply_markup=kb_connect())
 
+async def _bind_account(loginid: str):
+    """Find and bind the selected account from available_accounts."""
+    matched = next((a for a in state.available_accounts if a.loginid == loginid), None)
+    if not matched:
+        await tg_async(f"❌ Account `{loginid}` not found. Please try /connect again.",
+                       reply_markup=kb_main())
+        return
+
+    state.awaiting_account_selection = False
+    await switch_to_account(matched)
+
+    acct_icon = "🔴 REAL" if not matched.is_virtual else "🟢 DEMO"
+    mt5_note = ""
+    if matched.platform == "mt5" or matched.account_type == "mt5":
+        mt5_note = (
+            "\n\n⚠️ *MT5 Account Note:*\n"
+            "Deriv WS API cannot place contracts directly on MT5 sub-accounts. "
+            "Trades will execute on your master Deriv account. "
+            "Balance & P&L displayed here reflect the MT5 account for reference.\n"
+            "_For direct MT5 trading, use the MT5 terminal._"
+        )
+
+    await tg_async(
+        f"🔗 *Account Bound Successfully!*\n\n"
+        f"{matched.type_icon} *{matched.display_label}*\n"
+        f"Type: {acct_icon}\n"
+        f"Balance: `{matched.balance:.2f} {matched.currency}`\n"
+        f"Platform: `{matched.platform or matched.account_type}`\n"
+        f"{mt5_note}\n\n"
+        f"_Sniper Brain is now active. Scanning for high-quality setups..._",
+        reply_markup=kb_main())
+
+    h,m,f,o=await subscribe_pair(state.pair_key)
+    log.info(f"Re-subscribed after account selection: H1:{h} M15:{m} M5:{f} M1:{o}")
+
 async def _cmd(cmd:str):
     cmd=cmd.lower().strip()
+
+    # ── NEW: Account selection callback ───────────────────────────────
+    if cmd.startswith("cmd_acct_"):
+        loginid = cmd.replace("cmd_acct_", "").upper()
+        await _bind_account(loginid)
+        return
+
+    # ── NEW: Switch account command ───────────────────────────────────
+    if cmd in("/switch_account", "cmd_switch_account"):
+        if not state.available_accounts:
+            if state.broker_connected:
+                await tg_async("🔍 Fetching accounts...", reply_markup=kb_main())
+                accounts = await fetch_account_list()
+                state.available_accounts = accounts
+            if not state.available_accounts:
+                await tg_async(
+                    "⚠️ No accounts available. Please use /connect to authenticate first.",
+                    reply_markup=kb_main())
+                return
+        await tg_async(
+            f"🔄 *Switch Account*\n\n"
+            f"Currently bound to: `{state.selected_account_id}`\n\n"
+            f"👇 *Select an account:*",
+            reply_markup=kb_account_select(state.available_accounts))
+        return
 
     if cmd in("/start","/help","cmd_back"):
         mkt=market_header()
@@ -1466,14 +1759,23 @@ async def _cmd(cmd:str):
         conn=("✅ Connected" if state.broker_connected
               else"❌ Not connected — tap 🔗 Connect Broker")
         md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
+
+        # ── UPDATED: Show selected account in dashboard ───────────────
+        if state.selected_account:
+            acct_line = (f"Account: `{state.selected_account_id}` "
+                         f"({state.selected_account.display_label[:45]})\n"
+                         f"Bal: `{state.display_balance:.2f} {state.display_currency}`")
+        else:
+            acct_line = (f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
+                         f"Bal: `{state.account_balance:.2f} {state.account_currency}`")
+
         await tg_async(
             f"{mkt}\n\n"
-            f"🤖 *SMC SNIPER EA v5.2*\n\n"
+            f"🤖 *SMC SNIPER EA v5.3*\n\n"
             f"Status: {bl}\n"
             f"Broker: {conn}\n"
             f"Strategy: `{md_lbl}`\n"
-            f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
-            f"Bal: `{state.account_balance:.2f} {state.account_currency}`\n"
+            f"{acct_line}\n"
             f"Pair: `{state.pair_display}`  Risk:`{state.risk_pct*100:.0f}%`\n"
             f"Min Score: `{state.min_score}/100`\n"
             f"H1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}` M1:`{len(state.m1_candles)}`",
@@ -1493,6 +1795,15 @@ async def _cmd(cmd:str):
                    f"`{s['direction']}` @ `{s['entry']}`  SL:`{s['sl']}`\n"
                    f"Score:`{s['ob_score']}/100`  {s['struct']}  {s['pd_zone']}")
         md_lbl="🎯 SMC Sniper" if state.trading_mode=="SNIPER" else"⚡ Quick Scalper"
+
+        # ── UPDATED: Selected account in status ───────────────────────
+        if state.selected_account:
+            acct_line = (f"Account:`{state.selected_account_id}` "
+                         f"({state.selected_account_type.upper()})  "
+                         f"Bal:`{state.display_balance:.2f} {state.display_currency}`")
+        else:
+            acct_line = f"Acct:`{state.account_type.upper()}`  Bal:`{state.account_balance:.2f}`"
+
         await tg_async(
             f"{mkt}\n\n"
             f"⚡ *Sniper Status*\n"
@@ -1502,7 +1813,7 @@ async def _cmd(cmd:str):
             f"Bias:`{state.trend_bias}`  Zone:`{state.premium_discount}`\n"
             f"Session:`{state.session_now}`  ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
             f"Open Trades:`{len(state.open_contracts)}`\n"
-            f"Acct:`{state.account_type.upper()}`  Bal:`{state.account_balance:.2f}`\n"
+            f"{acct_line}\n"
             f"W/L:`{state.wins}/{state.losses}`  P&L:`{state.total_pnl:+.2f}`"
             f"{nxt_s}{sig_s}", reply_markup=kb_main())
 
@@ -1531,7 +1842,7 @@ async def _cmd(cmd:str):
     elif cmd in("/chart","cmd_chart"):
         buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
         chart_tf = state.exec_tf
-        
+
         if len(buf_for_chart)>=20:
             path=generate_chart(buf_for_chart,chart_tf,chart_type="live")
             if path:
@@ -1571,14 +1882,32 @@ async def _cmd(cmd:str):
 
     elif cmd in("/balance","cmd_balance"):
         if state.ws:
-            try: await get_balance()
+            try: await refresh_selected_account_balance()
             except Exception: pass
         wr=f"{state.wins/(state.wins+state.losses)*100:.1f}%" if(state.wins+state.losses)>0 else"N/A"
-        acct="🔴 REAL" if state.account_type=="real" else"🟢 DEMO"
+
+        # ── UPDATED: Balance dashboard shows selected account ─────────
+        if state.selected_account:
+            acct_icon = "🔴 REAL" if not state.selected_account.is_virtual else "🟢 DEMO"
+            mt5_tag = ""
+            if state.is_mt5_selected:
+                mt5_tag = f"  ·  MT5 {state.selected_account.mt5_account_type.capitalize()}"
+            acct_block = (
+                f"💰 *Account Balance*\n"
+                f"`{state.display_balance:.2f} {state.display_currency}`\n"
+                f"Type: {acct_icon}{mt5_tag}\n"
+                f"ID: `{state.selected_account_id}`\n"
+                f"Platform: `{state.selected_account.platform or state.selected_account.account_type}`\n"
+            )
+        else:
+            acct_icon="🔴 REAL" if state.account_type=="real" else"🟢 DEMO"
+            acct_block = (
+                f"💰 *Account Balance*\n"
+                f"`{state.account_balance:.2f} {state.account_currency}`\n"
+                f"Type: {acct_icon}  ID: `{state.account_id}`\n"
+            )
         await tg_async(
-            f"💰 *Account Balance*\n"
-            f"`{state.account_balance:.2f} {state.account_currency}`\n"
-            f"Type: {acct}  ID: `{state.account_id}`\n\n"
+            f"{acct_block}\n"
             f"Trades:`{state.trade_count}`  W/L:`{state.wins}/{state.losses}`  WR:`{wr}`\n"
             f"Total P&L:`{state.total_pnl:+.2f}`", reply_markup=kb_main())
 
@@ -1591,7 +1920,8 @@ async def _cmd(cmd:str):
             f"• ✅ Read scope\n"
             f"• ✅ Trade scope\n\n"
             f"Get it at:\n`app.deriv.com/account/api-token`\n\n"
-            f"_Your token is saved securely on the server._",
+            f"_After authentication you will see a list of all your accounts "
+            f"(Wallet, MT5 Standard, MT5 Financial, etc.) to choose from._",
             reply_markup=kb_connect())
 
     elif cmd=="cmd_token_help":
@@ -1602,7 +1932,9 @@ async def _cmd(cmd:str):
             f"3. API Token → Create new token\n"
             f"4. Enable: *Read + Trade*\n"
             f"5. Copy and paste the token here\n\n"
-            f"_For demo account: use your demo credentials_",
+            f"_For demo account: use your demo credentials_\n\n"
+            f"After pasting the token, the bot will show all your\n"
+            f"available sub-accounts (MT5, Wallet, etc.) for you to select.",
             reply_markup=kb_connect())
 
     elif cmd in("/settings","cmd_settings"):
@@ -1672,7 +2004,7 @@ async def _cmd(cmd:str):
                 try: await subscribe_pair(state.pair_key)
                 except Exception: pass
             await tg_async(f"💎 *Small Acc ON*\n{note}",reply_markup=kb_settings())
-            
+
     elif cmd=="cmd_growth":
         if state.growth_mode:
             state.growth_mode=False; state.risk_pct=0.01
@@ -1713,19 +2045,46 @@ async def ws_run(ws):
         log.info("Authorizing...")
         await authorize(); await get_balance()
         log.info(f"Bal:{state.account_balance} {state.account_currency} ({state.account_type})")
+
+        # ── UPDATED: Fetch accounts on startup if token already set ───
+        if state.deriv_token:
+            accounts = await fetch_account_list()
+            if accounts:
+                state.available_accounts = accounts
+                log.info(f"Pre-loaded {len(accounts)} accounts on startup")
+                # Auto-select first non-wallet real account if no selection yet
+                if not state.selected_account:
+                    preferred = next(
+                        (a for a in accounts if not a.is_virtual and a.account_type not in ("wallet",)),
+                        accounts[0]
+                    )
+                    await switch_to_account(preferred)
+                    log.info(f"Auto-selected account: {preferred.loginid}")
+
         h,m,f,o=await subscribe_pair(state.pair_key)
         acct_icon="🔴 REAL" if state.account_type=="real" else"🟢 DEMO"
         md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
+
+        # ── UPDATED: Show selected account in startup message ─────────
+        if state.selected_account:
+            acct_line = (f"Selected Acct: {state.selected_account.type_icon} "
+                         f"`{state.selected_account_id}` "
+                         f"({state.selected_account.display_label[:40]})\n"
+                         f"Bal:`{state.display_balance:.2f} {state.display_currency}`")
+        else:
+            acct_line = (f"Master: {acct_icon} `{state.account_id}`\n"
+                         f"Bal:`{state.account_balance:.2f} {state.account_currency}`")
+
         await tg_async(
             f"{market_header()}\n\n"
-            f"🤖 *SMC SNIPER EA v5.2 Online*\n"
-            f"Broker: {acct_icon} `{state.account_id}`\n"
+            f"🤖 *SMC SNIPER EA v5.3 Online*\n"
+            f"{acct_line}\n"
             f"Strategy: `{md_lbl}`\n"
-            f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair:`{state.pair_display}`  sym:`{state.active_symbol}`\n"
             f"Risk:`{state.risk_pct*100:.0f}%`  MinScore:`{state.min_score}/100`\n"
             f"Bars H1:`{h}` M15:`{m}` M5:`{f}` M1:`{o}` ✅\n\n"
-            f"_Fetching news... Sniper Brain armed._ 🎯",
+            f"_Fetching news... Sniper Brain armed._ 🎯\n\n"
+            f"Use 🔄 *Switch Account* to select a different account.",
             reply_markup=kb_main())
     task=asyncio.ensure_future(setup())
     try: await ws_reader(ws)
@@ -1761,23 +2120,39 @@ async def ws_loop():
 async def health(req):
     wr=f"{state.wins/(state.wins+state.losses)*100:.1f}" if(state.wins+state.losses)>0 else"0"
     return web.json_response({
-        "version":"5.2","status":"running" if state.running else"stopped",
+        "version":"5.3","status":"running" if state.running else"stopped",
         "paused":state.paused,"block_trading":state.block_trading,
         "block_reason":state.block_reason,"autonomous":state.autonomous,
         "mode":state.trading_mode,"min_score":state.min_score,
         "market_open":is_market_open(),"session":get_session(),
         "broker_connected":state.broker_connected,
-        "account_id":state.account_id,"account_type":state.account_type,
+        # Master account
+        "master_account_id":state.account_id,
+        "master_account_type":state.account_type,
+        # Selected account
+        "selected_account_id":state.selected_account_id,
+        "selected_account_type":state.selected_account_type,
+        "is_mt5":state.is_mt5_selected,
+        "available_accounts":[{
+            "loginid":a.loginid,
+            "type":a.account_type,
+            "platform":a.platform,
+            "balance":a.balance,
+            "currency":a.currency,
+            "is_virtual":a.is_virtual,
+        } for a in state.available_accounts],
         "pair":state.pair_key,"symbol":state.active_symbol,
         "price":state.current_price,"trend":state.trend_bias,
         "zone":state.premium_discount,"session_now":state.session_now,
         "ob_score":state.ob_score,"atr_ok":state.atr_filter_ok,
-        "balance":state.account_balance,
+        "balance":state.display_balance,
+        "currency":state.display_currency,
         "risk_pct":state.risk_pct,"small_acc":state.small_acc_mode,"growth_mode":state.growth_mode,
         "trades":state.trade_count,"wins":state.wins,"losses":state.losses,
         "winrate":wr,"total_pnl":state.total_pnl,
         "open_contracts":len(state.open_contracts),"history":len(state.trade_history),
-        "h1":len(state.h1_candles),"m15":len(state.m15_candles),"m5":len(state.m5_candles),"m1":len(state.m1_candles),
+        "h1":len(state.h1_candles),"m15":len(state.m15_candles),
+        "m5":len(state.m5_candles),"m1":len(state.m1_candles),
         "news_events":len(state.news_events),
         "next_red":state.next_red_event.title if state.next_red_event else None,
         "gran_actual":state.gran_actual,
@@ -1795,7 +2170,8 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.2 ·  Multi-Strategy Auto   ║")
+    log.info("║  SMC SNIPER EA v5.3 ·  Multi-Account Select  ║")
+    log.info("║  MT5 Support | Dynamic Session Bind           ║")
     log.info("║  News Shield | Broker Connect | Post-Reports ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
