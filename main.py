@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  SMC SNIPER EA  v5.1  —  Multi-Strategy Autonomous Trading Bot      ║
+║  SMC SNIPER EA  v5.2  —  Multi-Strategy Autonomous Trading Bot      ║
 ║  Senior Quant SMC | Sniper Brain | News Shield | Broker Connect     ║
 ║  Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready        ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import traceback
 from collections import deque
@@ -61,29 +62,22 @@ GRAN_FALLBACKS = {
     60:   [60,   120],
 }
 
-# Forex sessions in UTC hours
+MAX_SPREAD_LIMIT = 2.5 # pips
+
 SESSIONS = {
     "ASIA":     (0,  7),
     "LONDON":   (7,  12),
     "NY":       (12, 17),
-    "OVERLAP":  (12, 16),   # London/NY overlap — highest liquidity
+    "OVERLAP":  (12, 16),
     "CLOSE":    (17, 24),
 }
 
-# Best sessions per asset
-BEST_SESSIONS = {
-    "METAL": ["LONDON", "NY", "OVERLAP"],
-    "FOREX": ["LONDON", "NY", "OVERLAP"],
-    "INDEX": ["NY", "OVERLAP"],
-}
+MARKET_OPEN_HOUR  = 22
+MARKET_CLOSE_HOUR = 21
 
-# Forex market open/close (UTC)
-MARKET_OPEN_HOUR  = 22   # Sunday 22:00 UTC
-MARKET_CLOSE_HOUR = 21   # Friday 21:00 UTC
+TOKEN_FILE = Path("/tmp/.deriv_token")
 
-TOKEN_FILE = Path("/tmp/.deriv_token")   # persisted broker token
-
-PRE_NEWS_BLOCK  = 30 * 60   # seconds
+PRE_NEWS_BLOCK  = 30 * 60
 POST_NEWS_WAIT  = 15 * 60
 NEWS_INTERVAL   = 12 * 3600
 CHART_INTERVAL  = int(os.getenv("CHART_INTERVAL", "300"))
@@ -98,11 +92,22 @@ DERIV_WS_BASE   = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 # DATA CLASSES
 # ══════════════════════════════════════════════════════════════════════
 class NewsEvent:
-    __slots__ = ("time_et","currency","impact","title","actual","forecast","prev","dt_utc")
+    __slots__ = ("time_et","currency","impact","title","actual","forecast","prev","dt_utc","is_extreme")
     def __init__(self, time_et, currency, impact, title, actual="", forecast="", prev=""):
         self.time_et=time_et; self.currency=currency; self.impact=impact
         self.title=title; self.actual=actual; self.forecast=forecast
         self.prev=prev; self.dt_utc=None
+        
+        # Calculate Volatility Extreme
+        self.is_extreme = False
+        try:
+            f_val = float(re.sub(r'[^\d.-]', '', self.forecast)) if self.forecast else None
+            p_val = float(re.sub(r'[^\d.-]', '', self.prev)) if self.prev else None
+            if f_val is not None and p_val is not None and abs(p_val) > 0:
+                if abs(f_val - p_val) / abs(p_val) > 0.5: # 50% deviation
+                    self.is_extreme = True
+        except: pass
+
     @property
     def is_red(self): return self.impact=="high"
     @property
@@ -110,7 +115,6 @@ class NewsEvent:
 
 
 class TradeReason:
-    """Stores the autonomous reasoning for each trade — sent as post-trade report."""
     def __init__(self):
         self.h1_trend     = ""
         self.structure    = ""
@@ -177,30 +181,26 @@ class TradeReason:
 # ══════════════════════════════════════════════════════════════════════
 class BotState:
     def __init__(self):
-        # ── Broker connection ──
         self.deriv_token      = os.getenv("DERIV_API_TOKEN","")
         self.broker_connected = False
-        self.account_type     = "unknown"   # "real" / "demo"
+        self.account_type     = "unknown"
         self.account_id       = ""
         self.account_balance  = 0.0
         self.account_currency = "USD"
-        self.awaiting_token   = False       # True while waiting for user to send token
+        self.awaiting_token   = False
 
-        # ── Bot state ──
         self.running          = True
         self.paused           = False
-        self.autonomous       = True        # always-on autonomous mode
+        self.autonomous       = True
         self.block_trading    = False
         self.block_reason     = ""
 
-        # ── Multi-Strategy Toggle ──
-        self.trading_mode     = "SNIPER"    # "SNIPER" or "SCALPER"
+        self.trading_mode     = "SNIPER"
         self.min_score        = int(os.getenv("MIN_SCORE", "75"))
         self.trend_tf         = "H1"
         self.exec_tf          = "M15"
         self.conf_tf          = "M5"
 
-        # ── Pair settings ──
         self.pair_key         = "XAUUSD"
         self.active_symbol    = ""
         self.risk_pct         = 0.01
@@ -208,16 +208,20 @@ class BotState:
         self.tp2_r            = 4.0
         self.tp3_r            = 6.0
         self.small_acc_mode   = False
+        self.growth_mode      = False
 
-        # ── Candle buffers ──
-        self.h1_candles       = deque(maxlen=300)
-        self.m15_candles      = deque(maxlen=300)
-        self.m5_candles       = deque(maxlen=300)
-        self.m1_candles       = deque(maxlen=300)
+        # Enhanced Depth: 600 maxlen for deeper analysis
+        self.h1_candles       = deque(maxlen=600)
+        self.m15_candles      = deque(maxlen=600)
+        self.m5_candles       = deque(maxlen=600)
+        self.m1_candles       = deque(maxlen=600)
         self.gran_actual      = {3600:3600, 900:900, 300:300, 60:60}
 
-        # ── Price & analysis ──
         self.current_price    = 0.0
+        self.current_ask      = 0.0
+        self.current_bid      = 0.0
+        self.current_spread   = 0.0
+        
         self.trend_bias       = "NEUTRAL"
         self.last_signal      = None
         self.active_ob        = None
@@ -230,14 +234,11 @@ class BotState:
         self.atr_filter_ok    = True
         self.market_open      = True
 
-        # ── WebSocket ──
         self.ws               = None
         self.req_id           = 1
         self.pending_reqs     = {}
         self.subscribed_sym   = None
-        self.ws_task          = None
 
-        # ── Trades ──
         self.open_contracts   : Dict[str, dict] = {}
         self.trade_count      = 0
         self.wins             = 0
@@ -245,9 +246,8 @@ class BotState:
         self.total_pnl        = 0.0
         self.trade_history    : List[dict] = []
         self.last_trade_ts    = 0.0
-        self.signal_cooldown  = 300   # 5 min between signals
+        self.signal_cooldown  = 300
 
-        # ── News ──
         self.news_events      : List[NewsEvent] = []
         self.news_last_fetch  = 0.0
         self.next_red_event   : Optional[NewsEvent] = None
@@ -332,14 +332,16 @@ def kb_main():
 def kb_settings():
     r  = state.risk_pct * 100
     sm = "✅" if state.small_acc_mode else "○"
+    gw = "✅" if state.growth_mode else "○"
     md = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
     return {"inline_keyboard": [
         [{"text": f"🎛 Mode: {md}",           "callback_data": "cmd_mode_menu"}],
         [{"text": "💱 Select Pair",            "callback_data": "cmd_pair_menu"}],
-        [{"text": f"{sm} 💎 Small Acc ($10)",  "callback_data": "cmd_small_acc"}],
-        [{"text": f"{'✅' if r==1 else '○'} 1% Risk",  "callback_data": "cmd_risk_1"},
-         {"text": f"{'✅' if r==3 else '○'} 3% Risk",  "callback_data": "cmd_risk_3"},
-         {"text": f"{'✅' if r==5 else '○'} 5% Risk",  "callback_data": "cmd_risk_5"}],
+        [{"text": f"{sm} 💎 Small Acc",       "callback_data": "cmd_small_acc"},
+         {"text": f"{gw} 🚀 Growth ($10-$100)", "callback_data": "cmd_growth"}],
+        [{"text": f"{'✅' if r==1 and not state.growth_mode else '○'} 1% Risk",  "callback_data": "cmd_risk_1"},
+         {"text": f"{'✅' if r==3 and not state.growth_mode else '○'} 3% Risk",  "callback_data": "cmd_risk_3"},
+         {"text": f"{'✅' if r==5 and not state.growth_mode else '○'} 5% Risk",  "callback_data": "cmd_risk_5"}],
         [{"text": "⬅️ Back",                   "callback_data": "cmd_back"}],
     ]}
 
@@ -386,8 +388,6 @@ def tg_send(text: str, photo_path: str = None, reply_markup=None):
                 "chat_id": TELEGRAM_CHAT_ID, "text": text,
                 "reply_markup": markup, "parse_mode": "Markdown",
             }, timeout=10)
-        if r.status_code not in (200, 201):
-            log.warning(f"TG {r.status_code}: {r.text[:100]}")
     except Exception as e:
         log.error(f"tg_send: {e}")
 
@@ -486,10 +486,15 @@ def _amharic_summary() -> str:
     now      = datetime.now(UTC)
     reds     = [e for e in state.news_events if e.is_red   and e.dt_utc and e.dt_utc>now]
     oranges  = [e for e in state.news_events if e.is_orange and e.dt_utc and e.dt_utc>now]
+    
+    warnings = ""
+    for e in reds:
+        if e.is_extreme:
+            warnings += f"⚠️ ትኩረት: ለ {e.title} ትልቅ የገበያ መናወጥ (Volatility) ይጠበቃል!\n"
+
     if not reds and not oranges:
         return ("✅ *ደህንነቱ የተጠበቀ ቀን — Safe Day*\n"
-                "ዛሬ ለወርቅ (XAU/USD) ትልቅ ዜና የለም።\n"
-                "ቦቱ ያለ እገዳ ትሬዶችን ሊከፍት ይችላል።\n"
+                "ዛሬ ትልቅ ዜና የለም። ቦቱ ያለ እገዳ ትሬዶችን ሊከፍት ይችላል።\n"
                 "_ጥሩ የትሬዲንግ ቀን!_")
     if reds:
         titles = ", ".join(e.title[:28] for e in reds[:3])
@@ -499,12 +504,14 @@ def _amharic_summary() -> str:
         return (f"⚠️ *አደገኛ ቀን — Dangerous Day!*\n"
                 f"ከፍተኛ ዜና: `{titles}`\n"
                 f"ሰዓት: `{times}`\n\n"
-                f"📌 ዜናው ከ30 ደቂቃ በፊት ቦቱ ይቆማል።\n"
-                f"ዜናው ካለቀ በኋላ 15 ደቂቃ ይጠብቃል።\n"
-                "_ዛሬ ወርቅን በጥንቃቄ ይንግዱ!_")
+                f"{warnings}"
+                f"📌 *የእገዳ ጊዜ (Trade Block):*\n"
+                f"ቦቱ ዜናው ከመውጣቱ *30 ደቂቃ* በፊት ትሬድ ማድረጉን ያቆማል፣ "
+                f"እንዲሁም ዜናው ከወጣ በኋላ ለ*15 ደቂቃ* ይጠብቃል። "
+                f"በዚህ ጊዜ ምንም አዲስ ትሬድ አይከፈትም።\n"
+                f"_ዛሬ በጥንቃቄ ይንግዱ!_")
     return ("🟡 *መካከለኛ ጥንቃቄ — Moderate Caution*\n"
-            "ዛሬ መካከለኛ ዜና አለ።\n"
-            "ቦቱ ይሰራል — ነገር ግን ጥንቃቄ ያስፈልጋል።")
+            "ዛሬ መካከለኛ ዜና አለ። ቦቱ ይሰራል — ነገር ግን ጥንቃቄ ያስፈልጋል።")
 
 def generate_news_chart() -> Optional[str]:
     evs = state.news_events
@@ -514,8 +521,8 @@ def generate_news_chart() -> Optional[str]:
     for ev in evs[:18]:
         t = ev.dt_utc.astimezone(NY_TZ).strftime("%I:%M%p") if ev.dt_utc else ev.time_et
         rows.append([t, ev.currency, "🔴" if ev.is_red else "🟠",
-                     ev.title[:40], ev.forecast or "—", ev.actual or "—"])
-    cols   = ["Time (ET)","Curr","Impact","Event","Forecast","Actual"]
+                     ev.title[:40], ev.forecast or "—", ev.prev or "—"])
+    cols   = ["Time (ET)","Curr","Impact","Event","Forecast","Previous"]
     widths = [0.10, 0.06, 0.07, 0.44, 0.14, 0.15]
     fig, ax = plt.subplots(figsize=(14, max(4, len(rows)*0.42+1.8)), facecolor="#0d1117")
     ax.axis("off")
@@ -729,7 +736,7 @@ def generate_chart(candles:deque, tf:str="M15",
            if nxt and nxt.dt_utc else"")
     score_s=f"Score:{state.ob_score}/100  " if state.ob_score else""
     al.text(.01,.5,
-        f"SMC SNIPER v5.1 [{state.trading_mode}]  ·  {state.pair_display}  sym:{state.active_symbol}  "
+        f"SMC SNIPER v5.2 [{state.trading_mode}]  ·  {state.pair_display}  sym:{state.active_symbol}  "
         f"Bal:{state.account_balance:.2f}{state.account_currency}  "
         f"Risk:{state.risk_pct*100:.0f}%  {score_s}"
         f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
@@ -776,7 +783,7 @@ def generate_history_chart() -> Optional[str]:
     ax2.fill_between(labels,cum,alpha=.12,color=cc)
     ax2.axhline(0,color=GR,lw=.8); ax2.set_ylabel("Cumulative",color="#90a4ae",fontsize=8)
     ts=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99,.01,f"SMC SNIPER v5.1 · {ts}",color="#444d56",fontsize=7,ha="right")
+    fig.text(.99,.01,f"SMC SNIPER v5.2 · {ts}",color="#444d56",fontsize=7,ha="right")
     path="/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path,dpi=120,bbox_inches="tight",facecolor=fig.get_facecolor())
@@ -1001,9 +1008,13 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     risk=abs(entry-sl)
     if risk==0: return None
     mult=1 if bias=="BULLISH" else -1
+    
     tp1=entry+risk*state.tp1_r*mult
     tp2=entry+risk*state.tp2_r*mult
     tp3=entry+risk*state.tp3_r*mult
+    
+    rr_1_price = entry + risk * mult # 1:1 Strict BE Check Price
+    
     stake=max(1.,round(max(PAIR_REGISTRY[state.pair_key][3],
                            state.account_balance*state.risk_pct),2))
 
@@ -1011,6 +1022,7 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
         "direction":"BUY" if bias=="BULLISH" else"SELL",
         "entry":round(entry,5),"sl":round(sl,5),
         "tp1":round(tp1,5),"tp2":round(tp2,5),"tp3":round(tp3,5),
+        "rr_1":round(rr_1_price, 5),
         "risk_r":round(risk,5),"stake":stake,
         "struct":struct["type"],"ob":ob_,"fvg":fvg_,
         "trap":trap,"idm":idm,"ob_score":sc,"rsi":rsi_now,
@@ -1027,24 +1039,38 @@ def check_trade_mgmt():
         sig=info.get("signal")
         if not sig: continue
         p,d=state.current_price,info["direction"]
-        # Break-even at TP1
-        if not info["be_moved"]:
-            if(d=="BUY" and p>=sig["tp1"]) or(d=="SELL" and p<=sig["tp1"]):
-                info["be_moved"]=True; sig["sl"]=sig["entry"]
-                asyncio.ensure_future(tg_async(
-                    f"✅ *BreakEven* `{cid}`\nSL → Entry `{sig['entry']}`"))
-        # Trailing stop
-        buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
-        if len(buf)>=10:
-            df=pd.DataFrame(list(buf)[-30:])
-            df.columns=["time","open","high","low","close"]
-            swh,swl=_swing_pts(df,n=3)
-            if d=="BUY"  and swl:
-                t=df["low"].iloc[swl[-1]]*.9998
-                if t>sig["sl"]: sig["sl"]=t
-            elif d=="SELL" and swh:
-                t=df["high"].iloc[swh[-1]]*1.0002
-                if t<sig["sl"]: sig["sl"]=t
+        
+        # 1. Strict Break-Even at 1:1 R:R
+        if not info.get("be_moved"):
+            if (d=="BUY" and p >= sig["rr_1"]) or (d=="SELL" and p <= sig["rr_1"]):
+                info["be_moved"]=True
+                sig["sl"]=sig["entry"]
+                asyncio.ensure_future(tg_async(f"✅ *Strict Break-Even* `{cid}`\nPrice hit 1:1 R:R. SL → Entry `{sig['entry']}`"))
+                
+        # 2. Partial Close (50%) at TP1
+        if info.get("trade_split") == "HALF_1":
+            if (d=="BUY" and p >= sig["tp1"]) or (d=="SELL" and p <= sig["tp1"]):
+                asyncio.ensure_future(tg_async(f"💰 *Partial Close (50%)* hit at TP1 for `{cid}`"))
+                asyncio.ensure_future(close_contract(cid))
+                
+        # 3. Structural Trailing Stop after TP2 (Runner)
+        if info.get("trade_split") == "HALF_2":
+            if (d=="BUY" and p >= sig["tp2"]) or (d=="SELL" and p <= sig["tp2"]):
+                buf = state.m5_candles
+                if len(buf)>=10:
+                    df=pd.DataFrame(list(buf)[-30:])
+                    df.columns=["time","open","high","low","close"]
+                    swh,swl=_swing_pts(df,n=3)
+                    if d=="BUY" and swl:
+                        t=df["low"].iloc[swl[-1]]*.9998
+                        if t > sig["sl"]: 
+                            sig["sl"] = t
+                            asyncio.ensure_future(tg_async(f"🔒 Trailed SL behind M5 Structural Low: `{t:.5f}`"))
+                    elif d=="SELL" and swh:
+                        t=df["high"].iloc[swh[-1]]*1.0002
+                        if t < sig["sl"]: 
+                            sig["sl"] = t
+                            asyncio.ensure_future(tg_async(f"🔒 Trailed SL behind M5 Structural High: `{t:.5f}`"))
 
 # ══════════════════════════════════════════════════════════════════════
 # BROKER CONNECTION & DERIV WEBSOCKET
@@ -1099,7 +1125,7 @@ async def _fetch(sym:str,nom:int)->int:
     for ag in GRAN_FALLBACKS.get(nom,[nom]):
         try:
             r=await send_req({"ticks_history":sym,"end":"latest",
-                              "count":200,"granularity":ag,"style":"candles"})
+                              "count":600,"granularity":ag,"style":"candles"})
             if "error" in r: log.warning(f"Fetch {sym} g={ag}: {r['error'].get('message','')}"); continue
             raw=r.get("candles",[])
             if not raw: continue
@@ -1136,8 +1162,7 @@ async def subscribe_pair(key:str):
     log.info(f"subscribe_pair done: {sym} H1:{h} M15:{m} M5:{f} M1:{o}")
     return h,m,f,o
 
-async def open_contract(direction:str,amount:float)->Optional[str]:
-    if state.paused or state.block_trading: return None
+async def _do_open(direction: str, amount: float) -> Optional[str]:
     ct="MULTUP" if direction=="BUY" else"MULTDOWN"
     try:
         r=await send_req({"buy":1,"price":round(amount,2),"parameters":{
@@ -1145,16 +1170,41 @@ async def open_contract(direction:str,amount:float)->Optional[str]:
             "amount":round(amount,2),"currency":state.account_currency,
             "multiplier":10,"basis":"stake","stop_out":1}})
         if "error" in r: log.error(f"Buy: {r['error']['message']}"); return None
-        cid=r["buy"]["contract_id"]
-        state.open_contracts[cid]={
+        return r["buy"]["contract_id"]
+    except Exception as e: log.error(f"_do_open: {e}"); return None
+
+async def open_contract(direction:str,amount:float)->Optional[str]:
+    if state.paused or state.block_trading: return None
+    
+    amount_per_trade = round(amount / 2, 2)
+    # Respect minimum stake limit
+    min_st = PAIR_REGISTRY[state.pair_key][3]
+    if amount_per_trade < min_st:
+        amount_per_trade = min_st
+
+    # Trade 1 (TP1 Partial Close)
+    cid1 = await _do_open(direction, amount_per_trade)
+    if cid1:
+        state.open_contracts[cid1]={
             "direction":direction,"entry":state.current_price,
-            "amount":amount,"signal":state.last_signal,
-            "be_moved":False,"opened_at":time.time()}
+            "amount":amount_per_trade,"signal":state.last_signal,
+            "be_moved":False,"opened_at":time.time(), "trade_split": "HALF_1"}
         state.trade_count+=1
-        log.info(f"✅ Opened {cid} [{direction}] ${amount:.2f}")
-        asyncio.ensure_future(send_req({"proposal_open_contract":1,"contract_id":cid,"subscribe":1}))
-        return cid
-    except Exception as e: log.error(f"open_contract: {e}"); return None
+        log.info(f"✅ Opened HALF_1 {cid1} [{direction}] ${amount_per_trade:.2f}")
+        asyncio.ensure_future(send_req({"proposal_open_contract":1,"contract_id":cid1,"subscribe":1}))
+    
+    # Trade 2 (Runner)
+    cid2 = await _do_open(direction, amount_per_trade)
+    if cid2:
+        state.open_contracts[cid2]={
+            "direction":direction,"entry":state.current_price,
+            "amount":amount_per_trade,"signal":state.last_signal,
+            "be_moved":False,"opened_at":time.time(), "trade_split": "HALF_2"}
+        state.trade_count+=1
+        log.info(f"✅ Opened HALF_2 (Runner) {cid2} [{direction}] ${amount_per_trade:.2f}")
+        asyncio.ensure_future(send_req({"proposal_open_contract":1,"contract_id":cid2,"subscribe":1}))
+        
+    return cid1 or cid2
 
 async def close_contract(cid:str)->bool:
     try:
@@ -1192,7 +1242,11 @@ async def handle_msg(msg:dict):
                float(c["low"]),float(c["close"])) for c in msg.get("candles",[])]
         if rows: _update_buf(gran,rows)
     elif mt=="tick":
-        state.current_price=float(msg["tick"]["quote"])
+        t = msg["tick"]
+        state.current_price = float(t["quote"])
+        state.current_ask = float(t.get("ask", t["quote"]))
+        state.current_bid = float(t.get("bid", t["quote"]))
+        state.current_spread = state.current_ask - state.current_bid
     elif mt=="proposal_open_contract":
         poc=msg.get("proposal_open_contract",{})
         cid=str(poc.get("contract_id",""))
@@ -1205,6 +1259,8 @@ async def handle_msg(msg:dict):
             else:        state.losses+=1
             state.total_pnl+=profit; tnum=state.trade_count
             sig=info.get("signal",{}) or {}
+            split_lbl = info.get("trade_split", "")
+            
             state.trade_history.append({
                 "num":tnum,"id":cid,"pair":state.pair_display,
                 "direction":info.get("direction","?"),
@@ -1227,7 +1283,7 @@ async def handle_msg(msg:dict):
             amharic_r  =(reason_obj.build_amharic(info.get("direction","?"))
                          if reason_obj else "")
             await tg_async(
-                f"{'✅ WIN' if profit>0 else '❌ LOSS'}  `#{tnum}` — *Post-Trade Report*\n\n"
+                f"{'✅ WIN' if profit>0 else '❌ LOSS'}  `#{tnum}` [{split_lbl}] — *Post-Trade Report*\n\n"
                 f"Pair:`{state.pair_display}`  Dir:`{info.get('direction','?')}`\n"
                 f"Entry:`{info.get('entry',0):.5f}`  Exit:`{exit_s:.5f}`\n"
                 f"P&L: `{sign}{profit:.2f} {state.account_currency}`\n"
@@ -1282,6 +1338,15 @@ async def trading_loop():
             if sig:
                 sig_conf=compute_signal(state.conf_tf)
                 if sig_conf and sig_conf["direction"]==sig["direction"]:
+                    
+                    # Spread Guard
+                    pip_val = PAIR_REGISTRY[state.pair_key][2]
+                    spread_pips = state.current_spread / pip_val if pip_val else 0
+                    if spread_pips > MAX_SPREAD_LIMIT:
+                        log.warning(f"Spread {spread_pips:.1f} pips > {MAX_SPREAD_LIMIT} pips limit. Execution canceled.")
+                        await asyncio.sleep(15)
+                        continue
+
                     log.info(f"🎯 AUTO EXECUTE {sig['direction']} score:{sig['ob_score']} Mode:{state.trading_mode}")
                     reason=sig.get("reason")
                     buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
@@ -1291,13 +1356,15 @@ async def trading_loop():
                     score_txt=" + ".join(sig.get("score_reasons",[])[:5])
                     
                     md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
+                    g_lbl = " 🚀 GROWTH" if state.growth_mode else ""
+                    
                     await tg_async(
-                        f"🚀 *{md_lbl} ENTRY — {state.pair_display}*\n"
+                        f"🚀 *{md_lbl} ENTRY — {state.pair_display}*{g_lbl}\n"
                         f"Score: `{sig['ob_score']}/100` ✅ Autonomous\n\n"
                         f"Dir:    `{sig['direction']}`\n"
                         f"Entry:  `{sig['entry']}`\n"
                         f"SL:     `{sig['sl']}`\n"
-                        f"TP1({state.tp1_r}R): `{sig['tp1']}`\n"
+                        f"TP1(50%): `{sig['tp1']}`\n"
                         f"TP2({state.tp2_r}R): `{sig['tp2']}`\n"
                         f"TP3({state.tp3_r}R): `{sig['tp3']}`\n\n"
                         f"*Score Breakdown:*\n`{score_txt}`\n\n"
@@ -1401,7 +1468,7 @@ async def _cmd(cmd:str):
         md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
         await tg_async(
             f"{mkt}\n\n"
-            f"🤖 *SMC SNIPER EA v5.1*\n\n"
+            f"🤖 *SMC SNIPER EA v5.2*\n\n"
             f"Status: {bl}\n"
             f"Broker: {conn}\n"
             f"Strategy: `{md_lbl}`\n"
@@ -1546,7 +1613,8 @@ async def _cmd(cmd:str):
             f"Pair:`{state.pair_display}`  sym:`{state.active_symbol}`\n"
             f"Risk:`{state.risk_pct*100:.0f}%`  TPs:`{state.tp1_r}R/{state.tp2_r}R/{state.tp3_r}R`\n"
             f"Min Score:`{state.min_score}/100`\n"
-            f"Small Acc:`{'ON 💎' if state.small_acc_mode else 'OFF'}`",
+            f"Small Acc:`{'ON 💎' if state.small_acc_mode else 'OFF'}`\n"
+            f"Growth Mode:`{'ON 🚀' if state.growth_mode else 'OFF'}`",
             reply_markup=kb_settings())
 
     elif cmd in("/mode", "cmd_mode_menu"):
@@ -1574,7 +1642,7 @@ async def _cmd(cmd:str):
     elif cmd.startswith("cmd_pair_"):
         key=cmd.replace("cmd_pair_","").upper()
         if key in PAIR_REGISTRY:
-            old=state.pair_key; state.pair_key=key; state.small_acc_mode=False
+            old=state.pair_key; state.pair_key=key; state.small_acc_mode=False; state.growth_mode=False
             if state.ws:
                 try:
                     await tg_async(f"⏳ Switching to `{PAIR_REGISTRY[key][4]}`...", reply_markup=kb_main())
@@ -1592,7 +1660,7 @@ async def _cmd(cmd:str):
             state.tp1_r,state.tp2_r,state.tp3_r=2.,4.,6.
             await tg_async("💎 Small Acc *OFF* — 1% risk",reply_markup=kb_settings())
         else:
-            state.small_acc_mode=True
+            state.small_acc_mode=True; state.growth_mode=False
             if state.pair_key=="XAUUSD":
                 state.risk_pct=0.02; state.tp1_r,state.tp2_r,state.tp3_r=1.5,3.,5.
                 note="XAU/USD 2% risk (tight TPs)"
@@ -1604,10 +1672,19 @@ async def _cmd(cmd:str):
                 try: await subscribe_pair(state.pair_key)
                 except Exception: pass
             await tg_async(f"💎 *Small Acc ON*\n{note}",reply_markup=kb_settings())
+            
+    elif cmd=="cmd_growth":
+        if state.growth_mode:
+            state.growth_mode=False; state.risk_pct=0.01
+            await tg_async("🚀 Growth Mode *OFF* — Standard 1% risk",reply_markup=kb_settings())
+        else:
+            state.growth_mode=True; state.small_acc_mode=False
+            state.risk_pct = 0.10 # Aggressive 10% risk
+            await tg_async("🚀 *Growth Mode ON* ($10 to $100)\nAggressive 10% risk activated.",reply_markup=kb_settings())
 
-    elif cmd=="cmd_risk_1": state.risk_pct=0.01; state.small_acc_mode=False; await tg_async("✅ Risk → 1%",reply_markup=kb_settings())
-    elif cmd=="cmd_risk_3": state.risk_pct=0.03; state.small_acc_mode=False; await tg_async("✅ Risk → 3%",reply_markup=kb_settings())
-    elif cmd=="cmd_risk_5": state.risk_pct=0.05; state.small_acc_mode=False; await tg_async("✅ Risk → 5%",reply_markup=kb_settings())
+    elif cmd=="cmd_risk_1": state.risk_pct=0.01; state.small_acc_mode=False; state.growth_mode=False; await tg_async("✅ Risk → 1%",reply_markup=kb_settings())
+    elif cmd=="cmd_risk_3": state.risk_pct=0.03; state.small_acc_mode=False; state.growth_mode=False; await tg_async("✅ Risk → 3%",reply_markup=kb_settings())
+    elif cmd=="cmd_risk_5": state.risk_pct=0.05; state.small_acc_mode=False; state.growth_mode=False; await tg_async("✅ Risk → 5%",reply_markup=kb_settings())
 
     elif cmd in("/stop","cmd_stop"):
         state.paused=True; n=await close_all()
@@ -1641,7 +1718,7 @@ async def ws_run(ws):
         md_lbl="🎯 Sniper" if state.trading_mode=="SNIPER" else"⚡ Scalper"
         await tg_async(
             f"{market_header()}\n\n"
-            f"🤖 *SMC SNIPER EA v5.1 Online*\n"
+            f"🤖 *SMC SNIPER EA v5.2 Online*\n"
             f"Broker: {acct_icon} `{state.account_id}`\n"
             f"Strategy: `{md_lbl}`\n"
             f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
@@ -1684,7 +1761,7 @@ async def ws_loop():
 async def health(req):
     wr=f"{state.wins/(state.wins+state.losses)*100:.1f}" if(state.wins+state.losses)>0 else"0"
     return web.json_response({
-        "version":"5.1","status":"running" if state.running else"stopped",
+        "version":"5.2","status":"running" if state.running else"stopped",
         "paused":state.paused,"block_trading":state.block_trading,
         "block_reason":state.block_reason,"autonomous":state.autonomous,
         "mode":state.trading_mode,"min_score":state.min_score,
@@ -1696,7 +1773,7 @@ async def health(req):
         "zone":state.premium_discount,"session_now":state.session_now,
         "ob_score":state.ob_score,"atr_ok":state.atr_filter_ok,
         "balance":state.account_balance,
-        "risk_pct":state.risk_pct,"small_acc":state.small_acc_mode,
+        "risk_pct":state.risk_pct,"small_acc":state.small_acc_mode,"growth_mode":state.growth_mode,
         "trades":state.trade_count,"wins":state.wins,"losses":state.losses,
         "winrate":wr,"total_pnl":state.total_pnl,
         "open_contracts":len(state.open_contracts),"history":len(state.trade_history),
@@ -1718,7 +1795,7 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.1 ·  Multi-Strategy Auto   ║")
+    log.info("║  SMC SNIPER EA v5.2 ·  Multi-Strategy Auto   ║")
     log.info("║  News Shield | Broker Connect | Post-Reports ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
