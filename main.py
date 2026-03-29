@@ -254,7 +254,6 @@ class BotState:
 
 state = BotState()
 
-# Load persisted token on startup
 def _load_saved_token():
     try:
         if TOKEN_FILE.exists():
@@ -270,18 +269,16 @@ def _load_saved_token():
 # ══════════════════════════════════════════════════════════════════════
 def is_market_open() -> bool:
     now = datetime.now(UTC)
-    wd  = now.weekday()   # 0=Mon … 6=Sun
+    wd  = now.weekday()   
     h   = now.hour
-    # Closed: Friday 21:00 UTC → Sunday 22:00 UTC
-    if wd == 4 and h >= 21: return False   # Friday after close
-    if wd == 5:              return False   # Saturday
-    if wd == 6 and h < 22:  return False   # Sunday before open
+    if wd == 4 and h >= 21: return False   
+    if wd == 5:             return False   
+    if wd == 6 and h < 22:  return False   
     return True
 
 def time_to_next_open() -> str:
     now = datetime.now(UTC)
     wd  = now.weekday()
-    # Find next Sunday 22:00 UTC
     days_to_sun = (6 - wd) % 7
     if days_to_sun == 0 and now.hour >= 22:
         days_to_sun = 7
@@ -303,9 +300,9 @@ def get_session() -> str:
 def market_header() -> str:
     if is_market_open():
         sess = get_session()
-        return f"🟢 Market is *OPEN*  ·  Session: `{sess}`"
+        return f"🟢 Market is *OPEN* ·  Session: `{sess}`"
     else:
-        return f"🔴 Market is *CLOSED*  ·  Opens in `{time_to_next_open()}`"
+        return f"🔴 Market is *CLOSED* ·  Opens in `{time_to_next_open()}`"
 
 # ══════════════════════════════════════════════════════════════════════
 # KEYBOARDS
@@ -539,16 +536,6 @@ async def news_refresh_loop():
             state.next_red_event  = _next_red()
             path = await loop.run_in_executor(None, generate_news_chart)
             state.news_chart_path = path
-            reds = [e for e in events if e.is_red]
-            if reds:
-                nxt = state.next_red_event
-                ni  = (f"\nNext🔴: *{nxt.title}* @ "
-                       f"`{nxt.dt_utc.astimezone(NY_TZ).strftime('%I:%M%p ET')}`"
-                       if nxt and nxt.dt_utc else "")
-                await tg_async(
-                    f"{market_header()}\n\n"
-                    f"📰 *News Refresh — {len(reds)} Red Events Today*{ni}\n\n"
-                    f"{_amharic_summary()}", photo_path=path)
         except Exception as e:
             log.error(f"news_refresh_loop: {e}")
         await asyncio.sleep(NEWS_INTERVAL)
@@ -620,7 +607,6 @@ def generate_chart(candles:deque, tf:str="M15",
     ar=fig.add_subplot(gs[2],sharex=am); al=fig.add_subplot(gs[3])
     for a in(am,av,ar,al): _ax_s(a)
 
-    # Candles
     for i,row in df.iterrows():
         c=BC if row["close"]>=row["open"] else RC
         bl=min(row["open"],row["close"]); bh=max(row["open"],row["close"])
@@ -629,12 +615,10 @@ def generate_chart(candles:deque, tf:str="M15",
             (i-.35,bl),.7,max(bh-bl,df["close"].mean()*.00005),
             boxstyle="square,pad=0",fc=c,ec=c,alpha=0.85))
 
-    # Volume
     for i,row in df.iterrows():
         av.bar(i,1,color=BC if row["close"]>=row["open"] else RC,alpha=0.4,width=.7)
     av.set_ylabel("Vol",color="#555d68",fontsize=6)
 
-    # RSI
     rs=_rsi_calc(df["close"].values)
     ar.plot(range(len(rs)),rs,color="#90a4ae",lw=0.9)
     ar.axhline(70,color=RC,lw=.5,ls="--",alpha=.5)
@@ -642,12 +626,10 @@ def generate_chart(candles:deque, tf:str="M15",
     ar.axhline(30,color=BC,lw=.5,ls="--",alpha=.5)
     ar.set_ylim(0,100); ar.set_ylabel("RSI",color="#555d68",fontsize=6)
 
-    # EMA50
     if len(df)>=52:
         ema50=df["close"].ewm(span=50,adjust=False).mean()
         am.plot(range(len(ema50)),ema50.values,color="#78909c",lw=1.,ls="-.",alpha=.6,label="EMA50")
 
-    # OB
     if state.active_ob:
         ob=state.active_ob; oc=OBB if ob["type"]=="BULL" else OBR
         xs=max(0,len(df)-35)/len(df)
@@ -657,27 +639,23 @@ def generate_chart(candles:deque, tf:str="M15",
         sc_txt=f" {ob['type']} OB  sc:{state.ob_score}/100"
         am.text(2,ob["high"],sc_txt,color=oc,fontsize=7,va="bottom",fontfamily="monospace")
 
-    # FVG
     if state.active_fvg:
         fvg=state.active_fvg
         am.axhspan(fvg["low"],fvg["high"],alpha=.13,color=FC)
         am.text(2,fvg["high"],"  FVG",color=FC,fontsize=7,va="bottom",fontfamily="monospace")
 
-    # IDM
     if state.active_idm:
         idm=state.active_idm
         am.axhline(idm["level"],color=IC,ls=":",lw=1.2,alpha=.9)
         sw=("✅ SWEPT" if idm.get("swept") else "⏳ PENDING")
         am.text(2,idm["level"],f"  IDM {sw}",color=IC,fontsize=7,va="bottom",fontfamily="monospace")
 
-    # Trap
     if state.active_trap:
         trap=state.active_trap
         am.axhline(trap["level"],color=TC,ls=":",lw=1.4,alpha=.9)
         am.text(2,trap["level"],f"  TRAP {trap['side']}",
                 color=TC,fontsize=7,va="bottom",fontfamily="monospace")
 
-    # Fib 0.5
     if state.last_signal and "fib_hi" in state.last_signal:
         sig=state.last_signal
         mid=(sig["fib_hi"]+sig["fib_lo"])/2
@@ -686,7 +664,6 @@ def generate_chart(candles:deque, tf:str="M15",
         am.axhspan(mid,sig["fib_hi"],alpha=.04,color=RC)
         am.text(len(df)-2,mid," 0.5 Fib",color="#78909c",fontsize=6,ha="right",fontfamily="monospace")
 
-    # Signal lines
     if state.last_signal:
         sig=state.last_signal
         am.axhline(sig["entry"],color=EC,lw=1.6,ls="-")
@@ -694,7 +671,6 @@ def generate_chart(candles:deque, tf:str="M15",
         for tk,tc_ in zip(["tp1","tp2","tp3"],TPC):
             if tk in sig: am.axhline(sig[tk],color=tc_,lw=.8,ls="-.")
 
-    # Entry/exit overlays
     if entry_price:
         am.axhline(entry_price,color=EC,lw=2.2,alpha=.9)
         am.annotate(f"▶ ENTRY {entry_price:.5f}",xy=(len(df)-1,entry_price),
@@ -706,7 +682,6 @@ def generate_chart(candles:deque, tf:str="M15",
         am.annotate(f"◀ EXIT {exit_price:.5f}  P&L:{ps}",xy=(len(df)-1,exit_price),
                     color=xc,fontsize=8,ha="right",fontfamily="monospace")
 
-    # News markers
     for ev in state.news_events:
         if not ev.dt_utc or not ev.is_red: continue
         ep = ev.dt_utc.timestamp()
@@ -715,12 +690,10 @@ def generate_chart(candles:deque, tf:str="M15",
                 am.axvline(ci,color=RC,lw=1.,ls="--",alpha=.5)
                 am.text(ci,df["high"].max(),"🔴",fontsize=8,ha="center"); break
 
-    # Swings
     swh,swl=_swing_pts(df)
     for i in swh: am.plot(i,df.iloc[i]["high"]*1.00015,"^",color=BC,ms=4,alpha=.5)
     for i in swl: am.plot(i,df.iloc[i]["low"]*0.99985, "v",color=RC,ms=4,alpha=.5)
 
-    # Title
     tc_=BC if state.trend_bias=="BULLISH" else(RC if state.trend_bias=="BEARISH" else "#90a4ae")
     tl={"live":"📡 LIVE","entry":"🎯 ENTRY","exit":"🏁 CLOSED"}.get(chart_type,"")
     blk=" 🚫NEWS" if state.block_trading else""
@@ -732,7 +705,6 @@ def generate_chart(candles:deque, tf:str="M15",
         color=tc_,fontsize=10,fontfamily="monospace",pad=8)
     am.set_ylabel("Price",color="#90a4ae",fontsize=8)
 
-    # Bottom label
     al.set_xlim(0,1); al.set_ylim(0,1); al.axis("off")
     ts=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     nxt=state.next_red_event
@@ -747,7 +719,6 @@ def generate_chart(candles:deque, tf:str="M15",
         f"{nxt_s}  {ts}",
         color="#444d56",fontsize=6,va="center",fontfamily="monospace")
 
-    # Reason box
     if reason and chart_type=="entry":
         box_txt=(f"Score:{reason.score}  {reason.structure}  "
                  f"{reason.pd_zone}  IDM:{reason.idm_sweep}  Sess:{reason.session}")
@@ -795,7 +766,7 @@ def generate_history_chart() -> Optional[str]:
     plt.close(fig); return path
 
 # ══════════════════════════════════════════════════════════════════════
-# SMC SNIPER BRAIN  — Full strategy (unchanged from v4 + scoring boost)
+# SMC SNIPER BRAIN
 # ══════════════════════════════════════════════════════════════════════
 def _bos_choch(df:pd.DataFrame) -> Optional[dict]:
     H,L=_swing_pts(df)
@@ -902,15 +873,7 @@ def _h1_trend()->str:
     return state.trend_bias
 
 def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type,disp)->tuple:
-    """
-    Sniper Confluence Scoring System — 100 points total.
-    75+ = High Quality  (≈8/10)
-    60+ = Acceptable
-    <60 = Reject
-    """
     s=0; reasons=[]
-
-    # Core SMC (60 pts)
     if fvg:
         s+=20; reasons.append(f"FVG +20")
     if trap and trap.get("swept"):
@@ -919,25 +882,16 @@ def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type
         s+=15; reasons.append(f"IDM✅ +15")
     if ob   and disp>=2.0:
         s+=10; reasons.append(f"Disp{disp:.1f}x +10")
-
-    # Trend alignment (15 pts)
     if struct_type=="BOS": s+=10; reasons.append("BOS +10")
     elif struct_type=="CHoCH": s+=8; reasons.append("CHoCH +8")
-
-    # Session quality (10 pts)
     if session=="OVERLAP":  s+=10; reasons.append("Overlap +10")
     elif session in("LONDON","NY"): s+=7; reasons.append(f"{session} +7")
-
-    # Technical filters (15 pts)
     if atr_ok:    s+=5;  reasons.append("ATR✅ +5")
     if ema_ok:    s+=5;  reasons.append("EMA✅ +5")
     if candle_ok: s+=5;  reasons.append("Candle✅ +5")
-
-    # RSI confluence bonus
     if ob:
         if ob["type"]=="BULL" and rsi<40: s+=5; reasons.append(f"RSI{rsi:.0f} +5")
         elif ob["type"]=="BEAR" and rsi>60: s+=5; reasons.append(f"RSI{rsi:.0f} +5")
-
     return min(s,100), reasons
 
 def compute_signal(tf:str="M15") -> Optional[dict]:
@@ -970,7 +924,6 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     fvg_=_fvg(df,ob_); state.active_fvg=fvg_
     rsi_now=float(_rsi_calc(df["close"].values)[-1])
 
-    # Win-rate filters
     session=get_session(); state.session_now=session
     if state.pair_key=="XAUUSD" and session not in("LONDON","NY","OVERLAP"):
         return None
@@ -999,7 +952,6 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
         log.info(f"Score {sc}<{min_sc} — skip. Reasons: {score_reasons}")
         return None
 
-    # Build trade reason
     reason=TradeReason()
     reason.h1_trend   =f"H1 {bias}"
     reason.structure  =f"{struct['type']} {bias}"
@@ -1090,7 +1042,6 @@ async def authorize(token:str=None)->dict:
     state.broker_connected=True
     state.account_id  =auth.get("loginid","")
     state.account_type=auth.get("account_type","demo")
-    # Save valid token
     if token:
         state.deriv_token=token
         try: TOKEN_FILE.write_text(token)
@@ -1237,7 +1188,6 @@ async def handle_msg(msg:dict):
                 direction=info.get("direction"),pnl=profit,chart_type="exit")
             sign="+" if profit>0 else""
             wr=f"{state.wins/(state.wins+state.losses)*100:.1f}%" if(state.wins+state.losses)>0 else"N/A"
-            # Execution-only alert — full post-trade report
             reason_obj=sig.get("reason")
             post_report=(reason_obj.build_report(info.get("direction","?"))
                          if reason_obj else "")
@@ -1262,26 +1212,19 @@ async def handle_msg(msg:dict):
         log.warning(f"API: {msg['error'].get('message','?')}")
 
 # ══════════════════════════════════════════════════════════════════════
-# AUTO CHART BROADCAST
+# SILENT BACKGROUND SCANNER (NO TELEGRAM SPAM)
 # ══════════════════════════════════════════════════════════════════════
 async def chart_loop():
+    """ 
+    This loop now ONLY logs to the console/terminal.
+    It WILL NOT send any automatic updates to Telegram anymore.
+    """
     await asyncio.sleep(50)
     while state.running:
         try:
             if state.current_price>0 and len(state.m15_candles)>=20:
-                path=generate_chart(state.m15_candles,"M15",chart_type="live")
-                if path:
-                    be="📈" if state.trend_bias=="BULLISH" else"📉" if state.trend_bias=="BEARISH" else"➡️"
-                    pe="🟢" if state.premium_discount=="DISCOUNT" else"🔴" if state.premium_discount=="PREMIUM" else"⚪"
-                    blk=" | 🚫NEWS BLOCK" if state.block_trading else""
-                    await tg_async(
-                        f"{market_header()}{blk}\n\n"
-                        f"{be} *{state.pair_display}  M15*\n"
-                        f"Price:`{state.current_price:.5f}`  Bias:`{state.trend_bias}`\n"
-                        f"Zone:{pe}`{state.premium_discount}`  Score:`{state.ob_score}/100`\n"
-                        f"Session:`{state.session_now}`  ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
-                        f"Acct:`{state.account_type.upper()}`  Bal:`{state.account_balance:.2f}`",
-                        photo_path=path)
+                # Silently scan the market in the background
+                log.info(f"Silent Scan Active: {state.pair_display} | Bias: {state.trend_bias} | Zone: {state.premium_discount} | Score: {state.ob_score}/100")
         except Exception as e:
             log.error(f"chart_loop: {e}")
         await asyncio.sleep(CHART_INTERVAL)
@@ -1307,7 +1250,6 @@ async def trading_loop():
             if time.time()-state.last_trade_ts < state.signal_cooldown:
                 await asyncio.sleep(30); continue
 
-            # Autonomous signal pipeline
             sig=compute_signal("M15")
             if sig:
                 sig5=compute_signal("M5")
@@ -1318,7 +1260,8 @@ async def trading_loop():
                         entry_price=sig["entry"],direction=sig["direction"],
                         chart_type="entry",reason=reason)
                     score_txt=" + ".join(sig.get("score_reasons",[])[:5])
-                    # Execution alert — no noise, only on trade
+                    
+                    # Execution alert
                     await tg_async(
                         f"🎯 *SNIPER ENTRY — {state.pair_display}*\n"
                         f"Score: `{sig['ob_score']}/100` ✅ Autonomous\n\n"
@@ -1332,6 +1275,7 @@ async def trading_loop():
                         f"Stake: `{sig['stake']:.2f} {state.account_currency}`"
                         f"{'  💎' if state.small_acc_mode else ''}",
                         photo_path=chart)
+                    
                     cid=await open_contract(sig["direction"],sig["stake"])
                     if cid: state.last_trade_ts=time.time()
         except Exception as e:
@@ -1382,7 +1326,6 @@ async def _handle_upd(upd:dict):
         text=upd["message"].get("text","").strip()
         cid =str(upd["message"]["chat"]["id"])
         if TELEGRAM_CHAT_ID and cid!=TELEGRAM_CHAT_ID: return
-        # Token input flow
         if state.awaiting_token and text and not text.startswith("/"):
             await _process_token(text); return
         await _cmd(text)
@@ -1395,7 +1338,6 @@ async def _handle_upd(upd:dict):
         await _cmd(data)
 
 async def _process_token(token:str):
-    """Handle broker token sent by user."""
     state.awaiting_token=False
     if not state.ws:
         await tg_async("⚠️ Bot not connected yet. Please wait and try again.", reply_markup=kb_main())
@@ -1412,7 +1354,6 @@ async def _process_token(token:str):
             f"Balance: `{state.account_balance:.2f} {state.account_currency}`\n\n"
             f"_Sniper Brain is now active. Scanning for high-quality setups..._",
             reply_markup=kb_main())
-        # Re-subscribe with new token
         h,m,f=await subscribe_pair(state.pair_key)
         log.info(f"Re-subscribed after token: H1:{h} M15:{m} M5:{f}")
     except Exception as e:
