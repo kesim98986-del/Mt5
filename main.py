@@ -50,7 +50,7 @@ UTC   = timezone.utc
 
 PAIR_REGISTRY: Dict[str, tuple] = {
     # key: (primary_sym, otc_sym, pip_val, min_stake, display, category)
-    "XAUUSD": ("frxXAUUSD", "OTC_XAUUSD", 0.01,   1.0, "XAU/USD 🥇", "METAL"),
+    "XAUUSD": ("frxXAUUSD", "OTC_XAUUSD", 0.01,   1.0, "frxXAUUSD 🥇", "METAL"),
     "EURUSD": ("frxEURUSD", "OTC_EURUSD", 0.0001, 1.0, "EUR/USD 🇪🇺", "FOREX"),
     "GBPUSD": ("frxGBPUSD", "OTC_GBPUSD", 0.0001, 1.0, "GBP/USD 🇬🇧", "FOREX"),
     "US100":  ("frxUS100",  "OTC_NDX",    0.1,    1.0, "NASDAQ 💻",   "INDEX"),
