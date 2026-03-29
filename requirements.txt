@@ -1,0 +1,8 @@
+websockets==12.0
+pandas==2.2.2
+numpy==1.26.4
+matplotlib==3.9.0
+requests==2.32.3
+aiohttp==3.9.5
+beautifulsoup4==4.12.3
+tzdata==2024.1
