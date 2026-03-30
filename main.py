@@ -298,21 +298,13 @@ def time_to_next_open() -> str:
     return f"{h}h {m}m"
 
 def get_session() -> str:
-    """Return the current Forex session based on UTC hour.
-    Covers all 24 hours with no gaps:
-      00–06  → ASIA
-      07–11  → LONDON
-      12–15  → OVERLAP  (London/NY overlap — highest liquidity)
-      16–16  → NY       (post-overlap NY only)
-      17–21  → CLOSE
-      22–23  → ASIA     (early Tokyo / Sunday open)
-    """
+    """Return the current Forex session (UTC). Covers all 24 hours with no gaps."""
     h = datetime.now(UTC).hour
     if  0 <= h <  7: return "ASIA"
     if  7 <= h < 12: return "LONDON"
     if 12 <= h < 16: return "OVERLAP"
     if 16 <= h < 22: return "NY"
-    return "ASIA"   # 22–23: Tokyo/Sydney pre-open counts as Asian session
+    return "ASIA"   # 22–23: Tokyo/Sydney pre-open
 
 def market_header() -> str:
     if is_market_open():
@@ -756,10 +748,8 @@ def generate_chart(candles:deque, tf:str="M15",
     price_min = df["low"].min()
     price_max = df["high"].max()
     if price_min == price_max:
-        # Perfectly sideways market — add absolute padding so the line isn't invisible
         am.set_ylim(price_min - 1.0, price_max + 1.0)
     else:
-        # Normal price movement — add 10 % breathing room above and below
         pad = (price_max - price_min) * 0.10
         am.set_ylim(price_min - pad, price_max + pad)
 
@@ -916,24 +906,44 @@ def _get_trend(tf_name: str)->str:
 
 def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type,disp)->tuple:
     s=0; reasons=[]
+
+    # ── SMC confluence ──
     if fvg:
-        s+=20; reasons.append(f"FVG +20")
+        s+=20; reasons.append("FVG +20")
     if trap and trap.get("swept"):
-        s+=15; reasons.append(f"LiqTrap✅ +15")
-    if idm  and idm.get("swept"):
-        s+=15; reasons.append(f"IDM✅ +15")
-    if ob   and disp>=2.0:
+        s+=15; reasons.append("LiqTrap✅ +15")
+    if idm and idm.get("swept"):
+        s+=15; reasons.append("IDM✅ +15")
+    if ob and disp>=2.0:
         s+=10; reasons.append(f"Disp{disp:.1f}x +10")
-    if struct_type=="BOS": s+=10; reasons.append("BOS +10")
-    elif struct_type=="CHoCH": s+=8; reasons.append("CHoCH +8")
-    if session=="OVERLAP":  s+=10; reasons.append("Overlap +10")
-    elif session in("LONDON","NY"): s+=7; reasons.append(f"{session} +7")
-    if atr_ok:    s+=5;  reasons.append("ATR✅ +5")
-    if ema_ok:    s+=5;  reasons.append("EMA✅ +5")
-    if candle_ok: s+=5;  reasons.append("Candle✅ +5")
+
+    # ── Structure — independent checks, not elif ──
+    if struct_type=="BOS":
+        s+=10; reasons.append("BOS +10")
+    if struct_type=="CHoCH":
+        s+=8;  reasons.append("CHoCH +8")
+
+    # ── Session — independent checks, not elif ──
+    if session=="OVERLAP":
+        s+=10; reasons.append("Overlap +10")
+    if session in("LONDON","NY"):
+        s+=7;  reasons.append(f"{session} +7")
+
+    # ── Technical filters ──
+    if atr_ok:
+        s+=5;  reasons.append("ATR✅ +5")
+    if ema_ok:
+        s+=5;  reasons.append("EMA✅ +5")
+    if candle_ok:
+        s+=5;  reasons.append("Candle✅ +5")
+
+    # ── RSI confluence ──
     if ob:
-        if ob["type"]=="BULL" and rsi<40: s+=5; reasons.append(f"RSI{rsi:.0f} +5")
-        elif ob["type"]=="BEAR" and rsi>60: s+=5; reasons.append(f"RSI{rsi:.0f} +5")
+        if ob["type"]=="BULL" and rsi<40:
+            s+=5; reasons.append(f"RSI{rsi:.0f}(OS) +5")
+        if ob["type"]=="BEAR" and rsi>60:
+            s+=5; reasons.append(f"RSI{rsi:.0f}(OB) +5")
+
     return min(s,100), reasons
 
 def compute_signal(tf:str="M15") -> Optional[dict]:
@@ -957,11 +967,14 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     if bias=="BEARISH" and pd_zone!="PREMIUM":  return None
 
     idm=_idm(df,bias); state.active_idm=idm
-    if idm is None or not idm.get("swept"): return None
+    # IDM must exist but swept is preferred, not mandatory — score rewards it
+    if idm is None: return None
 
     trap=_equal_hl(df); state.active_trap=trap
-    if trap is None or not trap.get("swept"): return None
-    if trap["side"]!=("BUY" if bias=="BULLISH" else "SELL"): return None
+    # Trap is bonus confluence — don't hard-block if absent
+    if trap is not None:
+        if trap["side"]!=("BUY" if bias=="BULLISH" else "SELL"):
+            trap=None; state.active_trap=None
 
     ob_=_ob(df,bias)
     if ob_ is None: return None
@@ -1002,8 +1015,9 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     reason.h1_trend   =f"{state.trend_tf} {bias}"
     reason.structure  =f"{struct['type']} {bias}"
     reason.pd_zone    =pd_zone
-    reason.idm_sweep  ="✅ Confirmed" if idm.get("swept") else "⚠️ Partial"
-    reason.trap_sweep =f"✅ {trap['type']} swept"
+    reason.idm_sweep  ="✅ Swept" if idm.get("swept") else "⏳ Pending"
+    reason.trap_sweep =(f"✅ {trap['type']} swept" if trap and trap.get("swept")
+                        else "⚠️ No trap — IDM-only entry")
     reason.ob_type    =f"{ob_['type']} OB (disp:{disp:.1f}x)"
     reason.fvg_present=fvg_ is not None
     reason.session    =session
@@ -1271,8 +1285,38 @@ async def chart_loop():
     await asyncio.sleep(50)
     while state.running:
         try:
-            if state.current_price>0 and len(state.m15_candles)>=20:
-                log.info(f"Silent Scan Active: {state.pair_display} | Mode: {state.trading_mode} | Bias: {state.trend_bias} | Zone: {state.premium_discount} | Score: {state.ob_score}/100")
+            if state.current_price > 0 and len(state.m15_candles) >= 20:
+                # Run a live background scan so state.ob_score, trend_bias, etc. stay fresh
+                try:
+                    sig = compute_signal(state.exec_tf)
+                except Exception as e:
+                    sig = None
+                    log.warning(f"chart_loop scan: {e}")
+
+                sess = get_session()
+                state.session_now = sess
+                log.info(
+                    f"📡 Scan | {state.pair_display} | {state.trading_mode} | "
+                    f"Bias:{state.trend_bias} | Zone:{state.premium_discount} | "
+                    f"Score:{state.ob_score}/100 | Sess:{sess} | "
+                    f"Price:{state.current_price:.5f} | "
+                    f"Signal:{'✅ ' + sig['direction'] if sig else '—'}"
+                )
+
+                # Send a periodic chart to Telegram every interval
+                buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
+                chart = generate_chart(buf_for_chart, state.exec_tf, chart_type="live")
+                if chart:
+                    blk = "  🚫 NEWS BLOCKED" if state.block_trading else ""
+                    mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
+                    await tg_async(
+                        f"📡 *Live Chart — {state.pair_display}*  `{state.exec_tf}`\n"
+                        f"Market: {mkt}  Session: `{sess}`{blk}\n"
+                        f"Bias: `{state.trend_bias}`  Zone: `{state.premium_discount}`\n"
+                        f"Score: `{state.ob_score}/100`  Price: `{state.current_price:.5f}`\n"
+                        f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} "
+                        f"M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}",
+                        photo_path=chart)
         except Exception as e:
             log.error(f"chart_loop: {e}")
         await asyncio.sleep(CHART_INTERVAL)
@@ -1284,32 +1328,59 @@ async def trading_loop():
     await asyncio.sleep(35)
     while state.running:
         try:
-            if (state.paused or state.block_trading or
-                    state.current_price==0 or not state.broker_connected):
+            # ── Guard checks with explicit logging ──
+            if state.paused:
+                await asyncio.sleep(30); continue
+            if state.block_trading:
+                log.info(f"⏸ Trading blocked: {state.block_reason}")
+                await asyncio.sleep(30); continue
+            if state.current_price == 0:
+                log.info("⏳ Waiting for price data...")
+                await asyncio.sleep(30); continue
+            if not state.broker_connected:
+                log.info("⏳ Broker not connected")
                 await asyncio.sleep(30); continue
 
             if not is_market_open():
-                state.market_open=False
+                state.market_open = False
+                log.info("🔴 Market closed — sleeping")
                 await asyncio.sleep(60); continue
-            state.market_open=True
+            state.market_open = True
 
             check_trade_mgmt()
 
-            if time.time()-state.last_trade_ts < state.signal_cooldown:
+            cooldown_left = state.signal_cooldown - (time.time() - state.last_trade_ts)
+            if cooldown_left > 0:
+                log.info(f"⏳ Cooldown: {int(cooldown_left)}s remaining")
                 await asyncio.sleep(30); continue
 
-            sig=compute_signal(state.exec_tf)
+            # ── Candle data check ──
+            buf_lens = (len(state.h1_candles), len(state.m15_candles),
+                        len(state.m5_candles), len(state.m1_candles))
+            log.info(
+                f"🔍 Scanning {state.pair_display} [{state.trading_mode}] "
+                f"H1:{buf_lens[0]} M15:{buf_lens[1]} M5:{buf_lens[2]} M1:{buf_lens[3]} "
+                f"Bias:{state.trend_bias} Zone:{state.premium_discount} Score:{state.ob_score}/100"
+            )
+
+            sig = compute_signal(state.exec_tf)
+            if sig is None:
+                log.info(
+                    f"🔎 No signal — Bias:{state.trend_bias} Zone:{state.premium_discount} "
+                    f"Score:{state.ob_score}/100 Sess:{state.session_now} "
+                    f"ATR_ok:{state.atr_filter_ok}"
+                )
             if sig:
-                sig_conf=compute_signal(state.conf_tf)
-                if sig_conf and sig_conf["direction"]==sig["direction"]:
+                sig_conf = compute_signal(state.conf_tf)
+                if sig_conf and sig_conf["direction"] == sig["direction"]:
                     log.info(f"🎯 AUTO EXECUTE {sig['direction']} score:{sig['ob_score']} Mode:{state.trading_mode}")
-                    reason=sig.get("reason")
+                    reason = sig.get("reason")
                     buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
-                    chart=generate_chart(buf_for_chart,state.exec_tf,
-                        entry_price=sig["entry"],direction=sig["direction"],
-                        chart_type="entry",reason=reason)
-                    score_txt=" + ".join(sig.get("score_reasons",[])[:5])
-                    
+                    chart = generate_chart(buf_for_chart, state.exec_tf,
+                        entry_price=sig["entry"], direction=sig["direction"],
+                        chart_type="entry", reason=reason)
+                    score_txt = " + ".join(sig.get("score_reasons", [])[:5])
+
                     md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
                     await tg_async(
                         f"🚀 *{md_lbl} ENTRY — {state.pair_display}*\n"
@@ -1324,9 +1395,15 @@ async def trading_loop():
                         f"Stake: `{sig['stake']:.2f} {state.account_currency}`"
                         f"{'  💎' if state.small_acc_mode else ''}",
                         photo_path=chart)
-                    
-                    cid=await open_contract(sig["direction"],sig["stake"])
-                    if cid: state.last_trade_ts=time.time()
+
+                    cid = await open_contract(sig["direction"], sig["stake"])
+                    if cid:
+                        state.last_trade_ts = time.time()
+                else:
+                    conf_dir = sig_conf["direction"] if sig_conf else "None"
+                    log.info(
+                        f"⚠️ Confirmation failed — exec:{sig['direction']} conf:{conf_dir}"
+                    )
         except Exception as e:
             log.error(f"trading_loop: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(30)
