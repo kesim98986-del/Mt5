@@ -2,21 +2,18 @@
 ╔══════════════════════════════════════════════════════════════════════╗
 ║        SMC SNIPER EA v5.3 — Multi-Strategy Autonomous Trading Bot    ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║  Zero-Noise | Post-Trade Reasoning | Amharic | Mini App Dashboard    ║
-║         Railway-Ready | Full Web Dashboard | Settings Panel          ║
+║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
+║    Visual SMC Mapping | OB Rects | FVG Boxes | BOS/CHoCH | LIQ X    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-NEW in v5.3 (on top of all v5.2 fixes):
-4. TELEGRAM MINI APP DASHBOARD
-   - Dark-themed web dashboard at /  (auto-refreshes every 1s)
-   - Live chart image at /chart      (serves dashboard.png)
-   - JSON API at /api/state          (raw bot state as JSON)
-   - Hamburger (☰) menu with 3 tabs: Chart | Stats | Settings
-   - Settings panel: Risk %, Min Score, Mode, Pair, Small Acc
-   - All settings apply instantly to the live bot via POST /api/settings
-5. FIXED CHART PIP RANGE   — 5.0 pip hard floor for XAU/USD
-   so the Mini App chart stays perfectly stable.
-6. SESSION FIX             — 22:00–00:00 gap always maps to ASIAN.
+FIXES APPLIED (v5.3 — on top of all v5.2 fixes):
+4. OB RECTANGLES     — Proper filled rectangle per Bull/Bear Order Block.
+5. FVG HATCHED BOXES — Fair Value Gaps drawn as hatched shaded boxes.
+6. BOS / CHoCH LINES — Labelled structure-break lines with badge arrows.
+7. LIQUIDITY SWEEPS  — IDM & Trap levels marked with 'X LIQ' on sweep.
+8. 5.0-PT Y FLOOR    — mid±2.5 forced when natural spread < 5.0 pts.
+9. 60-BAR GUARD      — chart waits for 60+ candles before drawing.
+10. SESSION 22–24    — explicitly mapped to ASIAN; gap permanently closed.
 """
 
 import asyncio
@@ -329,19 +326,19 @@ def time_to_next_open() -> str:
 def get_session() -> str:
     """
     Return the current Forex session based on UTC hour.
-    Covers exactly 24 hours with ZERO gaps and NEVER returns 'UNKNOWN':
+    Covers exactly 24 hours — ZERO gaps — NEVER returns 'UNKNOWN':
 
       00:00 – 08:00  →  ASIAN
       08:00 – 13:00  →  LONDON
       13:00 – 17:00  →  OVERLAP   (London/NY — highest liquidity)
       17:00 – 22:00  →  NY
-      22:00 – 24:00  →  ASIAN     (wraps seamlessly back to Asian)
+      22:00 – 24:00  →  ASIAN     (wraps back; 22:00–00:00 gap fixed v5.3)
     """
     h = datetime.now(UTC).hour
-    if 8  <= h < 13: return "LONDON"
+    if  8 <= h < 13: return "LONDON"
     if 13 <= h < 17: return "OVERLAP"
     if 17 <= h < 22: return "NY"
-    return "ASIAN"   # covers 0–8 and 22–23 with a single return
+    return "ASIAN"   # 0–7 AND 22–23 both fall here — no gap possible
 
 
 def market_header() -> str:
@@ -707,24 +704,117 @@ def _swing_pts(df: pd.DataFrame, n: int = 5):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# FIX #2: CHART ENGINE — Fixed Y-axis (no flat line, no flicker)
+# CHART ENGINE v5.3 — Full SMC Visual Mapping
+# Fixes:  ① 5.0-pt forced Y-axis floor  ② OB rectangles  ③ FVG boxes
+#         ④ BOS/CHoCH labelled lines     ⑤ Liquidity-sweep markers
+#         ⑥ 60-candle data-reliability guard
 # ══════════════════════════════════════════════════════════════════════
+
 def _resolve_min_range(avg_price: float) -> float:
     """
-    Return the minimum acceptable Y-axis range based on price level.
-
-    Gold / Indices (>= 1000):   5.0  points  (FIXED 5.0 pip range — v5.3)
-    Mid-range (>= 10):           1.0  points
-    Forex majors (>= 1):         0.010 (100 pips)
-    Exotic micro (<  1):         0.001
-
-    The 5.0 pip floor for XAU/USD ensures the Mini App chart never
-    flickers or compresses to a flat line between updates.
+    Surgical Y-axis floor.
+      XAU/USD, US100 (≥ 1000) → 5.0 pts   ← FIXED 5-pip Mini App floor
+      Mid-range       (≥  10)  → 1.0
+      Forex majors    (≥   1)  → 0.010
+      Micro exotics   (<   1)  → 0.001
     """
-    if avg_price >= 1000: return 5.0     # XAU/USD, US100 — fixed 5.0 pip
+    if avg_price >= 1000: return 5.0    # XAU/USD · no flicker
     if avg_price >= 10:   return 1.0
-    if avg_price >= 1:    return 0.010   # EUR/USD, GBP/USD
+    if avg_price >= 1:    return 0.010  # EUR/USD · GBP/USD
     return 0.001
+
+
+def _draw_ob_rect(ax, x_start: int, x_end: int,
+                  lo: float, hi: float,
+                  color: str, label: str,
+                  score: int = 0):
+    """
+    Draw a filled rectangle for an Order Block with top/bottom border lines
+    and a text label at the right edge.
+    """
+    from matplotlib.patches import FancyBboxPatch
+    width  = x_end - x_start
+    rect   = FancyBboxPatch(
+        (x_start, lo), width, hi - lo,
+        boxstyle="square,pad=0",
+        linewidth=1.4, edgecolor=color,
+        facecolor=color, alpha=0.18, zorder=4)
+    ax.add_patch(rect)
+    # solid top and bottom border
+    ax.plot([x_start, x_end], [hi, hi], color=color, lw=1.2, ls="-", alpha=0.9, zorder=5)
+    ax.plot([x_start, x_end], [lo, lo], color=color, lw=1.2, ls="-", alpha=0.9, zorder=5)
+    sc_txt = f" sc:{score}" if score else ""
+    ax.text(x_end + 0.3, (hi + lo) / 2,
+            f" {label}{sc_txt}",
+            color=color, fontsize=7, va="center",
+            fontfamily="monospace", zorder=6,
+            bbox=dict(boxstyle="round,pad=0.15",
+                      fc="#0d1117", ec=color, alpha=0.75, lw=0.7))
+
+
+def _draw_fvg_box(ax, x_start: int, x_end: int,
+                  lo: float, hi: float, color: str):
+    """
+    Draw a hatched FVG (Fair Value Gap) box with dashed border.
+    """
+    from matplotlib.patches import Rectangle
+    rect = Rectangle(
+        (x_start, lo), x_end - x_start, hi - lo,
+        linewidth=1.0, edgecolor=color, linestyle="--",
+        facecolor=color, alpha=0.12, zorder=3,
+        hatch="///")
+    ax.add_patch(rect)
+    ax.text(x_end + 0.3, (hi + lo) / 2,
+            " FVG", color=color, fontsize=7, va="center",
+            fontfamily="monospace", zorder=6)
+
+
+def _draw_bos_choch(ax, x: int, level: float,
+                    kind: str, direction: str,
+                    chart_max: float):
+    """
+    Draw a labelled horizontal line for BOS or CHoCH structure break.
+    kind      = "BOS" | "CHoCH"
+    direction = "BULLISH" | "BEARISH"
+    """
+    color   = "#00e676" if direction == "BULLISH" else "#ff1744"
+    ls      = "-"       if kind == "BOS"         else "--"
+    lw      = 1.4       if kind == "BOS"         else 1.1
+    # line from detection bar to right edge
+    ax.axhline(level, xmin=x / max(ax.get_xlim()[1], 1),
+               color=color, lw=lw, ls=ls, alpha=0.85, zorder=5)
+    # label badge
+    label_y = level + (chart_max - level) * 0.012
+    ax.text(x + 1, label_y, f" {kind} {'↑' if direction == 'BULLISH' else '↓'}",
+            color=color, fontsize=7, va="bottom",
+            fontfamily="monospace", zorder=7,
+            bbox=dict(boxstyle="round,pad=0.15",
+                      fc="#0d1117", ec=color, alpha=0.80, lw=0.7))
+
+
+def _draw_liquidity_sweep(ax, x: int, level: float,
+                          side: str, swept: bool,
+                          tick: float):
+    """
+    Mark a liquidity level:
+      swept=True  → red/green 'X LIQ' marker
+      swept=False → dotted pending line with 'LIQ?' label
+    """
+    color = "#69f0ae" if side == "BUY" else "#ff1744"
+    if swept:
+        ax.plot(x, level, "x", ms=10, mew=2.5,
+                color=color, zorder=8, alpha=0.95)
+        ax.text(x + 0.5, level + tick * 0.4,
+                "LIQ", color=color, fontsize=7,
+                fontfamily="monospace", va="bottom", zorder=9,
+                bbox=dict(boxstyle="round,pad=0.12",
+                          fc="#0d1117", ec=color, alpha=0.80, lw=0.7))
+    else:
+        ax.axhline(level, color=color, lw=0.8, ls=":",
+                   alpha=0.55, zorder=4)
+        ax.text(2, level, " LIQ?", color=color,
+                fontsize=6.5, va="bottom",
+                fontfamily="monospace", zorder=5)
 
 
 def generate_chart(
@@ -737,22 +827,26 @@ def generate_chart(
         chart_type:  str   = "live",
         reason: "TradeReason" = None) -> Optional[str]:
 
-    if len(candles) < 20:
+    # ══════════════════════════════════════════════════════════════════
+    # DATA RELIABILITY GUARD — require 60 candles minimum
+    # If the buffer is thin, wait rather than draw a broken chart.
+    # ══════════════════════════════════════════════════════════════════
+    MIN_CANDLES = 60
+    if len(candles) < MIN_CANDLES:
+        log.info(f"⏳ Chart skipped — only {len(candles)} candles "
+                 f"(need {MIN_CANDLES})")
         return None
 
     # ── Build dataframe from last 80 candles ──
     df = pd.DataFrame(list(candles)[-80:])
     df.columns = ["time", "open", "high", "low", "close"]
-    df = df.astype({"open": float, "high": float, "low": float, "close": float})
+    df = df.astype({"open": float, "high": float,
+                    "low":  float, "close": float})
     df.reset_index(drop=True, inplace=True)
 
-    # ── Data validation: remove zero/negative-price rows ──
+    # ── Remove bad rows ──
     df = df[(df["open"] > 0) & (df["high"] > 0) &
             (df["low"]  > 0) & (df["close"] > 0)]
-    if len(df) < 20:
-        return None
-
-    # ── Outlier removal: drop candles >50% away from median close ──
     med = df["close"].median()
     df  = df[(df["close"] > med * 0.5) & (df["close"] < med * 2.0)]
     if len(df) < 20:
@@ -771,33 +865,37 @@ def generate_chart(
         _ax_s(a)
 
     # ══════════════════════════════════════════════════════════════════
-    # FIX #2: Y-AXIS SCALING — guaranteed minimum range; no flat line
+    # SURGICAL Y-AXIS FIX — forced 5.0-point floor for XAU/USD
+    # mid = (max + min) / 2  →  ylim = (mid - 2.5, mid + 2.5)
     # ══════════════════════════════════════════════════════════════════
     raw_min   = df["low"].min()
     raw_max   = df["high"].max()
     raw_range = raw_max - raw_min
     avg_price = (raw_max + raw_min) / 2.0
-
     MIN_RANGE = _resolve_min_range(avg_price)
 
     if raw_range < MIN_RANGE:
-        # Force-expand around the centre price
-        chart_min    = avg_price - MIN_RANGE / 2.0
-        chart_max    = avg_price + MIN_RANGE / 2.0
+        mid       = (raw_max + raw_min) / 2.0
+        chart_min = mid - MIN_RANGE / 2.0
+        chart_max = mid + MIN_RANGE / 2.0
         actual_range = MIN_RANGE
     else:
-        pad          = raw_range * 0.12   # 12 % breathing room
+        pad          = raw_range * 0.10
         chart_min    = raw_min - pad
         chart_max    = raw_max + pad
         actual_range = raw_range
+
+    # one-tick unit for label offsets
+    tick = actual_range * 0.003
 
     xs       = list(range(len(df)))
     bull_idx = [i for i in xs if df.loc[i, "close"] >= df.loc[i, "open"]]
     bear_idx = [i for i in xs if df.loc[i, "close"]  < df.loc[i, "open"]]
 
-    # ── Wicks (drawn first, behind bodies) ──
+    # ── Wicks ──
     def _wick_segs(idx):
-        return [[(i, df.loc[i, "low"]), (i, df.loc[i, "high"])] for i in idx]
+        return [[(i, df.loc[i, "low"]),
+                 (i, df.loc[i, "high"])] for i in idx]
 
     if bull_idx:
         am.add_collection(mc.LineCollection(
@@ -809,35 +907,187 @@ def generate_chart(
     # ── Candle bodies ──
     BODY_WIDTH = 0.5
     doji_min   = actual_range * 0.002
-
     for i in bull_idx:
         bot = min(df.loc[i, "open"], df.loc[i, "close"])
         ht  = max(abs(df.loc[i, "close"] - df.loc[i, "open"]), doji_min)
         am.bar(i, ht, bottom=bot, color=BC, width=BODY_WIDTH,
                edgecolor="#00c853", linewidth=0.5, alpha=0.95, zorder=3)
-
     for i in bear_idx:
         bot = min(df.loc[i, "open"], df.loc[i, "close"])
         ht  = max(abs(df.loc[i, "close"] - df.loc[i, "open"]), doji_min)
         am.bar(i, ht, bottom=bot, color=RC, width=BODY_WIDTH,
                edgecolor="#d50000", linewidth=0.5, alpha=0.95, zorder=3)
 
-    # ── Apply the fixed y-limits after drawing all bars ──
-    am.set_xlim(-1, len(df) + 1)
+    # ── Lock y-axis BEFORE drawing overlays ──
+    am.set_xlim(-1, len(df) + 4)   # +4 for right-side labels
     am.set_ylim(chart_min, chart_max)
 
-    # ── EMA 21 + EMA 50 ──
+    def _in_range(p):
+        return chart_min <= p <= chart_max
+
+    # ══════════════════════════════════════════════════════════════════
+    # EMA 21 + EMA 50
+    # ══════════════════════════════════════════════════════════════════
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
     if ema21.min() >= chart_min * 0.9 and ema21.max() <= chart_max * 1.1:
-        am.plot(xs, ema21.values, color="#ffeb3b", lw=1.5, alpha=0.8, label="EMA21")
-
+        am.plot(xs, ema21.values, color="#ffeb3b",
+                lw=1.5, alpha=0.8, label="EMA21", zorder=4)
     if len(df) >= 52:
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         if ema50.min() >= chart_min * 0.9 and ema50.max() <= chart_max * 1.1:
-            am.plot(xs, ema50.values, color="#78909c", lw=1.2,
-                    ls="--", alpha=0.7, label="EMA50")
+            am.plot(xs, ema50.values, color="#78909c",
+                    lw=1.2, ls="--", alpha=0.7, label="EMA50", zorder=4)
 
-    # ── Volume proxy (wick range) ──
+    # ══════════════════════════════════════════════════════════════════
+    # ① ORDER BLOCK RECTANGLES
+    #   Draws a proper filled rectangle from OB discovery bar to right edge.
+    #   Bull OB = cyan, Bear OB = orange.
+    # ══════════════════════════════════════════════════════════════════
+    if state.active_ob:
+        ob = state.active_ob
+        if _in_range(ob["low"]) and _in_range(ob["high"]):
+            oc      = OBB if ob["type"] == "BULL" else OBR
+            ob_lbl  = f"{'BULL' if ob['type'] == 'BULL' else 'BEAR'} OB"
+            x_start = max(0, len(df) - 40)
+            x_end   = len(df) + 3
+            _draw_ob_rect(am, x_start, x_end,
+                          ob["low"], ob["high"],
+                          oc, ob_lbl, state.ob_score)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ② FAIR VALUE GAP (FVG) — hatched shaded box
+    # ══════════════════════════════════════════════════════════════════
+    if state.active_fvg:
+        fvg = state.active_fvg
+        if _in_range(fvg["low"]) and _in_range(fvg["high"]):
+            x_start = max(0, len(df) - 30)
+            x_end   = len(df) + 3
+            _draw_fvg_box(am, x_start, x_end,
+                          fvg["low"], fvg["high"], FC)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ③ BOS / CHoCH LABELLED STRUCTURE LINES
+    # ══════════════════════════════════════════════════════════════════
+    if state.last_signal:
+        sig = state.last_signal
+        struct_type = sig.get("struct")
+        bias        = sig.get("bias", state.trend_bias)
+        if struct_type in ("BOS", "CHoCH"):
+            level = sig.get("entry", 0)
+            if _in_range(level):
+                _draw_bos_choch(am, max(0, len(df) - 30),
+                                level, struct_type, bias, chart_max)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ④ IDM (Inducement) — liquidity sweep marker
+    # ══════════════════════════════════════════════════════════════════
+    if state.active_idm:
+        idm = state.active_idm
+        lvl = idm.get("level", 0)
+        if _in_range(lvl):
+            swept = idm.get("swept", False)
+            _draw_liquidity_sweep(
+                am, max(0, len(df) - 10), lvl,
+                idm.get("side", "BUY"), swept, tick)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ⑤ TRAP (Equal Highs/Lows) — liquidity sweep marker
+    # ══════════════════════════════════════════════════════════════════
+    if state.active_trap:
+        trap = state.active_trap
+        lvl  = trap.get("level", 0)
+        if _in_range(lvl):
+            swept = trap.get("swept", False)
+            side  = trap.get("side", "BUY")
+            _draw_liquidity_sweep(
+                am, max(0, len(df) - 8), lvl, side, swept, tick)
+            # extra label with trap type
+            lbl = trap.get("type", "TRAP")
+            am.text(2, lvl + tick,
+                    f" {lbl}", color=TC, fontsize=6.5,
+                    va="bottom", fontfamily="monospace", zorder=7)
+
+    # ── Fibonacci Premium / Discount zones ──
+    if state.last_signal and "fib_hi" in state.last_signal:
+        sig = state.last_signal
+        flo, fhi = sig["fib_lo"], sig["fib_hi"]
+        if _in_range(flo) and _in_range(fhi):
+            mid = (fhi + flo) / 2
+            am.axhline(mid, color="#78909c", ls="-.", lw=0.6, alpha=0.4)
+            am.axhspan(flo, mid, alpha=0.04, color=BC)
+            am.axhspan(mid, fhi, alpha=0.04, color=RC)
+            am.text(len(df) - 2, mid, " 0.5 EQ",
+                    color="#78909c", fontsize=6, ha="right",
+                    fontfamily="monospace")
+
+    # ── Active signal lines: Entry / SL / TPs ──
+    if state.last_signal:
+        sig = state.last_signal
+        if _in_range(sig["entry"]):
+            am.axhline(sig["entry"], color=EC, lw=1.6, ls="-", zorder=6)
+            am.text(len(df) + 0.3, sig["entry"],
+                    f" E:{sig['entry']:.2f}",
+                    color=EC, fontsize=7, va="center",
+                    fontfamily="monospace", zorder=7)
+        if _in_range(sig["sl"]):
+            am.axhline(sig["sl"], color=SC, lw=1.0, ls="--", zorder=6)
+            am.text(len(df) + 0.3, sig["sl"],
+                    f" SL:{sig['sl']:.2f}",
+                    color=SC, fontsize=7, va="center",
+                    fontfamily="monospace", zorder=7)
+        for tk, tc_ in zip(["tp1", "tp2", "tp3"], TPC):
+            if tk in sig and _in_range(sig[tk]):
+                am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.", zorder=5)
+                am.text(len(df) + 0.3, sig[tk],
+                        f" {tk.upper()}:{sig[tk]:.2f}",
+                        color=tc_, fontsize=6.5, va="center",
+                        fontfamily="monospace", zorder=6)
+
+    # ── Entry / Exit markers (trade chart) ──
+    if entry_price and _in_range(entry_price):
+        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9, zorder=7)
+        am.annotate(f"▶ ENTRY {entry_price:.2f}",
+                    xy=(len(df) - 1, entry_price),
+                    color=EC, fontsize=8, ha="right",
+                    fontfamily="monospace")
+    if exit_price and _in_range(exit_price):
+        xc = BC if (pnl and pnl > 0) else RC
+        am.axhline(exit_price, color=xc, lw=2.0, ls="--", alpha=0.9, zorder=7)
+        ps = f"+{pnl:.2f}" if (pnl and pnl > 0) else f"{pnl:.2f}"
+        am.annotate(f"◀ EXIT {exit_price:.2f} P&L:{ps}",
+                    xy=(len(df) - 1, exit_price),
+                    color=xc, fontsize=8, ha="right",
+                    fontfamily="monospace")
+
+    # ── Red news event vertical lines ──
+    for ev in state.news_events:
+        if not ev.dt_utc or not ev.is_red:
+            continue
+        ep = ev.dt_utc.timestamp()
+        for ci, crow in df.iterrows():
+            if crow["time"] >= ep:
+                am.axvline(ci, color=RC, lw=1.0, ls="--", alpha=0.4, zorder=3)
+                am.text(ci, chart_max - tick * 2,
+                        f" 🔴{ev.title[:10]}",
+                        color=RC, fontsize=5.5, va="top",
+                        fontfamily="monospace", rotation=90)
+                break
+
+    # ── Swing High/Low markers ──
+    swh, swl = _swing_pts(df, n=15)
+    mp = tick * 2.5
+    for i in swh[-3:]:
+        if _in_range(df.loc[i, "high"]):
+            am.plot(i, df.loc[i, "high"] + mp, "v",
+                    color="#ff9800", ms=6, alpha=0.85, zorder=6)
+    for i in swl[-3:]:
+        if _in_range(df.loc[i, "low"]):
+            am.plot(i, df.loc[i, "low"] - mp, "^",
+                    color="#69f0ae", ms=6, alpha=0.85, zorder=6)
+
+    # ══════════════════════════════════════════════════════════════════
+    # VOLUME sub-panel
+    # ══════════════════════════════════════════════════════════════════
     vol  = (df["high"] - df["low"]).values
     vmax = vol.max() if vol.max() > 0 else 1.0
     if bull_idx:
@@ -849,7 +1099,9 @@ def generate_chart(
     av.set_ylim(0, 1.3)
     av.set_ylabel("Vol", color="#555d68", fontsize=6)
 
-    # ── RSI ──
+    # ══════════════════════════════════════════════════════════════════
+    # RSI sub-panel
+    # ══════════════════════════════════════════════════════════════════
     rsi = _rsi_calc(df["close"].values)
     ar.plot(xs, rsi, color="#90a4ae", lw=1.2)
     ar.fill_between(xs, rsi, 70, where=(rsi >= 70), alpha=0.2, color=RC)
@@ -859,120 +1111,52 @@ def generate_chart(
     ar.axhline(30, color=BC, lw=0.6, ls="--", alpha=0.6)
     ar.set_ylim(0, 100)
     ar.set_ylabel("RSI", color="#555d68", fontsize=6)
-
-    # ── SMC overlays (range-guarded) ──
-    def _in_range(price):
-        return chart_min <= price <= chart_max
-
-    if state.active_ob:
-        ob = state.active_ob
-        if _in_range(ob["low"]) and _in_range(ob["high"]):
-            oc  = OBB if ob["type"] == "BULL" else OBR
-            xs0 = max(0, len(df) - 35) / len(df)
-            am.axhspan(ob["low"], ob["high"], xmin=xs0, alpha=0.15, color=oc)
-            am.axhline(ob["high"], color=oc, ls="--", lw=0.9, alpha=0.8)
-            am.axhline(ob["low"],  color=oc, ls="--", lw=0.9, alpha=0.8)
-            am.text(2, ob["high"],
-                    f" {ob['type']} OB sc:{state.ob_score}/100",
-                    color=oc, fontsize=7, va="bottom", fontfamily="monospace")
-
-    if state.active_fvg:
-        fvg = state.active_fvg
-        if _in_range(fvg["low"]) and _in_range(fvg["high"]):
-            am.axhspan(fvg["low"], fvg["high"], alpha=0.13, color=FC)
-            am.text(2, fvg["high"], " FVG", color=FC, fontsize=7,
-                    va="bottom", fontfamily="monospace")
-
-    if state.active_idm:
-        idm = state.active_idm
-        if _in_range(idm["level"]):
-            am.axhline(idm["level"], color=IC, ls=":", lw=1.3, alpha=0.9)
-            sw = "SWEPT" if idm.get("swept") else "PENDING"
-            am.text(2, idm["level"], f" IDM {sw}", color=IC, fontsize=7,
-                    va="bottom", fontfamily="monospace")
-
-    if state.active_trap:
-        trap = state.active_trap
-        if _in_range(trap["level"]):
-            am.axhline(trap["level"], color=TC, ls=":", lw=1.5, alpha=0.9)
-            am.text(2, trap["level"], f" TRAP {trap['side']}", color=TC,
-                    fontsize=7, va="bottom", fontfamily="monospace")
-
-    if state.last_signal and "fib_hi" in state.last_signal:
-        sig = state.last_signal
-        if _in_range(sig["fib_lo"]) and _in_range(sig["fib_hi"]):
-            mid = (sig["fib_hi"] + sig["fib_lo"]) / 2
-            am.axhline(mid, color="#78909c", ls="-.", lw=0.6, alpha=0.4)
-            am.axhspan(sig["fib_lo"], mid, alpha=0.04, color=BC)
-            am.axhspan(mid, sig["fib_hi"], alpha=0.04, color=RC)
-            am.text(len(df) - 2, mid, " 0.5 Fib", color="#78909c",
-                    fontsize=6, ha="right", fontfamily="monospace")
-
-    if state.last_signal:
-        sig = state.last_signal
-        if _in_range(sig["entry"]):
-            am.axhline(sig["entry"], color=EC, lw=1.6, ls="-")
-        if _in_range(sig["sl"]):
-            am.axhline(sig["sl"], color=SC, lw=1.0, ls="--")
-        for tk, tc_ in zip(["tp1", "tp2", "tp3"], TPC):
-            if tk in sig and _in_range(sig[tk]):
-                am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.")
-
-    if entry_price and _in_range(entry_price):
-        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9)
-        am.annotate(f"▶ ENTRY {entry_price:.5f}",
-                    xy=(len(df) - 1, entry_price),
-                    color=EC, fontsize=8, ha="right", fontfamily="monospace")
-
-    if exit_price and _in_range(exit_price):
-        xc = BC if (pnl and pnl > 0) else RC
-        am.axhline(exit_price, color=xc, lw=2.0, ls="--", alpha=0.9)
-        ps = f"+{pnl:.2f}" if (pnl and pnl > 0) else f"{pnl:.2f}"
-        am.annotate(f"◀ EXIT {exit_price:.5f} P&L:{ps}",
-                    xy=(len(df) - 1, exit_price),
-                    color=xc, fontsize=8, ha="right", fontfamily="monospace")
-
-    # ── News event lines ──
-    for ev in state.news_events:
-        if not ev.dt_utc or not ev.is_red:
-            continue
-        ep = ev.dt_utc.timestamp()
-        for ci, crow in df.iterrows():
-            if crow["time"] >= ep:
-                am.axvline(ci, color=RC, lw=1.0, ls="--", alpha=0.5)
-                break
-
-    # ── Swing points ──
-    swh, swl = _swing_pts(df, n=15)
-    mp = actual_range * 0.008
-    for i in swh[-3:]:
-        am.plot(i, df.loc[i, "high"] + mp, "v",
-                color="#ff9800", ms=6, alpha=0.85, zorder=6)
-    for i in swl[-3:]:
-        am.plot(i, df.loc[i, "low"] - mp, "^",
-                color="#69f0ae", ms=6, alpha=0.85, zorder=6)
+    # RSI label
+    rsi_now = rsi[-1]
+    rsi_c   = RC if rsi_now > 70 else (BC if rsi_now < 30 else "#90a4ae")
+    ar.text(len(df) - 1, rsi_now,
+            f" {rsi_now:.0f}", color=rsi_c,
+            fontsize=6.5, va="center", fontfamily="monospace")
 
     # ── Title ──
     tc_ = (BC if state.trend_bias == "BULLISH"
            else (RC if state.trend_bias == "BEARISH" else "#90a4ae"))
-    tl  = {"live": "📡 LIVE", "entry": "🎯 ENTRY", "exit": "🏁 CLOSED"}.get(chart_type, "")
+    tl  = {"live":  "📡 LIVE",
+           "entry": "🎯 ENTRY",
+           "exit":  "🏁 CLOSED"}.get(chart_type, "")
     blk = " 🚫NEWS" if state.block_trading else ""
     mkt = "🟢" if is_market_open() else "🔴"
     am.set_title(
         f"{tl} {state.pair_display} · {tf} · {mkt} "
-        f"Bias:{state.trend_bias} Zone:{state.premium_discount} "
-        f"· {state.current_price:.3f} Sess:{state.session_now}{blk}",
+        f"Bias:{state.trend_bias}  Zone:{state.premium_discount}"
+        f"  · {state.current_price:.2f}  Sess:{state.session_now}{blk}",
         color=tc_, fontsize=10, fontfamily="monospace", pad=8)
     am.set_ylabel("Price", color="#90a4ae", fontsize=8)
 
+    # ── Score / reason overlay box (entry charts) ──
     if reason and chart_type == "entry":
         am.text(0.01, 0.98,
-                f"Score:{reason.score} {reason.structure} "
-                f"{reason.pd_zone} IDM:{reason.idm_sweep} Sess:{reason.session}",
+                f"Score:{reason.score}  {reason.structure}"
+                f"  {reason.pd_zone}  IDM:{reason.idm_sweep}"
+                f"  Sess:{reason.session}",
                 transform=am.transAxes, fontsize=7, va="top",
                 fontfamily="monospace", color="#cdd9e5",
-                bbox=dict(boxstyle="round,pad=.3", fc="#161b22",
-                          ec="#30363d", alpha=0.85))
+                bbox=dict(boxstyle="round,pad=.3",
+                          fc="#161b22", ec="#30363d", alpha=0.88))
+
+    # ── Legend: SMC layer key ──
+    legend_items = [
+        mpatches.Patch(color=OBB, alpha=0.7, label="Bull OB"),
+        mpatches.Patch(color=OBR, alpha=0.7, label="Bear OB"),
+        mpatches.Patch(color=FC,  alpha=0.5, label="FVG"),
+        mpatches.Patch(color=BC,  alpha=0.7, label="BOS ↑"),
+        mpatches.Patch(color=RC,  alpha=0.7, label="BOS ↓ / CHoCH"),
+        mpatches.Patch(color=IC,  alpha=0.7, label="IDM / LIQ"),
+    ]
+    am.legend(handles=legend_items, loc="upper left",
+              fontsize=6, framealpha=0.5,
+              facecolor="#161b22", edgecolor="#30363d",
+              labelcolor="#cdd9e5")
 
     # ── Info bar ──
     al.set_xlim(0, 1); al.set_ylim(0, 1); al.axis("off")
@@ -983,14 +1167,15 @@ def generate_chart(
              if nxt and nxt.dt_utc else "")
     sc_s = f"Score:{state.ob_score}/100 " if state.ob_score else ""
     al.text(0.01, 0.5,
-            f"SMC SNIPER v5.2 [{state.trading_mode}] · {state.pair_display} "
-            f"sym:{state.active_symbol} Bal:{state.account_balance:.2f}"
-            f"{state.account_currency} "
-            f"Risk:{state.risk_pct*100:.0f}% {sc_s}"
-            f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} "
-            f"M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
-            f"{nxt_s} {ts}",
-            color="#444d56", fontsize=6, va="center", fontfamily="monospace")
+            f"SMC SNIPER v5.3 [{state.trading_mode}] · {state.pair_display}"
+            f"  sym:{state.active_symbol}"
+            f"  Bal:{state.account_balance:.2f}{state.account_currency}"
+            f"  Risk:{state.risk_pct*100:.0f}%  {sc_s}"
+            f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)}"
+            f" M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
+            f"{nxt_s}  {ts}",
+            color="#444d56", fontsize=6, va="center",
+            fontfamily="monospace")
 
     plt.setp(am.get_xticklabels(), visible=False)
     plt.setp(av.get_xticklabels(), visible=False)
@@ -1722,15 +1907,6 @@ async def chart_loop():
 
                 sess = get_session()
                 state.session_now = sess
-
-                # ── Generate a fresh live chart (also used by Mini App dashboard) ──
-                try:
-                    buf_for_chart = (state.m15_candles if state.exec_tf == "M15"
-                                     else state.m5_candles)
-                    generate_chart(buf_for_chart, state.exec_tf, chart_type="live")
-                except Exception as ce:
-                    log.warning(f"chart_loop chart gen: {ce}")
-
                 log.info(
                     f"📡 Scan | {state.pair_display} | {state.trading_mode} | "
                     f"Bias:{state.trend_bias} | Zone:{state.premium_discount} | "
@@ -2343,885 +2519,14 @@ async def health(req):
     })
 
 
-def _dashboard_html() -> str:
-    """Return the full dark-themed Telegram Mini App dashboard HTML."""
-    return """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
-<title>SMC Sniper EA v5.3</title>
-<style>
-  :root{
-    --bg:#0d1117;--surface:#161b22;--border:#30363d;--accent:#00e676;
-    --red:#ff1744;--yellow:#ffeb3b;--blue:#2979ff;--purple:#ce93d8;
-    --text:#cdd9e5;--muted:#8b949e;--orange:#ff9800;
-  }
-  *{box-sizing:border-box;margin:0;padding:0;}
-  html,body{height:100%;background:var(--bg);color:var(--text);
-    font-family:'SF Mono',Consolas,monospace;font-size:13px;overflow:hidden;}
-
-  /* ── TOP BAR ── */
-  .topbar{
-    display:flex;align-items:center;justify-content:space-between;
-    background:var(--surface);border-bottom:1px solid var(--border);
-    padding:8px 12px;height:46px;position:fixed;top:0;left:0;right:0;z-index:100;
-  }
-  .topbar-title{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.5px;}
-  .topbar-sub{font-size:10px;color:var(--muted);margin-top:1px;}
-  .menu-btn{
-    background:none;border:none;cursor:pointer;padding:4px 6px;
-    color:var(--text);font-size:20px;line-height:1;border-radius:6px;
-    transition:background .15s;
-  }
-  .menu-btn:hover{background:var(--border);}
-  .status-dot{
-    width:8px;height:8px;border-radius:50%;display:inline-block;
-    margin-right:5px;flex-shrink:0;
-  }
-  .dot-green{background:var(--accent);box-shadow:0 0 6px var(--accent);}
-  .dot-red{background:var(--red);box-shadow:0 0 6px var(--red);}
-  .dot-yellow{background:var(--yellow);}
-
-  /* ── DRAWER ── */
-  .drawer-overlay{
-    display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;
-  }
-  .drawer-overlay.open{display:block;}
-  .drawer{
-    position:fixed;top:0;right:-280px;width:280px;height:100%;
-    background:var(--surface);border-left:1px solid var(--border);
-    z-index:201;transition:right .25s ease;display:flex;flex-direction:column;
-  }
-  .drawer.open{right:0;}
-  .drawer-header{
-    padding:14px 16px;border-bottom:1px solid var(--border);
-    display:flex;align-items:center;justify-content:space-between;
-  }
-  .drawer-header h3{font-size:15px;color:var(--accent);}
-  .close-btn{background:none;border:none;color:var(--muted);font-size:22px;
-    cursor:pointer;padding:0 2px;}
-
-  /* ── TABS ── */
-  .tabs{
-    display:flex;border-bottom:1px solid var(--border);
-    background:var(--bg);
-  }
-  .tab{
-    flex:1;padding:10px 4px;text-align:center;font-size:11px;
-    color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
-    transition:all .15s;user-select:none;
-  }
-  .tab.active{color:var(--accent);border-bottom-color:var(--accent);}
-  .tab-icon{font-size:16px;display:block;margin-bottom:2px;}
-
-  /* ── MAIN CONTENT ── */
-  .main{
-    position:fixed;top:46px;left:0;right:0;bottom:0;overflow-y:auto;
-  }
-  .panel{display:none;padding:10px;}
-  .panel.active{display:block;}
-
-  /* ── CHART PANEL ── */
-  #panel-chart{padding:0;}
-  .chart-wrap{
-    position:relative;width:100%;
-    background:var(--bg);
-  }
-  .chart-wrap img{
-    width:100%;display:block;
-    border-bottom:1px solid var(--border);
-  }
-  .chart-refresh-badge{
-    position:absolute;top:8px;right:8px;
-    background:rgba(0,0,0,.7);border:1px solid var(--border);
-    border-radius:10px;padding:2px 8px;font-size:10px;color:var(--muted);
-  }
-  .live-badge{
-    position:absolute;top:8px;left:8px;
-    background:rgba(0,230,118,.15);border:1px solid var(--accent);
-    border-radius:10px;padding:2px 8px;font-size:10px;
-    color:var(--accent);display:flex;align-items:center;gap:4px;
-  }
-  .live-dot{
-    width:6px;height:6px;border-radius:50%;background:var(--accent);
-    animation:pulse 1s infinite;
-  }
-  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
-
-  .price-bar{
-    display:flex;align-items:center;justify-content:space-between;
-    padding:8px 12px;background:var(--surface);
-    border-bottom:1px solid var(--border);
-  }
-  .price-main{font-size:22px;font-weight:700;color:var(--accent);}
-  .price-label{font-size:10px;color:var(--muted);}
-  .price-right{text-align:right;}
-
-  /* ── STATS PANEL ── */
-  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;}
-  .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;}
-  .card{
-    background:var(--surface);border:1px solid var(--border);
-    border-radius:8px;padding:10px 12px;
-  }
-  .card-label{font-size:10px;color:var(--muted);margin-bottom:4px;}
-  .card-value{font-size:15px;font-weight:700;}
-  .card-value.green{color:var(--accent);}
-  .card-value.red{color:var(--red);}
-  .card-value.yellow{color:var(--yellow);}
-  .card-value.blue{color:var(--blue);}
-  .card-value.orange{color:var(--orange);}
-  .card-value.purple{color:var(--purple);}
-
-  .section-title{
-    font-size:11px;color:var(--muted);text-transform:uppercase;
-    letter-spacing:.8px;margin:14px 0 6px;
-  }
-
-  .trade-row{
-    background:var(--surface);border:1px solid var(--border);border-radius:6px;
-    padding:8px 10px;margin-bottom:6px;
-    display:flex;justify-content:space-between;align-items:center;
-  }
-  .trade-dir{font-size:11px;font-weight:700;}
-  .trade-dir.buy{color:var(--accent);}
-  .trade-dir.sell{color:var(--red);}
-
-  .progress-bar{
-    height:4px;background:var(--border);border-radius:2px;margin-top:6px;overflow:hidden;
-  }
-  .progress-fill{height:100%;border-radius:2px;transition:width .5s;}
-
-  /* ── SETTINGS PANEL ── */
-  .settings-group{
-    background:var(--surface);border:1px solid var(--border);
-    border-radius:8px;overflow:hidden;margin-bottom:12px;
-  }
-  .settings-item{
-    display:flex;align-items:center;justify-content:space-between;
-    padding:12px 14px;border-bottom:1px solid var(--border);
-  }
-  .settings-item:last-child{border-bottom:none;}
-  .settings-label{font-size:12px;color:var(--text);}
-  .settings-sub{font-size:10px;color:var(--muted);margin-top:2px;}
-  .settings-value{font-size:12px;color:var(--accent);font-weight:600;}
-
-  .btn-row{display:flex;gap:6px;flex-wrap:wrap;}
-  .btn-opt{
-    padding:6px 12px;border-radius:16px;font-size:11px;font-family:inherit;
-    border:1px solid var(--border);background:var(--bg);color:var(--muted);
-    cursor:pointer;transition:all .15s;
-  }
-  .btn-opt.active,
-  .btn-opt:hover{background:var(--accent);color:#000;border-color:var(--accent);}
-  .btn-opt.active-red:hover,
-  .btn-opt.active-red{background:var(--red);color:#fff;border-color:var(--red);}
-
-  .range-wrap{display:flex;align-items:center;gap:10px;width:60%;}
-  input[type=range]{
-    flex:1;-webkit-appearance:none;height:4px;border-radius:2px;
-    background:var(--border);outline:none;cursor:pointer;
-  }
-  input[type=range]::-webkit-slider-thumb{
-    -webkit-appearance:none;width:16px;height:16px;border-radius:50%;
-    background:var(--accent);cursor:pointer;
-  }
-  .range-val{
-    min-width:36px;text-align:right;color:var(--accent);font-weight:700;font-size:12px;
-  }
-
-  .toggle{
-    position:relative;display:inline-block;width:40px;height:22px;
-  }
-  .toggle input{opacity:0;width:0;height:0;}
-  .slider-tog{
-    position:absolute;inset:0;background:var(--border);border-radius:22px;
-    cursor:pointer;transition:.25s;
-  }
-  .slider-tog:before{
-    content:"";position:absolute;left:3px;top:3px;
-    width:16px;height:16px;border-radius:50%;background:#888;transition:.25s;
-  }
-  input:checked+.slider-tog{background:rgba(0,230,118,.3);border:1px solid var(--accent);}
-  input:checked+.slider-tog:before{transform:translateX(18px);background:var(--accent);}
-
-  .save-btn{
-    width:100%;padding:13px;background:var(--accent);color:#000;
-    border:none;border-radius:8px;font-size:14px;font-weight:700;
-    font-family:inherit;cursor:pointer;margin-top:6px;transition:opacity .15s;
-  }
-  .save-btn:active{opacity:.7;}
-  .save-btn:disabled{opacity:.4;cursor:not-allowed;}
-
-  .toast{
-    position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-    background:var(--accent);color:#000;padding:8px 20px;border-radius:20px;
-    font-size:12px;font-weight:700;opacity:0;transition:opacity .3s;z-index:300;
-    pointer-events:none;
-  }
-  .toast.show{opacity:1;}
-
-  /* scrollbar */
-  ::-webkit-scrollbar{width:4px;}
-  ::-webkit-scrollbar-track{background:transparent;}
-  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
-</style>
-</head>
-<body>
-
-<!-- TOP BAR -->
-<div class="topbar">
-  <div>
-    <div class="topbar-title">
-      <span class="status-dot dot-green" id="conn-dot"></span>SMC SNIPER EA
-    </div>
-    <div class="topbar-sub" id="topbar-sub">v5.3 · connecting...</div>
-  </div>
-  <button class="menu-btn" onclick="toggleDrawer()">☰</button>
-</div>
-
-<!-- DRAWER OVERLAY -->
-<div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
-<div class="drawer" id="drawer">
-  <div class="drawer-header">
-    <h3>⚙ Menu</h3>
-    <button class="close-btn" onclick="closeDrawer()">✕</button>
-  </div>
-  <div style="padding:14px;flex:1;overflow-y:auto;">
-    <div style="margin-bottom:14px;">
-      <div class="card-label">BOT STATUS</div>
-      <div id="drawer-status" style="font-size:13px;color:var(--accent);">Loading...</div>
-    </div>
-    <div style="margin-bottom:14px;">
-      <div class="card-label">ACCOUNT</div>
-      <div id="drawer-account" style="font-size:12px;color:var(--text);">—</div>
-    </div>
-    <div style="margin-bottom:14px;">
-      <div class="card-label">CURRENT SESSION</div>
-      <div id="drawer-session" style="font-size:13px;color:var(--yellow);">—</div>
-    </div>
-    <div style="margin-bottom:14px;">
-      <div class="card-label">NEXT RED NEWS</div>
-      <div id="drawer-news" style="font-size:11px;color:var(--red);">—</div>
-    </div>
-    <hr style="border-color:var(--border);margin:12px 0;"/>
-    <div class="card-label" style="margin-bottom:8px;">QUICK LINKS</div>
-    <a href="/api/state" target="_blank"
-       style="display:block;padding:9px 12px;background:var(--bg);border:1px solid var(--border);
-       border-radius:6px;color:var(--blue);text-decoration:none;font-size:12px;margin-bottom:6px;">
-      📡 Raw JSON API
-    </a>
-    <a href="/chart" target="_blank"
-       style="display:block;padding:9px 12px;background:var(--bg);border:1px solid var(--border);
-       border-radius:6px;color:var(--accent);text-decoration:none;font-size:12px;">
-      🖼 Chart Image (PNG)
-    </a>
-  </div>
-</div>
-
-<!-- MAIN CONTENT -->
-<div class="main">
-
-  <!-- TABS -->
-  <div class="tabs" id="tabs">
-    <div class="tab active" onclick="showTab('chart')" id="tab-chart">
-      <span class="tab-icon">📊</span>Chart
-    </div>
-    <div class="tab" onclick="showTab('stats')" id="tab-stats">
-      <span class="tab-icon">📈</span>Stats
-    </div>
-    <div class="tab" onclick="showTab('settings')" id="tab-settings">
-      <span class="tab-icon">⚙️</span>Settings
-    </div>
-  </div>
-
-  <!-- ═══════════ CHART PANEL ═══════════ -->
-  <div class="panel active" id="panel-chart">
-    <div class="price-bar">
-      <div>
-        <div class="price-label" id="pair-label">XAU/USD</div>
-        <div class="price-main" id="live-price">—</div>
-      </div>
-      <div class="price-right">
-        <div style="font-size:11px;color:var(--muted);" id="bias-label">Bias: —</div>
-        <div style="font-size:11px;" id="zone-label">Zone: —</div>
-        <div style="font-size:10px;color:var(--muted);" id="score-label">Score: —</div>
-      </div>
-    </div>
-    <div class="chart-wrap">
-      <img id="chart-img" src="/chart?t=0" alt="Chart loading..." onerror="this.style.opacity='.3'"/>
-      <div class="live-badge"><div class="live-dot"></div>LIVE</div>
-      <div class="chart-refresh-badge" id="refresh-badge">⟳ —</div>
-    </div>
-  </div>
-
-  <!-- ═══════════ STATS PANEL ═══════════ -->
-  <div class="panel" id="panel-stats">
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-label">💰 Balance</div>
-        <div class="card-value green" id="s-balance">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">📊 Total P&amp;L</div>
-        <div class="card-value" id="s-pnl">—</div>
-      </div>
-    </div>
-    <div class="grid-3">
-      <div class="card">
-        <div class="card-label">✅ Wins</div>
-        <div class="card-value green" id="s-wins">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">❌ Losses</div>
-        <div class="card-value red" id="s-losses">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">🎯 Win Rate</div>
-        <div class="card-value yellow" id="s-wr">—</div>
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-label">🔄 Open Trades</div>
-        <div class="card-value blue" id="s-open">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">🔢 Total Trades</div>
-        <div class="card-value" id="s-total">—</div>
-      </div>
-    </div>
-
-    <div class="section-title">Market State</div>
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-label">📍 Session</div>
-        <div class="card-value yellow" id="s-session">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">📐 Zone</div>
-        <div class="card-value purple" id="s-zone">—</div>
-      </div>
-    </div>
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-label">⚡ ATR</div>
-        <div class="card-value" id="s-atr">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">🧠 Sniper Score</div>
-        <div class="card-value orange" id="s-score">—</div>
-      </div>
-    </div>
-
-    <div class="section-title">Candle Buffers</div>
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-label">H1 Candles</div>
-        <div class="card-value blue" id="s-h1">—</div>
-        <div class="progress-bar"><div class="progress-fill" id="pb-h1"
-          style="background:var(--blue);"></div></div>
-      </div>
-      <div class="card">
-        <div class="card-label">M15 Candles</div>
-        <div class="card-value blue" id="s-m15">—</div>
-        <div class="progress-bar"><div class="progress-fill" id="pb-m15"
-          style="background:var(--blue);"></div></div>
-      </div>
-    </div>
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-label">M5 Candles</div>
-        <div class="card-value blue" id="s-m5">—</div>
-        <div class="progress-bar"><div class="progress-fill" id="pb-m5"
-          style="background:var(--blue);"></div></div>
-      </div>
-      <div class="card">
-        <div class="card-label">M1 Candles</div>
-        <div class="card-value blue" id="s-m1">—</div>
-        <div class="progress-bar"><div class="progress-fill" id="pb-m1"
-          style="background:var(--blue);"></div></div>
-      </div>
-    </div>
-
-    <div class="section-title">Next Red News</div>
-    <div class="card" id="s-news-card">
-      <div class="card-value red" id="s-news">—</div>
-    </div>
-  </div>
-
-  <!-- ═══════════ SETTINGS PANEL ═══════════ -->
-  <div class="panel" id="panel-settings">
-    <div class="section-title">Trading Mode</div>
-    <div class="settings-group">
-      <div class="settings-item">
-        <div>
-          <div class="settings-label">Strategy</div>
-          <div class="settings-sub">SNIPER=H1/M15/M5 · SCALPER=M15/M5/M1</div>
-        </div>
-        <div class="btn-row">
-          <button class="btn-opt" id="btn-sniper" onclick="setSetting('mode','SNIPER')">🎯 Sniper</button>
-          <button class="btn-opt" id="btn-scalper" onclick="setSetting('mode','SCALPER')">⚡ Scalper</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="section-title">Currency Pair</div>
-    <div class="settings-group">
-      <div class="settings-item">
-        <div><div class="settings-label">Pair</div></div>
-        <div class="btn-row" id="pair-btns">
-          <button class="btn-opt" id="btn-pair-XAUUSD" onclick="setSetting('pair','XAUUSD')">XAU/USD 🥇</button>
-          <button class="btn-opt" id="btn-pair-EURUSD" onclick="setSetting('pair','EURUSD')">EUR/USD 🇪🇺</button>
-          <button class="btn-opt" id="btn-pair-GBPUSD" onclick="setSetting('pair','GBPUSD')">GBP/USD 🇬🇧</button>
-          <button class="btn-opt" id="btn-pair-US100"  onclick="setSetting('pair','US100')">NASDAQ 💻</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="section-title">Risk Management</div>
-    <div class="settings-group">
-      <div class="settings-item">
-        <div>
-          <div class="settings-label">Risk %</div>
-          <div class="settings-sub">Per-trade account risk</div>
-        </div>
-        <div class="range-wrap">
-          <input type="range" min="1" max="10" step="1" id="risk-slider"
-            oninput="document.getElementById('risk-val').textContent=this.value+'%';pendingSettings.risk_pct=this.value/100;"/>
-          <div class="range-val" id="risk-val">1%</div>
-        </div>
-      </div>
-      <div class="settings-item">
-        <div>
-          <div class="settings-label">Min Score</div>
-          <div class="settings-sub">Minimum signal quality (0-100)</div>
-        </div>
-        <div class="range-wrap">
-          <input type="range" min="50" max="95" step="5" id="score-slider"
-            oninput="document.getElementById('score-val').textContent=this.value;pendingSettings.min_score=parseInt(this.value);"/>
-          <div class="range-val" id="score-val">75</div>
-        </div>
-      </div>
-      <div class="settings-item">
-        <div>
-          <div class="settings-label">💎 Small Account Mode</div>
-          <div class="settings-sub">Optimised for $10-$50 accounts</div>
-        </div>
-        <label class="toggle">
-          <input type="checkbox" id="small-acc-toggle"
-            onchange="pendingSettings.small_acc=this.checked;"/>
-          <span class="slider-tog"></span>
-        </label>
-      </div>
-    </div>
-
-    <div class="section-title">Bot Control</div>
-    <div class="settings-group">
-      <div class="settings-item">
-        <div>
-          <div class="settings-label">Autonomous Trading</div>
-          <div class="settings-sub">Pause / Resume the trading engine</div>
-        </div>
-        <label class="toggle">
-          <input type="checkbox" id="pause-toggle"
-            onchange="pendingSettings.paused=!this.checked;"/>
-          <span class="slider-tog"></span>
-        </label>
-      </div>
-    </div>
-
-    <button class="save-btn" id="save-btn" onclick="saveSettings()">
-      💾 Apply Settings
-    </button>
-  </div>
-
-</div><!-- /main -->
-
-<div class="toast" id="toast"></div>
-
-<script>
-// ══════════════════════════════════════════════
-// STATE
-// ══════════════════════════════════════════════
-let pendingSettings = {};
-let lastState = {};
-let chartTs = 0;
-let refreshTimer = null;
-let activeTab = 'chart';
-
-// ══════════════════════════════════════════════
-// TABS
-// ══════════════════════════════════════════════
-function showTab(name) {
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById('panel-' + name).classList.add('active');
-  document.getElementById('tab-' + name).classList.add('active');
-  activeTab = name;
-}
-
-// ══════════════════════════════════════════════
-// DRAWER
-// ══════════════════════════════════════════════
-function toggleDrawer() {
-  const d = document.getElementById('drawer');
-  const o = document.getElementById('drawer-overlay');
-  d.classList.toggle('open');
-  o.classList.toggle('open');
-}
-function closeDrawer() {
-  document.getElementById('drawer').classList.remove('open');
-  document.getElementById('drawer-overlay').classList.remove('open');
-}
-
-// ══════════════════════════════════════════════
-// FETCH STATE
-// ══════════════════════════════════════════════
-async function fetchState() {
-  try {
-    const r = await fetch('/api/state');
-    if (!r.ok) return;
-    lastState = await r.json();
-    updateUI(lastState);
-  } catch(e) {}
-}
-
-function updateUI(s) {
-  // ── Top bar ──
-  const dot = document.getElementById('conn-dot');
-  dot.className = 'status-dot ' + (s.broker_connected ? 'dot-green' : 'dot-red');
-  document.getElementById('topbar-sub').textContent =
-    `v5.3 · ${s.pair} · ${s.session_now || '—'}`;
-
-  // ── Chart panel ──
-  document.getElementById('live-price').textContent =
-    s.price ? s.price.toFixed(s.pair === 'XAUUSD' ? 2 : 5) : '—';
-  document.getElementById('pair-label').textContent = s.pair || '—';
-  const biasCls = s.trend === 'BULLISH' ? 'var(--accent)'
-                : s.trend === 'BEARISH' ? 'var(--red)' : 'var(--muted)';
-  document.getElementById('bias-label').style.color = biasCls;
-  document.getElementById('bias-label').textContent = 'Bias: ' + (s.trend || '—');
-  const zoneCls = s.zone === 'DISCOUNT' ? 'var(--accent)'
-                : s.zone === 'PREMIUM'  ? 'var(--red)' : 'var(--muted)';
-  document.getElementById('zone-label').style.color = zoneCls;
-  document.getElementById('zone-label').textContent = 'Zone: ' + (s.zone || '—');
-  document.getElementById('score-label').textContent = 'Score: ' + (s.ob_score || 0) + '/100';
-
-  // ── Chart image refresh ──
-  const now = Date.now();
-  if (now - chartTs >= 1000) {
-    document.getElementById('chart-img').src = '/chart?t=' + now;
-    chartTs = now;
-    document.getElementById('refresh-badge').textContent = '⟳ ' + new Date().toLocaleTimeString();
-  }
-
-  // ── Stats panel ──
-  const bal = s.balance ? s.balance.toFixed(2) + ' ' + (s.account_currency || 'USD') : '—';
-  document.getElementById('s-balance').textContent = bal;
-  const pnl = s.total_pnl !== undefined ? (s.total_pnl >= 0 ? '+' : '') + s.total_pnl.toFixed(2) : '—';
-  const pnlEl = document.getElementById('s-pnl');
-  pnlEl.textContent = pnl;
-  pnlEl.className = 'card-value ' + (s.total_pnl >= 0 ? 'green' : 'red');
-  document.getElementById('s-wins').textContent = s.wins !== undefined ? s.wins : '—';
-  document.getElementById('s-losses').textContent = s.losses !== undefined ? s.losses : '—';
-  document.getElementById('s-wr').textContent = s.winrate ? s.winrate + '%' : '—';
-  document.getElementById('s-open').textContent = s.open_contracts !== undefined ? s.open_contracts : '—';
-  document.getElementById('s-total').textContent = s.trades !== undefined ? s.trades : '—';
-  document.getElementById('s-session').textContent = s.session_now || '—';
-  document.getElementById('s-zone').textContent = s.zone || '—';
-  document.getElementById('s-atr').textContent = s.atr_ok ? '✅ OK' : '⚠️ LOW';
-  document.getElementById('s-atr').className = 'card-value ' + (s.atr_ok ? 'green' : 'red');
-  document.getElementById('s-score').textContent = (s.ob_score || 0) + '/100';
-
-  // Candle buffers
-  const setBar = (id, val) => {
-    document.getElementById(id).textContent = val;
-    document.getElementById('pb-' + id.replace('s-','')).style.width = Math.min(val / 10, 100) + '%';
-  };
-  setBar('s-h1', s.h1 || 0);
-  setBar('s-m15', s.m15 || 0);
-  setBar('s-m5', s.m5 || 0);
-  setBar('s-m1', s.m1 || 0);
-
-  // News
-  document.getElementById('s-news').textContent = s.next_red || 'No red news today ✅';
-  document.getElementById('s-news').style.color = s.next_red ? 'var(--red)' : 'var(--accent)';
-
-  // ── Drawer ──
-  const statusTxt = s.paused ? '⏸ PAUSED' : s.block_trading ? '🚫 ' + s.block_reason : '🟢 ACTIVE';
-  document.getElementById('drawer-status').textContent = statusTxt;
-  document.getElementById('drawer-status').style.color = s.paused || s.block_trading ? 'var(--red)' : 'var(--accent)';
-  document.getElementById('drawer-account').textContent =
-    `ID: ${s.account_id || '—'} | ${(s.account_type || '—').toUpperCase()} | Bal: ${bal}`;
-  document.getElementById('drawer-session').textContent = (s.session_now || '—') + ' Session';
-  document.getElementById('drawer-news').textContent = s.next_red || 'No red news ✅';
-
-  // ── Settings sync (only if no pending changes) ──
-  if (Object.keys(pendingSettings).length === 0) {
-    syncSettingsFromState(s);
-  }
-}
-
-function syncSettingsFromState(s) {
-  // Mode buttons
-  document.getElementById('btn-sniper').className  = 'btn-opt' + (s.mode === 'SNIPER'  ? ' active' : '');
-  document.getElementById('btn-scalper').className = 'btn-opt' + (s.mode === 'SCALPER' ? ' active' : '');
-
-  // Pair buttons
-  ['XAUUSD','EURUSD','GBPUSD','US100'].forEach(p => {
-    const btn = document.getElementById('btn-pair-' + p);
-    if (btn) btn.className = 'btn-opt' + (s.pair === p ? ' active' : '');
-  });
-
-  // Sliders
-  const riskPct = Math.round((s.risk_pct || 0.01) * 100);
-  document.getElementById('risk-slider').value = riskPct;
-  document.getElementById('risk-val').textContent = riskPct + '%';
-  document.getElementById('score-slider').value = s.min_score || 75;
-  document.getElementById('score-val').textContent = s.min_score || 75;
-
-  // Toggles
-  document.getElementById('small-acc-toggle').checked = !!s.small_acc;
-  document.getElementById('pause-toggle').checked = !s.paused;
-}
-
-// ══════════════════════════════════════════════
-// SETTINGS
-// ══════════════════════════════════════════════
-function setSetting(key, val) {
-  pendingSettings[key] = val;
-  // Update button UI immediately
-  if (key === 'mode') {
-    document.getElementById('btn-sniper').className  = 'btn-opt' + (val === 'SNIPER'  ? ' active' : '');
-    document.getElementById('btn-scalper').className = 'btn-opt' + (val === 'SCALPER' ? ' active' : '');
-  }
-  if (key === 'pair') {
-    ['XAUUSD','EURUSD','GBPUSD','US100'].forEach(p => {
-      const btn = document.getElementById('btn-pair-' + p);
-      if (btn) btn.className = 'btn-opt' + (p === val ? ' active' : '');
-    });
-  }
-}
-
-async function saveSettings() {
-  // Also collect slider + toggle values
-  pendingSettings.risk_pct  = parseFloat(document.getElementById('risk-slider').value) / 100;
-  pendingSettings.min_score = parseInt(document.getElementById('score-slider').value);
-  pendingSettings.small_acc = document.getElementById('small-acc-toggle').checked;
-  pendingSettings.paused    = !document.getElementById('pause-toggle').checked;
-
-  const btn = document.getElementById('save-btn');
-  btn.disabled = true;
-  btn.textContent = 'Saving...';
-  try {
-    const r = await fetch('/api/settings', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(pendingSettings)
-    });
-    if (r.ok) {
-      showToast('✅ Settings Applied!');
-      pendingSettings = {};
-    } else {
-      showToast('❌ Save failed');
-    }
-  } catch(e) {
-    showToast('❌ Network error');
-  }
-  btn.disabled = false;
-  btn.textContent = '💾 Apply Settings';
-}
-
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2500);
-}
-
-// ══════════════════════════════════════════════
-// INIT & POLL LOOP
-// ══════════════════════════════════════════════
-fetchState();
-setInterval(fetchState, 1000);
-</script>
-</body>
-</html>"""
-
-
-async def api_state(req):
-    """JSON state endpoint used by the dashboard."""
-    wr = (f"{state.wins/(state.wins+state.losses)*100:.1f}"
-          if (state.wins + state.losses) > 0 else "0")
-    return web.json_response({
-        "version":          "5.3",
-        "status":           "running" if state.running else "stopped",
-        "paused":           state.paused,
-        "block_trading":    state.block_trading,
-        "block_reason":     state.block_reason,
-        "autonomous":       state.autonomous,
-        "mode":             state.trading_mode,
-        "min_score":        state.min_score,
-        "market_open":      is_market_open(),
-        "session":          get_session(),
-        "broker_connected": state.broker_connected,
-        "account_id":       state.account_id,
-        "account_type":     state.account_type,
-        "account_currency": state.account_currency,
-        "pair":             state.pair_key,
-        "symbol":           state.active_symbol,
-        "price":            state.current_price,
-        "trend":            state.trend_bias,
-        "zone":             state.premium_discount,
-        "session_now":      state.session_now,
-        "ob_score":         state.ob_score,
-        "atr_ok":           state.atr_filter_ok,
-        "balance":          state.account_balance,
-        "risk_pct":         state.risk_pct,
-        "small_acc":        state.small_acc_mode,
-        "trades":           state.trade_count,
-        "wins":             state.wins,
-        "losses":           state.losses,
-        "winrate":          wr,
-        "total_pnl":        state.total_pnl,
-        "open_contracts":   len(state.open_contracts),
-        "history":          len(state.trade_history),
-        "h1":               len(state.h1_candles),
-        "m15":              len(state.m15_candles),
-        "m5":               len(state.m5_candles),
-        "m1":               len(state.m1_candles),
-        "news_events":      len(state.news_events),
-        "next_red":         (state.next_red_event.title
-                             if state.next_red_event else None),
-        "gran_actual":      state.gran_actual,
-    })
-
-
-async def api_settings(req):
-    """
-    POST /api/settings — Apply settings from the Mini App dashboard.
-    Accepts JSON body with any subset of settable fields.
-    """
-    try:
-        data = await req.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
-
-    changed = []
-
-    if "mode" in data:
-        m = str(data["mode"]).upper()
-        if m in ("SNIPER", "SCALPER"):
-            state.trading_mode = m
-            if m == "SNIPER":
-                state.min_score = 75
-                state.trend_tf  = "H1"
-                state.exec_tf   = "M15"
-                state.conf_tf   = "M5"
-            else:
-                state.min_score = 60
-                state.trend_tf  = "M15"
-                state.exec_tf   = "M5"
-                state.conf_tf   = "M1"
-            changed.append(f"mode={m}")
-
-    if "min_score" in data:
-        sc = int(data["min_score"])
-        if 30 <= sc <= 100:
-            state.min_score = sc
-            changed.append(f"min_score={sc}")
-
-    if "risk_pct" in data:
-        rp = float(data["risk_pct"])
-        if 0.001 <= rp <= 0.20:
-            state.risk_pct = rp
-            changed.append(f"risk_pct={rp}")
-
-    if "pair" in data:
-        pk = str(data["pair"]).upper()
-        if pk in PAIR_REGISTRY:
-            old_key = state.pair_key
-            state.pair_key = pk
-            state.small_acc_mode = False
-            # Trigger re-subscription asynchronously
-            if state.ws:
-                asyncio.ensure_future(subscribe_pair(pk))
-            changed.append(f"pair={pk}")
-
-    if "small_acc" in data:
-        state.small_acc_mode = bool(data["small_acc"])
-        if state.small_acc_mode and state.pair_key == "XAUUSD":
-            state.risk_pct = 0.02
-            state.tp1_r, state.tp2_r, state.tp3_r = 1.5, 3., 5.
-        elif not state.small_acc_mode:
-            state.risk_pct = 0.01
-            state.tp1_r, state.tp2_r, state.tp3_r = 2., 4., 6.
-        changed.append(f"small_acc={state.small_acc_mode}")
-
-    if "paused" in data:
-        state.paused = bool(data["paused"])
-        if not state.paused:
-            state.block_trading = False
-            state.block_reason  = ""
-        changed.append(f"paused={state.paused}")
-
-    log.info(f"⚙️ Settings via API: {', '.join(changed) if changed else 'no changes'}")
-    return web.json_response({"ok": True, "changed": changed})
-
-
-async def dashboard(req):
-    """Serve the Telegram Mini App dashboard HTML."""
-    return web.Response(text=_dashboard_html(), content_type="text/html")
-
-
-async def chart_route(req):
-    """Serve the latest chart PNG for the Mini App."""
-    # Try live chart first, fall back to entry/exit chart
-    for path in ("/tmp/sniper_chart_live.png",
-                 "/tmp/sniper_chart_entry.png",
-                 "/tmp/sniper_chart_exit.png",
-                 "/tmp/dashboard.png"):
-        p = Path(path)
-        if p.exists():
-            return web.FileResponse(p, headers={
-                "Cache-Control": "no-store, no-cache, must-revalidate",
-                "Pragma": "no-cache",
-            })
-    # No chart yet — return a minimal placeholder PNG
-    import base64
-    PLACEHOLDER = (
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
-        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
-    return web.Response(
-        body=base64.b64decode(PLACEHOLDER),
-        content_type="image/png",
-        headers={"Cache-Control": "no-store"})
-
-
-async def health(req):
-    """Legacy /health endpoint — returns same JSON as /api/state."""
-    return await api_state(req)
-
-
 async def start_health():
     app = web.Application()
-    # Dashboard & chart routes
-    app.router.add_get("/",            dashboard)
-    app.router.add_get("/chart",       chart_route)
-    app.router.add_get("/api/state",   api_state)
-    app.router.add_post("/api/settings", api_settings)
-    # Legacy compatibility
-    app.router.add_get("/health",      health)
+    app.router.add_get("/",       health)
+    app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info(f"🌐 Web dashboard: http://0.0.0.0:{PORT}/")
-    log.info(f"🖼  Chart route:   http://0.0.0.0:{PORT}/chart")
-    log.info(f"📡 API state:      http://0.0.0.0:{PORT}/api/state")
-    log.info(f"⚙️  API settings:  http://0.0.0.0:{PORT}/api/settings")
+    log.info(f"Health :{PORT}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3229,9 +2534,9 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.3 · Mini App Dashboard     ║")
+    log.info("║  SMC SNIPER EA v5.2 · Multi-Strategy Auto    ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  Web Dashboard | Settings API | Chart Route  ║")
+    log.info("║  [COMPLETE REWRITE — 3 BUGS FIXED FOREVER]  ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
