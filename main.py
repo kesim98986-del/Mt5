@@ -64,11 +64,11 @@ GRAN_FALLBACKS = {
 
 # Forex sessions in UTC hours
 SESSIONS = {
-    "ASIA":     (0,  7),
-    "LONDON":   (7,  12),
-    "NY":       (12, 17),
-    "OVERLAP":  (12, 16),   # London/NY overlap — highest liquidity
-    "CLOSE":    (17, 24),
+    "ASIAN":    (0,  8),
+    "LONDON":   (8,  13),
+    "NY":       (17, 22),
+    "OVERLAP":  (13, 17),   # London/NY overlap — highest liquidity
+    "CLOSE":    (22, 24),
 }
 
 # Best sessions per asset
@@ -301,11 +301,11 @@ def time_to_next_open() -> str:
 def get_session() -> str:
     """Return the current Forex session (UTC). Covers all 24 hours with no gaps."""
     h = datetime.now(UTC).hour
-    if  0 <= h <  7: return "ASIA"
-    if  7 <= h < 12: return "LONDON"
-    if 12 <= h < 16: return "OVERLAP"
-    if 16 <= h < 22: return "NY"
-    return "ASIA"   # 22–23: Tokyo/Sydney pre-open
+    if  0 <= h <  8: return "ASIAN"
+    if  8 <= h < 13: return "LONDON"
+    if 13 <= h < 17: return "OVERLAP"
+    if 17 <= h < 22: return "NY"
+    return "ASIAN"   # 22–24: Tokyo/Sydney pre-open and crossover
 
 def market_header() -> str:
     if is_market_open():
@@ -568,18 +568,13 @@ async def news_block_monitor():
                 state.block_trading = True
                 state.block_reason  = reason
                 log.info(f"🚫 BLOCKED: {reason}")
-                await tg_async(
-                    f"{market_header()}\n\n"
-                    f"🚫 *Trading Blocked — News Shield Active*\n{reason}\n\n"
-                    f"_Bot auto-resumes after the news window._", reply_markup=kb_main())
+                # Routine Telegram notifications are disabled to prevent spam. 
+                # Block alerts are only available directly via Telegram commands or server console logs.
             elif not block and state.block_trading:
                 state.block_trading = False
                 state.block_reason  = ""
                 log.info("✅ UNBLOCKED")
-                await tg_async(
-                    f"{market_header()}\n\n"
-                    f"✅ *Trading Resumed*\n"
-                    f"News window cleared. Sniper Brain reactivated.", reply_markup=kb_main())
+                # Routine Telegram notifications are disabled to prevent spam.
         except Exception as e:
             log.error(f"news_block_monitor: {e}")
         await asyncio.sleep(60)
@@ -635,8 +630,13 @@ def generate_chart(candles:deque, tf:str="M15",
     # ── Pre-compute metrics ──
     price_min   = df["low"].min()
     price_max   = df["high"].max()
-    price_range = (price_max - price_min) if price_max != price_min else 1.0
-    pad         = price_range * 0.13
+    if price_min == price_max:
+        price_range = 1.0
+        pad = 1.0
+    else:
+        price_range = price_max - price_min
+        pad = price_range * 0.15
+        
     xs          = list(range(len(df)))
 
     bull_idx = [i for i in xs if df.loc[i,"close"] >= df.loc[i,"open"]]
@@ -1111,8 +1111,9 @@ def check_trade_mgmt():
         if not info["be_moved"]:
             if(d=="BUY" and p>=sig["tp1"]) or(d=="SELL" and p<=sig["tp1"]):
                 info["be_moved"]=True; sig["sl"]=sig["entry"]
-                asyncio.ensure_future(tg_async(
-                    f"✅ *BreakEven* `{cid}`\nSL → Entry `{sig['entry']}`"))
+                # Routine telegram disabled
+                # asyncio.ensure_future(tg_async(
+                #     f"✅ *BreakEven* `{cid}`\nSL → Entry `{sig['entry']}`"))
         # Trailing stop
         buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
         if len(buf)>=10:
@@ -1348,19 +1349,9 @@ async def chart_loop():
                     f"Signal:{'✅ ' + sig['direction'] if sig else '—'}"
                 )
 
+                # Telegram spam disabled for routine scans; we only log the data to the console.
                 buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
                 chart = generate_chart(buf_for_chart, state.exec_tf, chart_type="live")
-                if chart:
-                    blk = "  🚫 NEWS BLOCKED" if state.block_trading else ""
-                    mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
-                    await tg_async(
-                        f"📡 *Live Chart — {state.pair_display}*  `{state.exec_tf}`\n"
-                        f"Market: {mkt}  Session: `{sess}`{blk}\n"
-                        f"Bias: `{state.trend_bias}`  Zone: `{state.premium_discount}`\n"
-                        f"Score: `{state.ob_score}/100`  Price: `{state.current_price:.5f}`\n"
-                        f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} "
-                        f"M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}",
-                        photo_path=chart)
         except Exception as e:
             log.error(f"chart_loop: {e}")
         await asyncio.sleep(CHART_INTERVAL)
