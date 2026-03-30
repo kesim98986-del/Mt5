@@ -1,22 +1,22 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.2 — Multi-Strategy Autonomous Trading Bot    ║
+║        SMC SNIPER EA v5.3 — Multi-Strategy Autonomous Trading Bot    ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
-║              [COMPLETE REWRITE — 3 BUGS PERMANENTLY FIXED]          ║
+║  Zero-Noise | Post-Trade Reasoning | Amharic | Mini App Dashboard    ║
+║         Railway-Ready | Full Web Dashboard | Settings Panel          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-FIXES APPLIED (v5.2):
-1. PERSISTENT CANDLE BUFFER  — All candle deques use maxlen=1000.
-   _store() APPENDS one candle at a time so history is never lost.
-2. FIXED CHART Y-AXIS        — Minimum range of 10.0 pts for Gold
-   (≥1000), 0.010 for Forex, 50 for indices. Flat-line & flicker gone.
-3. GAPLESS SESSION LOGIC     — get_session() covers exactly 24 h:
-     00:00–08:00 UTC  → ASIAN
-     08:00–13:00 UTC  → LONDON
-     13:00–17:00 UTC  → OVERLAP
-     17:00–22:00 UTC  → NY
-     22:00–24:00 UTC  → ASIAN  (wraps; no gap, no UNKNOWN)
+NEW in v5.3 (on top of all v5.2 fixes):
+4. TELEGRAM MINI APP DASHBOARD
+   - Dark-themed web dashboard at /  (auto-refreshes every 1s)
+   - Live chart image at /chart      (serves dashboard.png)
+   - JSON API at /api/state          (raw bot state as JSON)
+   - Hamburger (☰) menu with 3 tabs: Chart | Stats | Settings
+   - Settings panel: Risk %, Min Score, Mode, Pair, Small Acc
+   - All settings apply instantly to the live bot via POST /api/settings
+5. FIXED CHART PIP RANGE   — 5.0 pip hard floor for XAU/USD
+   so the Mini App chart stays perfectly stable.
+6. SESSION FIX             — 22:00–00:00 gap always maps to ASIAN.
 """
 
 import asyncio
@@ -713,12 +713,15 @@ def _resolve_min_range(avg_price: float) -> float:
     """
     Return the minimum acceptable Y-axis range based on price level.
 
-    Gold / Indices (>= 1000):   10.0  points
+    Gold / Indices (>= 1000):   5.0  points  (FIXED 5.0 pip range — v5.3)
     Mid-range (>= 10):           1.0  points
     Forex majors (>= 1):         0.010 (100 pips)
     Exotic micro (<  1):         0.001
+
+    The 5.0 pip floor for XAU/USD ensures the Mini App chart never
+    flickers or compresses to a flat line between updates.
     """
-    if avg_price >= 1000: return 10.0    # XAU/USD, US100
+    if avg_price >= 1000: return 5.0     # XAU/USD, US100 — fixed 5.0 pip
     if avg_price >= 10:   return 1.0
     if avg_price >= 1:    return 0.010   # EUR/USD, GBP/USD
     return 0.001
@@ -1719,6 +1722,15 @@ async def chart_loop():
 
                 sess = get_session()
                 state.session_now = sess
+
+                # ── Generate a fresh live chart (also used by Mini App dashboard) ──
+                try:
+                    buf_for_chart = (state.m15_candles if state.exec_tf == "M15"
+                                     else state.m5_candles)
+                    generate_chart(buf_for_chart, state.exec_tf, chart_type="live")
+                except Exception as ce:
+                    log.warning(f"chart_loop chart gen: {ce}")
+
                 log.info(
                     f"📡 Scan | {state.pair_display} | {state.trading_mode} | "
                     f"Bias:{state.trend_bias} | Zone:{state.premium_discount} | "
@@ -2331,14 +2343,885 @@ async def health(req):
     })
 
 
+def _dashboard_html() -> str:
+    """Return the full dark-themed Telegram Mini App dashboard HTML."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>SMC Sniper EA v5.3</title>
+<style>
+  :root{
+    --bg:#0d1117;--surface:#161b22;--border:#30363d;--accent:#00e676;
+    --red:#ff1744;--yellow:#ffeb3b;--blue:#2979ff;--purple:#ce93d8;
+    --text:#cdd9e5;--muted:#8b949e;--orange:#ff9800;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;background:var(--bg);color:var(--text);
+    font-family:'SF Mono',Consolas,monospace;font-size:13px;overflow:hidden;}
+
+  /* ── TOP BAR ── */
+  .topbar{
+    display:flex;align-items:center;justify-content:space-between;
+    background:var(--surface);border-bottom:1px solid var(--border);
+    padding:8px 12px;height:46px;position:fixed;top:0;left:0;right:0;z-index:100;
+  }
+  .topbar-title{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.5px;}
+  .topbar-sub{font-size:10px;color:var(--muted);margin-top:1px;}
+  .menu-btn{
+    background:none;border:none;cursor:pointer;padding:4px 6px;
+    color:var(--text);font-size:20px;line-height:1;border-radius:6px;
+    transition:background .15s;
+  }
+  .menu-btn:hover{background:var(--border);}
+  .status-dot{
+    width:8px;height:8px;border-radius:50%;display:inline-block;
+    margin-right:5px;flex-shrink:0;
+  }
+  .dot-green{background:var(--accent);box-shadow:0 0 6px var(--accent);}
+  .dot-red{background:var(--red);box-shadow:0 0 6px var(--red);}
+  .dot-yellow{background:var(--yellow);}
+
+  /* ── DRAWER ── */
+  .drawer-overlay{
+    display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;
+  }
+  .drawer-overlay.open{display:block;}
+  .drawer{
+    position:fixed;top:0;right:-280px;width:280px;height:100%;
+    background:var(--surface);border-left:1px solid var(--border);
+    z-index:201;transition:right .25s ease;display:flex;flex-direction:column;
+  }
+  .drawer.open{right:0;}
+  .drawer-header{
+    padding:14px 16px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;justify-content:space-between;
+  }
+  .drawer-header h3{font-size:15px;color:var(--accent);}
+  .close-btn{background:none;border:none;color:var(--muted);font-size:22px;
+    cursor:pointer;padding:0 2px;}
+
+  /* ── TABS ── */
+  .tabs{
+    display:flex;border-bottom:1px solid var(--border);
+    background:var(--bg);
+  }
+  .tab{
+    flex:1;padding:10px 4px;text-align:center;font-size:11px;
+    color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
+    transition:all .15s;user-select:none;
+  }
+  .tab.active{color:var(--accent);border-bottom-color:var(--accent);}
+  .tab-icon{font-size:16px;display:block;margin-bottom:2px;}
+
+  /* ── MAIN CONTENT ── */
+  .main{
+    position:fixed;top:46px;left:0;right:0;bottom:0;overflow-y:auto;
+  }
+  .panel{display:none;padding:10px;}
+  .panel.active{display:block;}
+
+  /* ── CHART PANEL ── */
+  #panel-chart{padding:0;}
+  .chart-wrap{
+    position:relative;width:100%;
+    background:var(--bg);
+  }
+  .chart-wrap img{
+    width:100%;display:block;
+    border-bottom:1px solid var(--border);
+  }
+  .chart-refresh-badge{
+    position:absolute;top:8px;right:8px;
+    background:rgba(0,0,0,.7);border:1px solid var(--border);
+    border-radius:10px;padding:2px 8px;font-size:10px;color:var(--muted);
+  }
+  .live-badge{
+    position:absolute;top:8px;left:8px;
+    background:rgba(0,230,118,.15);border:1px solid var(--accent);
+    border-radius:10px;padding:2px 8px;font-size:10px;
+    color:var(--accent);display:flex;align-items:center;gap:4px;
+  }
+  .live-dot{
+    width:6px;height:6px;border-radius:50%;background:var(--accent);
+    animation:pulse 1s infinite;
+  }
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+
+  .price-bar{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:8px 12px;background:var(--surface);
+    border-bottom:1px solid var(--border);
+  }
+  .price-main{font-size:22px;font-weight:700;color:var(--accent);}
+  .price-label{font-size:10px;color:var(--muted);}
+  .price-right{text-align:right;}
+
+  /* ── STATS PANEL ── */
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;}
+  .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;}
+  .card{
+    background:var(--surface);border:1px solid var(--border);
+    border-radius:8px;padding:10px 12px;
+  }
+  .card-label{font-size:10px;color:var(--muted);margin-bottom:4px;}
+  .card-value{font-size:15px;font-weight:700;}
+  .card-value.green{color:var(--accent);}
+  .card-value.red{color:var(--red);}
+  .card-value.yellow{color:var(--yellow);}
+  .card-value.blue{color:var(--blue);}
+  .card-value.orange{color:var(--orange);}
+  .card-value.purple{color:var(--purple);}
+
+  .section-title{
+    font-size:11px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.8px;margin:14px 0 6px;
+  }
+
+  .trade-row{
+    background:var(--surface);border:1px solid var(--border);border-radius:6px;
+    padding:8px 10px;margin-bottom:6px;
+    display:flex;justify-content:space-between;align-items:center;
+  }
+  .trade-dir{font-size:11px;font-weight:700;}
+  .trade-dir.buy{color:var(--accent);}
+  .trade-dir.sell{color:var(--red);}
+
+  .progress-bar{
+    height:4px;background:var(--border);border-radius:2px;margin-top:6px;overflow:hidden;
+  }
+  .progress-fill{height:100%;border-radius:2px;transition:width .5s;}
+
+  /* ── SETTINGS PANEL ── */
+  .settings-group{
+    background:var(--surface);border:1px solid var(--border);
+    border-radius:8px;overflow:hidden;margin-bottom:12px;
+  }
+  .settings-item{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:12px 14px;border-bottom:1px solid var(--border);
+  }
+  .settings-item:last-child{border-bottom:none;}
+  .settings-label{font-size:12px;color:var(--text);}
+  .settings-sub{font-size:10px;color:var(--muted);margin-top:2px;}
+  .settings-value{font-size:12px;color:var(--accent);font-weight:600;}
+
+  .btn-row{display:flex;gap:6px;flex-wrap:wrap;}
+  .btn-opt{
+    padding:6px 12px;border-radius:16px;font-size:11px;font-family:inherit;
+    border:1px solid var(--border);background:var(--bg);color:var(--muted);
+    cursor:pointer;transition:all .15s;
+  }
+  .btn-opt.active,
+  .btn-opt:hover{background:var(--accent);color:#000;border-color:var(--accent);}
+  .btn-opt.active-red:hover,
+  .btn-opt.active-red{background:var(--red);color:#fff;border-color:var(--red);}
+
+  .range-wrap{display:flex;align-items:center;gap:10px;width:60%;}
+  input[type=range]{
+    flex:1;-webkit-appearance:none;height:4px;border-radius:2px;
+    background:var(--border);outline:none;cursor:pointer;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+    background:var(--accent);cursor:pointer;
+  }
+  .range-val{
+    min-width:36px;text-align:right;color:var(--accent);font-weight:700;font-size:12px;
+  }
+
+  .toggle{
+    position:relative;display:inline-block;width:40px;height:22px;
+  }
+  .toggle input{opacity:0;width:0;height:0;}
+  .slider-tog{
+    position:absolute;inset:0;background:var(--border);border-radius:22px;
+    cursor:pointer;transition:.25s;
+  }
+  .slider-tog:before{
+    content:"";position:absolute;left:3px;top:3px;
+    width:16px;height:16px;border-radius:50%;background:#888;transition:.25s;
+  }
+  input:checked+.slider-tog{background:rgba(0,230,118,.3);border:1px solid var(--accent);}
+  input:checked+.slider-tog:before{transform:translateX(18px);background:var(--accent);}
+
+  .save-btn{
+    width:100%;padding:13px;background:var(--accent);color:#000;
+    border:none;border-radius:8px;font-size:14px;font-weight:700;
+    font-family:inherit;cursor:pointer;margin-top:6px;transition:opacity .15s;
+  }
+  .save-btn:active{opacity:.7;}
+  .save-btn:disabled{opacity:.4;cursor:not-allowed;}
+
+  .toast{
+    position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+    background:var(--accent);color:#000;padding:8px 20px;border-radius:20px;
+    font-size:12px;font-weight:700;opacity:0;transition:opacity .3s;z-index:300;
+    pointer-events:none;
+  }
+  .toast.show{opacity:1;}
+
+  /* scrollbar */
+  ::-webkit-scrollbar{width:4px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div>
+    <div class="topbar-title">
+      <span class="status-dot dot-green" id="conn-dot"></span>SMC SNIPER EA
+    </div>
+    <div class="topbar-sub" id="topbar-sub">v5.3 · connecting...</div>
+  </div>
+  <button class="menu-btn" onclick="toggleDrawer()">☰</button>
+</div>
+
+<!-- DRAWER OVERLAY -->
+<div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-header">
+    <h3>⚙ Menu</h3>
+    <button class="close-btn" onclick="closeDrawer()">✕</button>
+  </div>
+  <div style="padding:14px;flex:1;overflow-y:auto;">
+    <div style="margin-bottom:14px;">
+      <div class="card-label">BOT STATUS</div>
+      <div id="drawer-status" style="font-size:13px;color:var(--accent);">Loading...</div>
+    </div>
+    <div style="margin-bottom:14px;">
+      <div class="card-label">ACCOUNT</div>
+      <div id="drawer-account" style="font-size:12px;color:var(--text);">—</div>
+    </div>
+    <div style="margin-bottom:14px;">
+      <div class="card-label">CURRENT SESSION</div>
+      <div id="drawer-session" style="font-size:13px;color:var(--yellow);">—</div>
+    </div>
+    <div style="margin-bottom:14px;">
+      <div class="card-label">NEXT RED NEWS</div>
+      <div id="drawer-news" style="font-size:11px;color:var(--red);">—</div>
+    </div>
+    <hr style="border-color:var(--border);margin:12px 0;"/>
+    <div class="card-label" style="margin-bottom:8px;">QUICK LINKS</div>
+    <a href="/api/state" target="_blank"
+       style="display:block;padding:9px 12px;background:var(--bg);border:1px solid var(--border);
+       border-radius:6px;color:var(--blue);text-decoration:none;font-size:12px;margin-bottom:6px;">
+      📡 Raw JSON API
+    </a>
+    <a href="/chart" target="_blank"
+       style="display:block;padding:9px 12px;background:var(--bg);border:1px solid var(--border);
+       border-radius:6px;color:var(--accent);text-decoration:none;font-size:12px;">
+      🖼 Chart Image (PNG)
+    </a>
+  </div>
+</div>
+
+<!-- MAIN CONTENT -->
+<div class="main">
+
+  <!-- TABS -->
+  <div class="tabs" id="tabs">
+    <div class="tab active" onclick="showTab('chart')" id="tab-chart">
+      <span class="tab-icon">📊</span>Chart
+    </div>
+    <div class="tab" onclick="showTab('stats')" id="tab-stats">
+      <span class="tab-icon">📈</span>Stats
+    </div>
+    <div class="tab" onclick="showTab('settings')" id="tab-settings">
+      <span class="tab-icon">⚙️</span>Settings
+    </div>
+  </div>
+
+  <!-- ═══════════ CHART PANEL ═══════════ -->
+  <div class="panel active" id="panel-chart">
+    <div class="price-bar">
+      <div>
+        <div class="price-label" id="pair-label">XAU/USD</div>
+        <div class="price-main" id="live-price">—</div>
+      </div>
+      <div class="price-right">
+        <div style="font-size:11px;color:var(--muted);" id="bias-label">Bias: —</div>
+        <div style="font-size:11px;" id="zone-label">Zone: —</div>
+        <div style="font-size:10px;color:var(--muted);" id="score-label">Score: —</div>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <img id="chart-img" src="/chart?t=0" alt="Chart loading..." onerror="this.style.opacity='.3'"/>
+      <div class="live-badge"><div class="live-dot"></div>LIVE</div>
+      <div class="chart-refresh-badge" id="refresh-badge">⟳ —</div>
+    </div>
+  </div>
+
+  <!-- ═══════════ STATS PANEL ═══════════ -->
+  <div class="panel" id="panel-stats">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-label">💰 Balance</div>
+        <div class="card-value green" id="s-balance">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">📊 Total P&amp;L</div>
+        <div class="card-value" id="s-pnl">—</div>
+      </div>
+    </div>
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-label">✅ Wins</div>
+        <div class="card-value green" id="s-wins">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">❌ Losses</div>
+        <div class="card-value red" id="s-losses">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">🎯 Win Rate</div>
+        <div class="card-value yellow" id="s-wr">—</div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-label">🔄 Open Trades</div>
+        <div class="card-value blue" id="s-open">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">🔢 Total Trades</div>
+        <div class="card-value" id="s-total">—</div>
+      </div>
+    </div>
+
+    <div class="section-title">Market State</div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-label">📍 Session</div>
+        <div class="card-value yellow" id="s-session">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">📐 Zone</div>
+        <div class="card-value purple" id="s-zone">—</div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-label">⚡ ATR</div>
+        <div class="card-value" id="s-atr">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">🧠 Sniper Score</div>
+        <div class="card-value orange" id="s-score">—</div>
+      </div>
+    </div>
+
+    <div class="section-title">Candle Buffers</div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-label">H1 Candles</div>
+        <div class="card-value blue" id="s-h1">—</div>
+        <div class="progress-bar"><div class="progress-fill" id="pb-h1"
+          style="background:var(--blue);"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">M15 Candles</div>
+        <div class="card-value blue" id="s-m15">—</div>
+        <div class="progress-bar"><div class="progress-fill" id="pb-m15"
+          style="background:var(--blue);"></div></div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-label">M5 Candles</div>
+        <div class="card-value blue" id="s-m5">—</div>
+        <div class="progress-bar"><div class="progress-fill" id="pb-m5"
+          style="background:var(--blue);"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">M1 Candles</div>
+        <div class="card-value blue" id="s-m1">—</div>
+        <div class="progress-bar"><div class="progress-fill" id="pb-m1"
+          style="background:var(--blue);"></div></div>
+      </div>
+    </div>
+
+    <div class="section-title">Next Red News</div>
+    <div class="card" id="s-news-card">
+      <div class="card-value red" id="s-news">—</div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SETTINGS PANEL ═══════════ -->
+  <div class="panel" id="panel-settings">
+    <div class="section-title">Trading Mode</div>
+    <div class="settings-group">
+      <div class="settings-item">
+        <div>
+          <div class="settings-label">Strategy</div>
+          <div class="settings-sub">SNIPER=H1/M15/M5 · SCALPER=M15/M5/M1</div>
+        </div>
+        <div class="btn-row">
+          <button class="btn-opt" id="btn-sniper" onclick="setSetting('mode','SNIPER')">🎯 Sniper</button>
+          <button class="btn-opt" id="btn-scalper" onclick="setSetting('mode','SCALPER')">⚡ Scalper</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">Currency Pair</div>
+    <div class="settings-group">
+      <div class="settings-item">
+        <div><div class="settings-label">Pair</div></div>
+        <div class="btn-row" id="pair-btns">
+          <button class="btn-opt" id="btn-pair-XAUUSD" onclick="setSetting('pair','XAUUSD')">XAU/USD 🥇</button>
+          <button class="btn-opt" id="btn-pair-EURUSD" onclick="setSetting('pair','EURUSD')">EUR/USD 🇪🇺</button>
+          <button class="btn-opt" id="btn-pair-GBPUSD" onclick="setSetting('pair','GBPUSD')">GBP/USD 🇬🇧</button>
+          <button class="btn-opt" id="btn-pair-US100"  onclick="setSetting('pair','US100')">NASDAQ 💻</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">Risk Management</div>
+    <div class="settings-group">
+      <div class="settings-item">
+        <div>
+          <div class="settings-label">Risk %</div>
+          <div class="settings-sub">Per-trade account risk</div>
+        </div>
+        <div class="range-wrap">
+          <input type="range" min="1" max="10" step="1" id="risk-slider"
+            oninput="document.getElementById('risk-val').textContent=this.value+'%';pendingSettings.risk_pct=this.value/100;"/>
+          <div class="range-val" id="risk-val">1%</div>
+        </div>
+      </div>
+      <div class="settings-item">
+        <div>
+          <div class="settings-label">Min Score</div>
+          <div class="settings-sub">Minimum signal quality (0-100)</div>
+        </div>
+        <div class="range-wrap">
+          <input type="range" min="50" max="95" step="5" id="score-slider"
+            oninput="document.getElementById('score-val').textContent=this.value;pendingSettings.min_score=parseInt(this.value);"/>
+          <div class="range-val" id="score-val">75</div>
+        </div>
+      </div>
+      <div class="settings-item">
+        <div>
+          <div class="settings-label">💎 Small Account Mode</div>
+          <div class="settings-sub">Optimised for $10-$50 accounts</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="small-acc-toggle"
+            onchange="pendingSettings.small_acc=this.checked;"/>
+          <span class="slider-tog"></span>
+        </label>
+      </div>
+    </div>
+
+    <div class="section-title">Bot Control</div>
+    <div class="settings-group">
+      <div class="settings-item">
+        <div>
+          <div class="settings-label">Autonomous Trading</div>
+          <div class="settings-sub">Pause / Resume the trading engine</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="pause-toggle"
+            onchange="pendingSettings.paused=!this.checked;"/>
+          <span class="slider-tog"></span>
+        </label>
+      </div>
+    </div>
+
+    <button class="save-btn" id="save-btn" onclick="saveSettings()">
+      💾 Apply Settings
+    </button>
+  </div>
+
+</div><!-- /main -->
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ══════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════
+let pendingSettings = {};
+let lastState = {};
+let chartTs = 0;
+let refreshTimer = null;
+let activeTab = 'chart';
+
+// ══════════════════════════════════════════════
+// TABS
+// ══════════════════════════════════════════════
+function showTab(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  activeTab = name;
+}
+
+// ══════════════════════════════════════════════
+// DRAWER
+// ══════════════════════════════════════════════
+function toggleDrawer() {
+  const d = document.getElementById('drawer');
+  const o = document.getElementById('drawer-overlay');
+  d.classList.toggle('open');
+  o.classList.toggle('open');
+}
+function closeDrawer() {
+  document.getElementById('drawer').classList.remove('open');
+  document.getElementById('drawer-overlay').classList.remove('open');
+}
+
+// ══════════════════════════════════════════════
+// FETCH STATE
+// ══════════════════════════════════════════════
+async function fetchState() {
+  try {
+    const r = await fetch('/api/state');
+    if (!r.ok) return;
+    lastState = await r.json();
+    updateUI(lastState);
+  } catch(e) {}
+}
+
+function updateUI(s) {
+  // ── Top bar ──
+  const dot = document.getElementById('conn-dot');
+  dot.className = 'status-dot ' + (s.broker_connected ? 'dot-green' : 'dot-red');
+  document.getElementById('topbar-sub').textContent =
+    `v5.3 · ${s.pair} · ${s.session_now || '—'}`;
+
+  // ── Chart panel ──
+  document.getElementById('live-price').textContent =
+    s.price ? s.price.toFixed(s.pair === 'XAUUSD' ? 2 : 5) : '—';
+  document.getElementById('pair-label').textContent = s.pair || '—';
+  const biasCls = s.trend === 'BULLISH' ? 'var(--accent)'
+                : s.trend === 'BEARISH' ? 'var(--red)' : 'var(--muted)';
+  document.getElementById('bias-label').style.color = biasCls;
+  document.getElementById('bias-label').textContent = 'Bias: ' + (s.trend || '—');
+  const zoneCls = s.zone === 'DISCOUNT' ? 'var(--accent)'
+                : s.zone === 'PREMIUM'  ? 'var(--red)' : 'var(--muted)';
+  document.getElementById('zone-label').style.color = zoneCls;
+  document.getElementById('zone-label').textContent = 'Zone: ' + (s.zone || '—');
+  document.getElementById('score-label').textContent = 'Score: ' + (s.ob_score || 0) + '/100';
+
+  // ── Chart image refresh ──
+  const now = Date.now();
+  if (now - chartTs >= 1000) {
+    document.getElementById('chart-img').src = '/chart?t=' + now;
+    chartTs = now;
+    document.getElementById('refresh-badge').textContent = '⟳ ' + new Date().toLocaleTimeString();
+  }
+
+  // ── Stats panel ──
+  const bal = s.balance ? s.balance.toFixed(2) + ' ' + (s.account_currency || 'USD') : '—';
+  document.getElementById('s-balance').textContent = bal;
+  const pnl = s.total_pnl !== undefined ? (s.total_pnl >= 0 ? '+' : '') + s.total_pnl.toFixed(2) : '—';
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = pnl;
+  pnlEl.className = 'card-value ' + (s.total_pnl >= 0 ? 'green' : 'red');
+  document.getElementById('s-wins').textContent = s.wins !== undefined ? s.wins : '—';
+  document.getElementById('s-losses').textContent = s.losses !== undefined ? s.losses : '—';
+  document.getElementById('s-wr').textContent = s.winrate ? s.winrate + '%' : '—';
+  document.getElementById('s-open').textContent = s.open_contracts !== undefined ? s.open_contracts : '—';
+  document.getElementById('s-total').textContent = s.trades !== undefined ? s.trades : '—';
+  document.getElementById('s-session').textContent = s.session_now || '—';
+  document.getElementById('s-zone').textContent = s.zone || '—';
+  document.getElementById('s-atr').textContent = s.atr_ok ? '✅ OK' : '⚠️ LOW';
+  document.getElementById('s-atr').className = 'card-value ' + (s.atr_ok ? 'green' : 'red');
+  document.getElementById('s-score').textContent = (s.ob_score || 0) + '/100';
+
+  // Candle buffers
+  const setBar = (id, val) => {
+    document.getElementById(id).textContent = val;
+    document.getElementById('pb-' + id.replace('s-','')).style.width = Math.min(val / 10, 100) + '%';
+  };
+  setBar('s-h1', s.h1 || 0);
+  setBar('s-m15', s.m15 || 0);
+  setBar('s-m5', s.m5 || 0);
+  setBar('s-m1', s.m1 || 0);
+
+  // News
+  document.getElementById('s-news').textContent = s.next_red || 'No red news today ✅';
+  document.getElementById('s-news').style.color = s.next_red ? 'var(--red)' : 'var(--accent)';
+
+  // ── Drawer ──
+  const statusTxt = s.paused ? '⏸ PAUSED' : s.block_trading ? '🚫 ' + s.block_reason : '🟢 ACTIVE';
+  document.getElementById('drawer-status').textContent = statusTxt;
+  document.getElementById('drawer-status').style.color = s.paused || s.block_trading ? 'var(--red)' : 'var(--accent)';
+  document.getElementById('drawer-account').textContent =
+    `ID: ${s.account_id || '—'} | ${(s.account_type || '—').toUpperCase()} | Bal: ${bal}`;
+  document.getElementById('drawer-session').textContent = (s.session_now || '—') + ' Session';
+  document.getElementById('drawer-news').textContent = s.next_red || 'No red news ✅';
+
+  // ── Settings sync (only if no pending changes) ──
+  if (Object.keys(pendingSettings).length === 0) {
+    syncSettingsFromState(s);
+  }
+}
+
+function syncSettingsFromState(s) {
+  // Mode buttons
+  document.getElementById('btn-sniper').className  = 'btn-opt' + (s.mode === 'SNIPER'  ? ' active' : '');
+  document.getElementById('btn-scalper').className = 'btn-opt' + (s.mode === 'SCALPER' ? ' active' : '');
+
+  // Pair buttons
+  ['XAUUSD','EURUSD','GBPUSD','US100'].forEach(p => {
+    const btn = document.getElementById('btn-pair-' + p);
+    if (btn) btn.className = 'btn-opt' + (s.pair === p ? ' active' : '');
+  });
+
+  // Sliders
+  const riskPct = Math.round((s.risk_pct || 0.01) * 100);
+  document.getElementById('risk-slider').value = riskPct;
+  document.getElementById('risk-val').textContent = riskPct + '%';
+  document.getElementById('score-slider').value = s.min_score || 75;
+  document.getElementById('score-val').textContent = s.min_score || 75;
+
+  // Toggles
+  document.getElementById('small-acc-toggle').checked = !!s.small_acc;
+  document.getElementById('pause-toggle').checked = !s.paused;
+}
+
+// ══════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════
+function setSetting(key, val) {
+  pendingSettings[key] = val;
+  // Update button UI immediately
+  if (key === 'mode') {
+    document.getElementById('btn-sniper').className  = 'btn-opt' + (val === 'SNIPER'  ? ' active' : '');
+    document.getElementById('btn-scalper').className = 'btn-opt' + (val === 'SCALPER' ? ' active' : '');
+  }
+  if (key === 'pair') {
+    ['XAUUSD','EURUSD','GBPUSD','US100'].forEach(p => {
+      const btn = document.getElementById('btn-pair-' + p);
+      if (btn) btn.className = 'btn-opt' + (p === val ? ' active' : '');
+    });
+  }
+}
+
+async function saveSettings() {
+  // Also collect slider + toggle values
+  pendingSettings.risk_pct  = parseFloat(document.getElementById('risk-slider').value) / 100;
+  pendingSettings.min_score = parseInt(document.getElementById('score-slider').value);
+  pendingSettings.small_acc = document.getElementById('small-acc-toggle').checked;
+  pendingSettings.paused    = !document.getElementById('pause-toggle').checked;
+
+  const btn = document.getElementById('save-btn');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(pendingSettings)
+    });
+    if (r.ok) {
+      showToast('✅ Settings Applied!');
+      pendingSettings = {};
+    } else {
+      showToast('❌ Save failed');
+    }
+  } catch(e) {
+    showToast('❌ Network error');
+  }
+  btn.disabled = false;
+  btn.textContent = '💾 Apply Settings';
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// ══════════════════════════════════════════════
+// INIT & POLL LOOP
+// ══════════════════════════════════════════════
+fetchState();
+setInterval(fetchState, 1000);
+</script>
+</body>
+</html>"""
+
+
+async def api_state(req):
+    """JSON state endpoint used by the dashboard."""
+    wr = (f"{state.wins/(state.wins+state.losses)*100:.1f}"
+          if (state.wins + state.losses) > 0 else "0")
+    return web.json_response({
+        "version":          "5.3",
+        "status":           "running" if state.running else "stopped",
+        "paused":           state.paused,
+        "block_trading":    state.block_trading,
+        "block_reason":     state.block_reason,
+        "autonomous":       state.autonomous,
+        "mode":             state.trading_mode,
+        "min_score":        state.min_score,
+        "market_open":      is_market_open(),
+        "session":          get_session(),
+        "broker_connected": state.broker_connected,
+        "account_id":       state.account_id,
+        "account_type":     state.account_type,
+        "account_currency": state.account_currency,
+        "pair":             state.pair_key,
+        "symbol":           state.active_symbol,
+        "price":            state.current_price,
+        "trend":            state.trend_bias,
+        "zone":             state.premium_discount,
+        "session_now":      state.session_now,
+        "ob_score":         state.ob_score,
+        "atr_ok":           state.atr_filter_ok,
+        "balance":          state.account_balance,
+        "risk_pct":         state.risk_pct,
+        "small_acc":        state.small_acc_mode,
+        "trades":           state.trade_count,
+        "wins":             state.wins,
+        "losses":           state.losses,
+        "winrate":          wr,
+        "total_pnl":        state.total_pnl,
+        "open_contracts":   len(state.open_contracts),
+        "history":          len(state.trade_history),
+        "h1":               len(state.h1_candles),
+        "m15":              len(state.m15_candles),
+        "m5":               len(state.m5_candles),
+        "m1":               len(state.m1_candles),
+        "news_events":      len(state.news_events),
+        "next_red":         (state.next_red_event.title
+                             if state.next_red_event else None),
+        "gran_actual":      state.gran_actual,
+    })
+
+
+async def api_settings(req):
+    """
+    POST /api/settings — Apply settings from the Mini App dashboard.
+    Accepts JSON body with any subset of settable fields.
+    """
+    try:
+        data = await req.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+    changed = []
+
+    if "mode" in data:
+        m = str(data["mode"]).upper()
+        if m in ("SNIPER", "SCALPER"):
+            state.trading_mode = m
+            if m == "SNIPER":
+                state.min_score = 75
+                state.trend_tf  = "H1"
+                state.exec_tf   = "M15"
+                state.conf_tf   = "M5"
+            else:
+                state.min_score = 60
+                state.trend_tf  = "M15"
+                state.exec_tf   = "M5"
+                state.conf_tf   = "M1"
+            changed.append(f"mode={m}")
+
+    if "min_score" in data:
+        sc = int(data["min_score"])
+        if 30 <= sc <= 100:
+            state.min_score = sc
+            changed.append(f"min_score={sc}")
+
+    if "risk_pct" in data:
+        rp = float(data["risk_pct"])
+        if 0.001 <= rp <= 0.20:
+            state.risk_pct = rp
+            changed.append(f"risk_pct={rp}")
+
+    if "pair" in data:
+        pk = str(data["pair"]).upper()
+        if pk in PAIR_REGISTRY:
+            old_key = state.pair_key
+            state.pair_key = pk
+            state.small_acc_mode = False
+            # Trigger re-subscription asynchronously
+            if state.ws:
+                asyncio.ensure_future(subscribe_pair(pk))
+            changed.append(f"pair={pk}")
+
+    if "small_acc" in data:
+        state.small_acc_mode = bool(data["small_acc"])
+        if state.small_acc_mode and state.pair_key == "XAUUSD":
+            state.risk_pct = 0.02
+            state.tp1_r, state.tp2_r, state.tp3_r = 1.5, 3., 5.
+        elif not state.small_acc_mode:
+            state.risk_pct = 0.01
+            state.tp1_r, state.tp2_r, state.tp3_r = 2., 4., 6.
+        changed.append(f"small_acc={state.small_acc_mode}")
+
+    if "paused" in data:
+        state.paused = bool(data["paused"])
+        if not state.paused:
+            state.block_trading = False
+            state.block_reason  = ""
+        changed.append(f"paused={state.paused}")
+
+    log.info(f"⚙️ Settings via API: {', '.join(changed) if changed else 'no changes'}")
+    return web.json_response({"ok": True, "changed": changed})
+
+
+async def dashboard(req):
+    """Serve the Telegram Mini App dashboard HTML."""
+    return web.Response(text=_dashboard_html(), content_type="text/html")
+
+
+async def chart_route(req):
+    """Serve the latest chart PNG for the Mini App."""
+    # Try live chart first, fall back to entry/exit chart
+    for path in ("/tmp/sniper_chart_live.png",
+                 "/tmp/sniper_chart_entry.png",
+                 "/tmp/sniper_chart_exit.png",
+                 "/tmp/dashboard.png"):
+        p = Path(path)
+        if p.exists():
+            return web.FileResponse(p, headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            })
+    # No chart yet — return a minimal placeholder PNG
+    import base64
+    PLACEHOLDER = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+    return web.Response(
+        body=base64.b64decode(PLACEHOLDER),
+        content_type="image/png",
+        headers={"Cache-Control": "no-store"})
+
+
+async def health(req):
+    """Legacy /health endpoint — returns same JSON as /api/state."""
+    return await api_state(req)
+
+
 async def start_health():
     app = web.Application()
-    app.router.add_get("/",       health)
-    app.router.add_get("/health", health)
+    # Dashboard & chart routes
+    app.router.add_get("/",            dashboard)
+    app.router.add_get("/chart",       chart_route)
+    app.router.add_get("/api/state",   api_state)
+    app.router.add_post("/api/settings", api_settings)
+    # Legacy compatibility
+    app.router.add_get("/health",      health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info(f"Health :{PORT}")
+    log.info(f"🌐 Web dashboard: http://0.0.0.0:{PORT}/")
+    log.info(f"🖼  Chart route:   http://0.0.0.0:{PORT}/chart")
+    log.info(f"📡 API state:      http://0.0.0.0:{PORT}/api/state")
+    log.info(f"⚙️  API settings:  http://0.0.0.0:{PORT}/api/settings")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2346,9 +3229,9 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.2 · Multi-Strategy Auto    ║")
+    log.info("║  SMC SNIPER EA v5.3 · Mini App Dashboard     ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  [COMPLETE REWRITE — 3 BUGS FIXED FOREVER]  ║")
+    log.info("║  Web Dashboard | Settings API | Chart Route  ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
