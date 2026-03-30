@@ -625,33 +625,50 @@ def generate_chart(candles:deque, tf:str="M15",
     ar=fig.add_subplot(gs[2],sharex=am); al=fig.add_subplot(gs[3])
     for a in(am,av,ar,al): _ax_s(a)
 
-    # ── Candlestick rendering ──
-    # Compute a minimum body height in price units (0.5% of ATR) so doji
-    # candles are still visible — but do NOT use mean*factor which made every
-    # candle look the same height and all green.
-    atr_px = float(df["high"].max() - df["low"].min()) * 0.005
-    for i, row in df.iterrows():
-        is_bull = float(row["close"]) >= float(row["open"])
-        c  = BC if is_bull else RC               # green=bull, red=bear
-        bl = min(float(row["open"]), float(row["close"]))
-        bh = max(float(row["open"]), float(row["close"]))
-        body_h = max(bh - bl, atr_px)            # ensure doji still visible
-        # Wick
-        am.plot([i, i], [float(row["low"]), float(row["high"])],
-                color=c, lw=0.8, alpha=0.9)
-        # Body
-        am.add_patch(mpatches.FancyBboxPatch(
-            (i - 0.35, bl), 0.7, body_h,
-            boxstyle="square,pad=0", fc=c, ec=c, alpha=0.85))
+    # ── Candlestick rendering — using Rectangle in exact price coordinates ──
+    # FancyBboxPatch is NOT safe for financial charts: its padding is in
+    # display/axes units and distorts body sizes at high price values (e.g. 4500+).
+    # Rectangle(xy, width, height) works entirely in data coordinates.
+    price_range = float(df["high"].max() - df["low"].min())
+    # Minimum doji body: 3% of the visible price range so tiny candles still show
+    doji_min = price_range * 0.003 if price_range > 0 else 0.01
 
-    # ── Volume panel — use candle range as proxy (no real vol from Deriv) ──
-    vol_proxy = (df["high"] - df["low"]).values
+    bull_colors, bear_colors = [], []
+    for i, row in df.iterrows():
+        o  = float(row["open"])
+        h  = float(row["high"])
+        l  = float(row["low"])
+        c  = float(row["close"])
+        is_bull = c >= o
+        col     = BC if is_bull else RC
+
+        # Wick — thin line from low to high
+        am.plot([i, i], [l, h], color=col, lw=0.9, zorder=2)
+
+        # Body — Rectangle in data coordinates; no padding distortion
+        body_bot = min(o, c)
+        body_top = max(o, c)
+        body_h   = max(body_top - body_bot, doji_min)   # ensure doji visible
+        rect = mpatches.Rectangle(
+            (i - 0.38, body_bot),   # (x, y) bottom-left corner
+            0.76,                    # width
+            body_h,                  # height in price units
+            linewidth=0.5,
+            edgecolor=col,
+            facecolor=col,
+            alpha=0.9,
+            zorder=3,
+        )
+        am.add_patch(rect)
+
+    # ── Volume panel — candle range as proxy (Deriv candles have no tick vol) ──
+    vol_proxy = (df["high"] - df["low"]).astype(float).values
     vol_max   = vol_proxy.max() if vol_proxy.max() > 0 else 1.0
     for i, row in df.iterrows():
         is_bull = float(row["close"]) >= float(row["open"])
         av.bar(i, vol_proxy[i] / vol_max,
-               color=BC if is_bull else RC, alpha=0.5, width=0.7)
-    av.set_ylim(0, 1.2)
+               color=BC if is_bull else RC, alpha=0.55, width=0.7)
+    av.set_ylim(0, 1.3)
     av.set_ylabel("Vol", color="#555d68", fontsize=6)
 
     rs=_rsi_calc(df["close"].values)
@@ -726,16 +743,16 @@ def generate_chart(candles:deque, tf:str="M15",
                 am.text(ci,df["high"].max(),"🔴",fontsize=8,ha="center"); break
 
     # ── Swing point markers ──
-    # ▲ green ABOVE swing highs (resistance), ▼ red BELOW swing lows (support)
-    swh, swl = _swing_pts(df)
-    price_range = df["high"].max() - df["low"].min()
-    marker_pad  = price_range * 0.012   # 1.2% of visible range
+    # n=8: only mark highs/lows that are the extreme over ±8 candles each side
+    # This prevents every bar being marked. ▼ red above swing highs, ▲ green below swing lows.
+    swh, swl = _swing_pts(df, n=8)
+    marker_pad = price_range * 0.008   # 0.8% offset so markers clear the wick
     for i in swh:
         am.plot(i, df.iloc[i]["high"] + marker_pad,
-                "v", color=RC, ms=5, alpha=0.7)   # ▼ red at swing HIGH (sell-side)
+                "v", color=RC, ms=6, alpha=0.85, zorder=5)
     for i in swl:
-        am.plot(i, df.iloc[i]["low"]  - marker_pad,
-                "^", color=BC, ms=5, alpha=0.7)   # ▲ green at swing LOW  (buy-side)
+        am.plot(i, df.iloc[i]["low"] - marker_pad,
+                "^", color=BC, ms=6, alpha=0.85, zorder=5)
 
     tc_=BC if state.trend_bias=="BULLISH" else(RC if state.trend_bias=="BEARISH" else "#90a4ae")
     tl={"live":"📡 LIVE","entry":"🎯 ENTRY","exit":"🏁 CLOSED"}.get(chart_type,"")
@@ -769,13 +786,13 @@ def generate_chart(candles:deque, tf:str="M15",
                 fontsize=7,va="top",fontfamily="monospace",color="#cdd9e5",
                 bbox=dict(boxstyle="round,pad=.3",fc="#161b22",ec="#30363d",alpha=.85))
 
-    # ── Price-axis Y limits: guard against flat-line (min == max) ──
-    price_min = df["low"].min()
-    price_max = df["high"].max()
-    if price_min == price_max:
+    # ── Price-axis Y limits ──
+    price_min = float(df["low"].min())
+    price_max = float(df["high"].max())
+    if price_range == 0:
         am.set_ylim(price_min - 1.0, price_max + 1.0)
     else:
-        pad = (price_max - price_min) * 0.10
+        pad = price_range * 0.12   # 12% breathing room so markers don't clip
         am.set_ylim(price_min - pad, price_max + pad)
 
     plt.setp(am.get_xticklabels(),visible=False)
