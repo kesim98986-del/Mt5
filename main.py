@@ -298,12 +298,21 @@ def time_to_next_open() -> str:
     return f"{h}h {m}m"
 
 def get_session() -> str:
+    """Return the current Forex session based on UTC hour.
+    Covers all 24 hours with no gaps:
+      00–06  → ASIA
+      07–11  → LONDON
+      12–15  → OVERLAP  (London/NY overlap — highest liquidity)
+      16–16  → NY       (post-overlap NY only)
+      17–21  → CLOSE
+      22–23  → ASIA     (early Tokyo / Sunday open)
+    """
     h = datetime.now(UTC).hour
-    if  0 <= h < 7:  return "ASIA"
+    if  0 <= h <  7: return "ASIA"
     if  7 <= h < 12: return "LONDON"
     if 12 <= h < 16: return "OVERLAP"
-    if 12 <= h < 17: return "NY"
-    return "CLOSE"
+    if 16 <= h < 22: return "NY"
+    return "ASIA"   # 22–23: Tokyo/Sydney pre-open counts as Asian session
 
 def market_header() -> str:
     if is_market_open():
@@ -742,6 +751,17 @@ def generate_chart(candles:deque, tf:str="M15",
         am.text(.01,.98,box_txt,transform=am.transAxes,
                 fontsize=7,va="top",fontfamily="monospace",color="#cdd9e5",
                 bbox=dict(boxstyle="round,pad=.3",fc="#161b22",ec="#30363d",alpha=.85))
+
+    # ── Price-axis Y limits: guard against flat-line (min == max) ──
+    price_min = df["low"].min()
+    price_max = df["high"].max()
+    if price_min == price_max:
+        # Perfectly sideways market — add absolute padding so the line isn't invisible
+        am.set_ylim(price_min - 1.0, price_max + 1.0)
+    else:
+        # Normal price movement — add 10 % breathing room above and below
+        pad = (price_max - price_min) * 0.10
+        am.set_ylim(price_min - pad, price_max + pad)
 
     plt.setp(am.get_xticklabels(),visible=False)
     plt.setp(av.get_xticklabels(),visible=False)
