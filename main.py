@@ -579,13 +579,10 @@ async def news_block_monitor():
                 state.block_trading = True
                 state.block_reason  = reason
                 log.info(f"🚫 BLOCKED: {reason}")
-                # Routine Telegram notifications are disabled to prevent spam.
-                # Block alerts are only available directly via Telegram commands or server console logs.
             elif not block and state.block_trading:
                 state.block_trading = False
                 state.block_reason  = ""
                 log.info("✅ UNBLOCKED")
-                # Routine Telegram notifications are disabled to prevent spam.
         except Exception as e:
             log.error(f"news_block_monitor: {e}")
         await asyncio.sleep(60)
@@ -642,7 +639,7 @@ def generate_chart(candles:deque, tf:str="M15",
     price_min = df["low"].min()
     price_max = df["high"].max()
     
-    # FIX: Y-axis scaling with exactly 15% padding or ±1.0 if min==max
+    # Chart Scaling/Zoom Fix: Updated Y-axis logic
     if price_min == price_max:
         # If min and max are the same, add ±1.0 padding
         pad = 1.0
@@ -656,7 +653,7 @@ def generate_chart(candles:deque, tf:str="M15",
     bull_idx = [i for i in xs if df.loc[i,"close"] >= df.loc[i,"open"]]
     bear_idx = [i for i in xs if df.loc[i,"close"]  < df.loc[i,"open"]]
 
-    # ── WICKS via LineCollection (guaranteed correct at any price level) ──
+    # ── WICKS via LineCollection ──
     def _wick_segs(idx):
         return [[(i, df.loc[i,"low"]), (i, df.loc[i,"high"])] for i in idx]
     if bull_idx:
@@ -666,10 +663,8 @@ def generate_chart(candles:deque, tf:str="M15",
         am.add_collection(mc.LineCollection(_wick_segs(bear_idx),
                           colors=RC, linewidths=1.0, zorder=2))
 
-    # ── BODIES via ax.bar() — native data coordinates, immune to transform bugs ──
-    # Minimum doji height = 20% of median body so tiny candles stay visible
+    # ── BODIES via ax.bar() ──
     bodies   = df.apply(lambda r: abs(r["close"]-r["open"]), axis=1)
-    # Use price_range for doji_min calculation (handle same min/max case)
     actual_range = price_max - price_min if price_max != price_min else 1.0
     doji_min = max(bodies.median()*0.20, actual_range*0.0005)
 
@@ -683,7 +678,7 @@ def generate_chart(candles:deque, tf:str="M15",
     if bear_idx: am.bar(bear_idx, bear_h, bottom=bear_bot,
                         color=RC, width=0.7, alpha=0.95, zorder=3)
 
-    # ── Axes limits (set AFTER bar so autoscale doesn't fight us) ──
+    # ── Axes limits (set AFTER bar) ──
     am.set_xlim(-1, len(df)+1)
     am.set_ylim(price_min - pad, price_max + pad)
 
@@ -694,7 +689,7 @@ def generate_chart(candles:deque, tf:str="M15",
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         am.plot(xs, ema50.values, color="#78909c", lw=1.0, ls="--", alpha=0.6, label="EMA50")
 
-    # ── Volume (candle range as proxy — Deriv provides no tick volume) ──
+    # ── Volume ──
     vol  = (df["high"] - df["low"]).values
     vmax = vol.max() if vol.max() > 0 else 1.0
     if bull_idx: av.bar(bull_idx, [vol[i]/vmax for i in bull_idx],
@@ -782,9 +777,8 @@ def generate_chart(candles:deque, tf:str="M15",
                 am.text(ci, price_max + pad*0.4, "🔴", fontsize=8, ha="center")
                 break
 
-    # ── Swing pivots — n=8 so only real significant highs/lows are marked ──
+    # ── Swing pivots ──
     swh, swl = _swing_pts(df, n=8)
-    # Use actual_range for marker positioning
     mp = actual_range * 0.007
     for i in swh:
         am.plot(i, df.loc[i,"high"]+mp, "v", color="#ff9800", ms=7, alpha=0.9, zorder=6)
@@ -987,7 +981,6 @@ def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type
     if ob and disp>=2.0:
         s+=10; reasons.append(f"Disp{disp:.1f}x +10")
 
-    # Independent checks — NOT elif
     if struct_type=="BOS":
         s+=10; reasons.append("BOS +10")
     if struct_type=="CHoCH":
@@ -1079,7 +1072,7 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     reason.fvg_present=fvg_ is not None
     reason.session    =session
     reason.atr_state  =f"{'✅ OK' if atr_ok else '⚠️ LOW'} ({atr_v:.5f})"
-    reason.ema_confirm=f"Price {'above' if price>ema50 else 'below'}) ✅"
+    reason.ema_confirm=f"Price {'above' if price>ema50 else 'below'} EMA50 ✅"
     reason.rsi_level  =rsi_now
     reason.candle_conf=f"{'Bullish' if candle_ok and bias=='BULLISH' else 'Bearish'} close ✅"
     reason.score      =sc
@@ -1122,9 +1115,6 @@ def check_trade_mgmt():
         if not info["be_moved"]:
             if(d=="BUY" and p>=sig["tp1"]) or(d=="SELL" and p<=sig["tp1"]):
                 info["be_moved"]=True; sig["sl"]=sig["entry"]
-                # Routine telegram disabled
-                # asyncio.ensure_future(tg_async(
-                #     f"✅ *BreakEven* `{cid}`\nSL → Entry `{sig['entry']}`"))
         # Trailing stop
         buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
         if len(buf)>=10:
@@ -1337,14 +1327,14 @@ async def handle_msg(msg:dict):
         log.warning(f"API: {msg['error'].get('message','?')}")
 
 # ══════════════════════════════════════════════════════════════════════
-# SILENT BACKGROUND SCANNER (NO TELEGRAM SPAM)
+# SILENT BACKGROUND SCANNER (ANTI-SPAM APPLIED)
 # ══════════════════════════════════════════════════════════════════════
 async def chart_loop():
     """
     Background scanner loop.
-    DISABLED: Periodic Telegram chart/status updates.
-    KEPT ACTIVE: Console logging for monitoring.
-    Charts are only sent when trades are EXECUTED or CLOSED.
+    TELEGRAM PERIODIC UPDATES DISABLED (Anti-Spam).
+    The bot ONLY sends Telegram alerts when a trade is EXECUTED or CLOSED.
+    All console logging remains active.
     """
     await asyncio.sleep(50)
     while state.running:
@@ -1366,16 +1356,8 @@ async def chart_loop():
                     f"Signal:{'✅ ' + sig['direction'] if sig else '—'}"
                 )
 
-                # ══════════════════════════════════════════════════════════════
-                # TELEGRAM PERIODIC UPDATES DISABLED (Anti-Spam)
-                # The following code is commented out to prevent routine
-                # chart/status messages from being sent to Telegram every minute.
-                # Telegram alerts are ONLY sent when trades are EXECUTED or CLOSED.
-                # ══════════════════════════════════════════════════════════════
-                # buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
-                # chart = generate_chart(buf_for_chart, state.exec_tf, chart_type="live")
-                # if chart:
-                #     await tg_async(f"📡 Periodic status update...", photo_path=chart)
+                # TELEGRAM PERIODIC UPDATES COMMENTED OUT (Anti-Spam Fix)
+                # Only trade entry/exit notifications are sent.
         except Exception as e:
             log.error(f"chart_loop: {e}")
         await asyncio.sleep(CHART_INTERVAL)
@@ -1601,7 +1583,7 @@ async def _cmd(cmd:str):
         if nxt and nxt.dt_utc:
             ny_t=nxt.dt_utc.astimezone(NY_TZ).strftime("%I:%M%p ET")
             mins=int((nxt.dt_utc-datetime.now(UTC)).total_seconds()//60)
-            ni=f"\n\n🔴 Next Red: *{nxt.title}* @ `{ny_t}` (~{mins}m away)"
+            ni=f"\n\n🔴 Next Red: *{nxt.title}* @ `{ny_t}` (\~{mins}m away)"
         bl_s,bl_r=_news_block()
         bi=f"\n\n{bl_r}" if bl_s else"\n\n✅ No active news block."
         await tg_async(
