@@ -625,43 +625,46 @@ def generate_chart(candles:deque, tf:str="M15",
     ar=fig.add_subplot(gs[2],sharex=am); al=fig.add_subplot(gs[3])
     for a in(am,av,ar,al): _ax_s(a)
 
-    # ── Candlestick rendering — using Rectangle in exact price coordinates ──
-    # FancyBboxPatch is NOT safe for financial charts: its padding is in
-    # display/axes units and distorts body sizes at high price values (e.g. 4500+).
-    # Rectangle(xy, width, height) works entirely in data coordinates.
-    price_range = float(df["high"].max() - df["low"].min())
-    # Minimum doji body: 3% of the visible price range so tiny candles still show
-    doji_min = price_range * 0.003 if price_range > 0 else 0.01
+    # ══ STEP 1: lock axes limits BEFORE any patches ══
+    # Patches are positioned in data coords at add_patch time.
+    # If set_ylim is called AFTER, the axes transform recomputes and all
+    # body rectangles shift — producing the oversized/all-same-color bug.
+    price_min   = float(df["low"].min())
+    price_max   = float(df["high"].max())
+    price_range = (price_max - price_min) if price_max != price_min else 1.0
+    pad         = price_range * 0.12
+    am.set_xlim(-1, len(df))
+    am.set_ylim(price_min - pad, price_max + pad)
 
-    bull_colors, bear_colors = [], []
+    # doji_min: 30% of the median real body — keeps tiny doji visible without
+    # inflating normal candles. Using a fraction of the full 80-candle range
+    # was the previous bug (range=10 → doji_min=0.03 → every small body blown up).
+    typical_body = float(
+        df.apply(lambda r: abs(float(r["close"]) - float(r["open"])), axis=1).median()
+    )
+    doji_min = max(typical_body * 0.30, price_range * 0.0008)
+
+    # ══ STEP 2: draw candles after limits are locked ══
     for i, row in df.iterrows():
-        o  = float(row["open"])
-        h  = float(row["high"])
-        l  = float(row["low"])
-        c  = float(row["close"])
+        o   = float(row["open"])
+        h   = float(row["high"])
+        l   = float(row["low"])
+        c   = float(row["close"])
         is_bull = c >= o
-        col     = BC if is_bull else RC
+        col = BC if is_bull else RC
 
-        # Wick — thin line from low to high
+        # Wick: thin vertical line low → high
         am.plot([i, i], [l, h], color=col, lw=0.9, zorder=2)
 
-        # Body — Rectangle in data coordinates; no padding distortion
+        # Body: Rectangle in exact price coordinates, zero linewidth
         body_bot = min(o, c)
-        body_top = max(o, c)
-        body_h   = max(body_top - body_bot, doji_min)   # ensure doji visible
-        rect = mpatches.Rectangle(
-            (i - 0.38, body_bot),   # (x, y) bottom-left corner
-            0.76,                    # width
-            body_h,                  # height in price units
-            linewidth=0.5,
-            edgecolor=col,
-            facecolor=col,
-            alpha=0.9,
-            zorder=3,
-        )
-        am.add_patch(rect)
+        body_h   = max(abs(c - o), doji_min)
+        am.add_patch(mpatches.Rectangle(
+            (i - 0.38, body_bot), 0.76, body_h,
+            linewidth=0, facecolor=col, edgecolor=col, alpha=0.9, zorder=3,
+        ))
 
-    # ── Volume panel — candle range as proxy (Deriv candles have no tick vol) ──
+    # ── Volume panel — candle range as proxy (Deriv candles carry no tick vol) ──
     vol_proxy = (df["high"] - df["low"]).astype(float).values
     vol_max   = vol_proxy.max() if vol_proxy.max() > 0 else 1.0
     for i, row in df.iterrows():
@@ -785,15 +788,6 @@ def generate_chart(candles:deque, tf:str="M15",
         am.text(.01,.98,box_txt,transform=am.transAxes,
                 fontsize=7,va="top",fontfamily="monospace",color="#cdd9e5",
                 bbox=dict(boxstyle="round,pad=.3",fc="#161b22",ec="#30363d",alpha=.85))
-
-    # ── Price-axis Y limits ──
-    price_min = float(df["low"].min())
-    price_max = float(df["high"].max())
-    if price_range == 0:
-        am.set_ylim(price_min - 1.0, price_max + 1.0)
-    else:
-        pad = price_range * 0.12   # 12% breathing room so markers don't clip
-        am.set_ylim(price_min - pad, price_max + pad)
 
     plt.setp(am.get_xticklabels(),visible=False)
     plt.setp(av.get_xticklabels(),visible=False)
