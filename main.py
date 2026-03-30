@@ -625,17 +625,34 @@ def generate_chart(candles:deque, tf:str="M15",
     ar=fig.add_subplot(gs[2],sharex=am); al=fig.add_subplot(gs[3])
     for a in(am,av,ar,al): _ax_s(a)
 
-    for i,row in df.iterrows():
-        c=BC if row["close"]>=row["open"] else RC
-        bl=min(row["open"],row["close"]); bh=max(row["open"],row["close"])
-        am.plot([i,i],[row["low"],row["high"]],color=c,lw=0.8,alpha=0.9)
+    # ── Candlestick rendering ──
+    # Compute a minimum body height in price units (0.5% of ATR) so doji
+    # candles are still visible — but do NOT use mean*factor which made every
+    # candle look the same height and all green.
+    atr_px = float(df["high"].max() - df["low"].min()) * 0.005
+    for i, row in df.iterrows():
+        is_bull = float(row["close"]) >= float(row["open"])
+        c  = BC if is_bull else RC               # green=bull, red=bear
+        bl = min(float(row["open"]), float(row["close"]))
+        bh = max(float(row["open"]), float(row["close"]))
+        body_h = max(bh - bl, atr_px)            # ensure doji still visible
+        # Wick
+        am.plot([i, i], [float(row["low"]), float(row["high"])],
+                color=c, lw=0.8, alpha=0.9)
+        # Body
         am.add_patch(mpatches.FancyBboxPatch(
-            (i-.35,bl),.7,max(bh-bl,df["close"].mean()*.00005),
-            boxstyle="square,pad=0",fc=c,ec=c,alpha=0.85))
+            (i - 0.35, bl), 0.7, body_h,
+            boxstyle="square,pad=0", fc=c, ec=c, alpha=0.85))
 
-    for i,row in df.iterrows():
-        av.bar(i,1,color=BC if row["close"]>=row["open"] else RC,alpha=0.4,width=.7)
-    av.set_ylabel("Vol",color="#555d68",fontsize=6)
+    # ── Volume panel — use candle range as proxy (no real vol from Deriv) ──
+    vol_proxy = (df["high"] - df["low"]).values
+    vol_max   = vol_proxy.max() if vol_proxy.max() > 0 else 1.0
+    for i, row in df.iterrows():
+        is_bull = float(row["close"]) >= float(row["open"])
+        av.bar(i, vol_proxy[i] / vol_max,
+               color=BC if is_bull else RC, alpha=0.5, width=0.7)
+    av.set_ylim(0, 1.2)
+    av.set_ylabel("Vol", color="#555d68", fontsize=6)
 
     rs=_rsi_calc(df["close"].values)
     ar.plot(range(len(rs)),rs,color="#90a4ae",lw=0.9)
@@ -708,9 +725,17 @@ def generate_chart(candles:deque, tf:str="M15",
                 am.axvline(ci,color=RC,lw=1.,ls="--",alpha=.5)
                 am.text(ci,df["high"].max(),"🔴",fontsize=8,ha="center"); break
 
-    swh,swl=_swing_pts(df)
-    for i in swh: am.plot(i,df.iloc[i]["high"]*1.00015,"^",color=BC,ms=4,alpha=.5)
-    for i in swl: am.plot(i,df.iloc[i]["low"]*0.99985, "v",color=RC,ms=4,alpha=.5)
+    # ── Swing point markers ──
+    # ▲ green ABOVE swing highs (resistance), ▼ red BELOW swing lows (support)
+    swh, swl = _swing_pts(df)
+    price_range = df["high"].max() - df["low"].min()
+    marker_pad  = price_range * 0.012   # 1.2% of visible range
+    for i in swh:
+        am.plot(i, df.iloc[i]["high"] + marker_pad,
+                "v", color=RC, ms=5, alpha=0.7)   # ▼ red at swing HIGH (sell-side)
+    for i in swl:
+        am.plot(i, df.iloc[i]["low"]  - marker_pad,
+                "^", color=BC, ms=5, alpha=0.7)   # ▲ green at swing LOW  (buy-side)
 
     tc_=BC if state.trend_bias=="BULLISH" else(RC if state.trend_bias=="BEARISH" else "#90a4ae")
     tl={"live":"📡 LIVE","entry":"🎯 ENTRY","exit":"🏁 CLOSED"}.get(chart_type,"")
@@ -907,7 +932,6 @@ def _get_trend(tf_name: str)->str:
 def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type,disp)->tuple:
     s=0; reasons=[]
 
-    # ── SMC confluence ──
     if fvg:
         s+=20; reasons.append("FVG +20")
     if trap and trap.get("swept"):
@@ -917,27 +941,21 @@ def sniper_score(ob,fvg,trap,idm,rsi,session,atr_ok,ema_ok,candle_ok,struct_type
     if ob and disp>=2.0:
         s+=10; reasons.append(f"Disp{disp:.1f}x +10")
 
-    # ── Structure — independent checks, not elif ──
+    # Independent checks — NOT elif
     if struct_type=="BOS":
         s+=10; reasons.append("BOS +10")
     if struct_type=="CHoCH":
         s+=8;  reasons.append("CHoCH +8")
 
-    # ── Session — independent checks, not elif ──
     if session=="OVERLAP":
         s+=10; reasons.append("Overlap +10")
     if session in("LONDON","NY"):
         s+=7;  reasons.append(f"{session} +7")
 
-    # ── Technical filters ──
-    if atr_ok:
-        s+=5;  reasons.append("ATR✅ +5")
-    if ema_ok:
-        s+=5;  reasons.append("EMA✅ +5")
-    if candle_ok:
-        s+=5;  reasons.append("Candle✅ +5")
+    if atr_ok:    s+=5; reasons.append("ATR✅ +5")
+    if ema_ok:    s+=5; reasons.append("EMA✅ +5")
+    if candle_ok: s+=5; reasons.append("Candle✅ +5")
 
-    # ── RSI confluence ──
     if ob:
         if ob["type"]=="BULL" and rsi<40:
             s+=5; reasons.append(f"RSI{rsi:.0f}(OS) +5")
@@ -967,11 +985,9 @@ def compute_signal(tf:str="M15") -> Optional[dict]:
     if bias=="BEARISH" and pd_zone!="PREMIUM":  return None
 
     idm=_idm(df,bias); state.active_idm=idm
-    # IDM must exist but swept is preferred, not mandatory — score rewards it
     if idm is None: return None
 
     trap=_equal_hl(df); state.active_trap=trap
-    # Trap is bonus confluence — don't hard-block if absent
     if trap is not None:
         if trap["side"]!=("BUY" if bias=="BULLISH" else "SELL"):
             trap=None; state.active_trap=None
@@ -1286,7 +1302,6 @@ async def chart_loop():
     while state.running:
         try:
             if state.current_price > 0 and len(state.m15_candles) >= 20:
-                # Run a live background scan so state.ob_score, trend_bias, etc. stay fresh
                 try:
                     sig = compute_signal(state.exec_tf)
                 except Exception as e:
@@ -1303,7 +1318,6 @@ async def chart_loop():
                     f"Signal:{'✅ ' + sig['direction'] if sig else '—'}"
                 )
 
-                # Send a periodic chart to Telegram every interval
                 buf_for_chart = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
                 chart = generate_chart(buf_for_chart, state.exec_tf, chart_type="live")
                 if chart:
@@ -1328,7 +1342,6 @@ async def trading_loop():
     await asyncio.sleep(35)
     while state.running:
         try:
-            # ── Guard checks with explicit logging ──
             if state.paused:
                 await asyncio.sleep(30); continue
             if state.block_trading:
@@ -1354,7 +1367,6 @@ async def trading_loop():
                 log.info(f"⏳ Cooldown: {int(cooldown_left)}s remaining")
                 await asyncio.sleep(30); continue
 
-            # ── Candle data check ──
             buf_lens = (len(state.h1_candles), len(state.m15_candles),
                         len(state.m5_candles), len(state.m1_candles))
             log.info(
@@ -1367,8 +1379,7 @@ async def trading_loop():
             if sig is None:
                 log.info(
                     f"🔎 No signal — Bias:{state.trend_bias} Zone:{state.premium_discount} "
-                    f"Score:{state.ob_score}/100 Sess:{state.session_now} "
-                    f"ATR_ok:{state.atr_filter_ok}"
+                    f"Score:{state.ob_score}/100 Sess:{state.session_now} ATR_ok:{state.atr_filter_ok}"
                 )
             if sig:
                 sig_conf = compute_signal(state.conf_tf)
@@ -1380,7 +1391,6 @@ async def trading_loop():
                         entry_price=sig["entry"], direction=sig["direction"],
                         chart_type="entry", reason=reason)
                     score_txt = " + ".join(sig.get("score_reasons", [])[:5])
-
                     md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
                     await tg_async(
                         f"🚀 *{md_lbl} ENTRY — {state.pair_display}*\n"
@@ -1395,15 +1405,12 @@ async def trading_loop():
                         f"Stake: `{sig['stake']:.2f} {state.account_currency}`"
                         f"{'  💎' if state.small_acc_mode else ''}",
                         photo_path=chart)
-
                     cid = await open_contract(sig["direction"], sig["stake"])
                     if cid:
                         state.last_trade_ts = time.time()
                 else:
                     conf_dir = sig_conf["direction"] if sig_conf else "None"
-                    log.info(
-                        f"⚠️ Confirmation failed — exec:{sig['direction']} conf:{conf_dir}"
-                    )
+                    log.info(f"⚠️ Confirmation failed — exec:{sig['direction']} conf:{conf_dir}")
         except Exception as e:
             log.error(f"trading_loop: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(30)
