@@ -20,9 +20,10 @@ from zoneinfo    import ZoneInfo
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.gridspec as gridspec
-import matplotlib.patches  as mpatches
-import matplotlib.pyplot   as plt
+import matplotlib.collections as mc
+import matplotlib.gridspec    as gridspec
+import matplotlib.patches     as mpatches
+import matplotlib.pyplot      as plt
 import numpy  as np
 import pandas as pd
 import requests
@@ -616,185 +617,203 @@ def generate_chart(candles:deque, tf:str="M15",
                    direction:str=None, pnl:float=None,
                    chart_type:str="live", reason:TradeReason=None) -> Optional[str]:
     if len(candles)<20: return None
-    df=pd.DataFrame(list(candles)[-80:])
-    df.columns=["time","open","high","low","close"]
-    df.reset_index(drop=True,inplace=True)
-    fig=plt.figure(figsize=(16,10),facecolor=BG)
-    gs=gridspec.GridSpec(4,1,figure=fig,hspace=0.05,height_ratios=[4,.6,.6,.6])
-    am=fig.add_subplot(gs[0]); av=fig.add_subplot(gs[1],sharex=am)
-    ar=fig.add_subplot(gs[2],sharex=am); al=fig.add_subplot(gs[3])
-    for a in(am,av,ar,al): _ax_s(a)
+    df = pd.DataFrame(list(candles)[-80:])
+    df.columns = ["time","open","high","low","close"]
+    df = df.astype({"open":float,"high":float,"low":float,"close":float})
+    df.reset_index(drop=True, inplace=True)
 
-    # ══ STEP 1: lock axes limits BEFORE any patches ══
-    # Patches are positioned in data coords at add_patch time.
-    # If set_ylim is called AFTER, the axes transform recomputes and all
-    # body rectangles shift — producing the oversized/all-same-color bug.
-    price_min   = float(df["low"].min())
-    price_max   = float(df["high"].max())
+    # ── Layout: price | volume | RSI | info bar ──
+    fig = plt.figure(figsize=(16,10), facecolor=BG)
+    gs  = gridspec.GridSpec(4,1, figure=fig, hspace=0.04,
+                            height_ratios=[5, 0.9, 1.0, 0.4])
+    am = fig.add_subplot(gs[0])
+    av = fig.add_subplot(gs[1], sharex=am)
+    ar = fig.add_subplot(gs[2], sharex=am)
+    al = fig.add_subplot(gs[3])
+    for a in (am,av,ar,al): _ax_s(a)
+
+    # ── Pre-compute metrics ──
+    price_min   = df["low"].min()
+    price_max   = df["high"].max()
     price_range = (price_max - price_min) if price_max != price_min else 1.0
-    pad         = price_range * 0.12
-    am.set_xlim(-1, len(df))
+    pad         = price_range * 0.13
+    xs          = list(range(len(df)))
+
+    bull_idx = [i for i in xs if df.loc[i,"close"] >= df.loc[i,"open"]]
+    bear_idx = [i for i in xs if df.loc[i,"close"] <  df.loc[i,"open"]]
+
+    # ── WICKS via LineCollection (guaranteed correct at any price level) ──
+    def _wick_segs(idx):
+        return [[(i, df.loc[i,"low"]), (i, df.loc[i,"high"])] for i in idx]
+    if bull_idx:
+        am.add_collection(mc.LineCollection(_wick_segs(bull_idx),
+                          colors=BC, linewidths=1.0, zorder=2))
+    if bear_idx:
+        am.add_collection(mc.LineCollection(_wick_segs(bear_idx),
+                          colors=RC, linewidths=1.0, zorder=2))
+
+    # ── BODIES via ax.bar() — native data coordinates, immune to transform bugs ──
+    # Minimum doji height = 20% of median body so tiny candles stay visible
+    bodies     = df.apply(lambda r: abs(r["close"]-r["open"]), axis=1)
+    doji_min   = max(bodies.median()*0.20, price_range*0.0005)
+
+    bull_bot = [min(df.loc[i,"open"], df.loc[i,"close"]) for i in bull_idx]
+    bull_h   = [max(abs(df.loc[i,"close"]-df.loc[i,"open"]), doji_min) for i in bull_idx]
+    bear_bot = [min(df.loc[i,"open"], df.loc[i,"close"]) for i in bear_idx]
+    bear_h   = [max(abs(df.loc[i,"close"]-df.loc[i,"open"]), doji_min) for i in bear_idx]
+
+    if bull_idx: am.bar(bull_idx, bull_h, bottom=bull_bot,
+                        color=BC, width=0.7, alpha=0.95, zorder=3)
+    if bear_idx: am.bar(bear_idx, bear_h, bottom=bear_bot,
+                        color=RC, width=0.7, alpha=0.95, zorder=3)
+
+    # ── Axes limits (set AFTER bar so autoscale doesn't fight us) ──
+    am.set_xlim(-1, len(df)+1)
     am.set_ylim(price_min - pad, price_max + pad)
 
-    # doji_min: 30% of the median real body — keeps tiny doji visible without
-    # inflating normal candles. Using a fraction of the full 80-candle range
-    # was the previous bug (range=10 → doji_min=0.03 → every small body blown up).
-    typical_body = float(
-        df.apply(lambda r: abs(float(r["close"]) - float(r["open"])), axis=1).median()
-    )
-    doji_min = max(typical_body * 0.30, price_range * 0.0008)
+    # ── EMA 21 + EMA 50 ──
+    ema21 = df["close"].ewm(span=21, adjust=False).mean()
+    am.plot(xs, ema21.values, color="#ffeb3b", lw=1.2, alpha=0.75, label="EMA21")
+    if len(df) >= 52:
+        ema50 = df["close"].ewm(span=50, adjust=False).mean()
+        am.plot(xs, ema50.values, color="#78909c", lw=1.0, ls="--", alpha=0.6, label="EMA50")
 
-    # ══ STEP 2: draw candles after limits are locked ══
-    for i, row in df.iterrows():
-        o   = float(row["open"])
-        h   = float(row["high"])
-        l   = float(row["low"])
-        c   = float(row["close"])
-        is_bull = c >= o
-        col = BC if is_bull else RC
-
-        # Wick: thin vertical line low → high
-        am.plot([i, i], [l, h], color=col, lw=0.9, zorder=2)
-
-        # Body: Rectangle in exact price coordinates, zero linewidth
-        body_bot = min(o, c)
-        body_h   = max(abs(c - o), doji_min)
-        am.add_patch(mpatches.Rectangle(
-            (i - 0.38, body_bot), 0.76, body_h,
-            linewidth=0, facecolor=col, edgecolor=col, alpha=0.9, zorder=3,
-        ))
-
-    # ── Volume panel — candle range as proxy (Deriv candles carry no tick vol) ──
-    vol_proxy = (df["high"] - df["low"]).astype(float).values
-    vol_max   = vol_proxy.max() if vol_proxy.max() > 0 else 1.0
-    for i, row in df.iterrows():
-        is_bull = float(row["close"]) >= float(row["open"])
-        av.bar(i, vol_proxy[i] / vol_max,
-               color=BC if is_bull else RC, alpha=0.55, width=0.7)
-    av.set_ylim(0, 1.3)
+    # ── Volume (candle range as proxy — Deriv provides no tick volume) ──
+    vol   = (df["high"] - df["low"]).values
+    vmax  = vol.max() if vol.max() > 0 else 1.0
+    if bull_idx: av.bar(bull_idx, [vol[i]/vmax for i in bull_idx],
+                        color=BC, alpha=0.6, width=0.7)
+    if bear_idx: av.bar(bear_idx, [vol[i]/vmax for i in bear_idx],
+                        color=RC, alpha=0.6, width=0.7)
+    av.set_ylim(0, 1.4)
     av.set_ylabel("Vol", color="#555d68", fontsize=6)
 
-    rs=_rsi_calc(df["close"].values)
-    ar.plot(range(len(rs)),rs,color="#90a4ae",lw=0.9)
-    ar.axhline(70,color=RC,lw=.5,ls="--",alpha=.5)
-    ar.axhline(50,color=GR,lw=.4,alpha=.5)
-    ar.axhline(30,color=BC,lw=.5,ls="--",alpha=.5)
-    ar.set_ylim(0,100); ar.set_ylabel("RSI",color="#555d68",fontsize=6)
+    # ── RSI ──
+    rsi = _rsi_calc(df["close"].values)
+    ar.plot(xs, rsi, color="#90a4ae", lw=1.0)
+    ar.fill_between(xs, rsi, 70, where=(rsi>=70), alpha=0.15, color=RC)
+    ar.fill_between(xs, rsi, 30, where=(rsi<=30), alpha=0.15, color=BC)
+    ar.axhline(70, color=RC, lw=0.5, ls="--", alpha=0.5)
+    ar.axhline(50, color=GR, lw=0.4, alpha=0.5)
+    ar.axhline(30, color=BC, lw=0.5, ls="--", alpha=0.5)
+    ar.set_ylim(0, 100)
+    ar.set_ylabel("RSI", color="#555d68", fontsize=6)
 
-    if len(df)>=52:
-        ema50=df["close"].ewm(span=50,adjust=False).mean()
-        am.plot(range(len(ema50)),ema50.values,color="#78909c",lw=1.,ls="-.",alpha=.6,label="EMA50")
-
+    # ── SMC overlays ──
     if state.active_ob:
-        ob=state.active_ob; oc=OBB if ob["type"]=="BULL" else OBR
-        xs=max(0,len(df)-35)/len(df)
-        am.axhspan(ob["low"],ob["high"],xmin=xs,alpha=.15,color=oc)
-        am.axhline(ob["high"],color=oc,ls="--",lw=.8,alpha=.7)
-        am.axhline(ob["low"], color=oc,ls="--",lw=.8,alpha=.7)
-        sc_txt=f" {ob['type']} OB  sc:{state.ob_score}/100"
-        am.text(2,ob["high"],sc_txt,color=oc,fontsize=7,va="bottom",fontfamily="monospace")
+        ob  = state.active_ob
+        oc  = OBB if ob["type"]=="BULL" else OBR
+        xs0 = max(0, len(df)-35) / len(df)
+        am.axhspan(ob["low"], ob["high"], xmin=xs0, alpha=0.15, color=oc)
+        am.axhline(ob["high"], color=oc, ls="--", lw=0.9, alpha=0.8)
+        am.axhline(ob["low"],  color=oc, ls="--", lw=0.9, alpha=0.8)
+        am.text(2, ob["high"], f" {ob['type']} OB  sc:{state.ob_score}/100",
+                color=oc, fontsize=7, va="bottom", fontfamily="monospace")
 
     if state.active_fvg:
-        fvg=state.active_fvg
-        am.axhspan(fvg["low"],fvg["high"],alpha=.13,color=FC)
-        am.text(2,fvg["high"],"  FVG",color=FC,fontsize=7,va="bottom",fontfamily="monospace")
+        fvg = state.active_fvg
+        am.axhspan(fvg["low"], fvg["high"], alpha=0.13, color=FC)
+        am.text(2, fvg["high"], "  FVG", color=FC, fontsize=7,
+                va="bottom", fontfamily="monospace")
 
     if state.active_idm:
-        idm=state.active_idm
-        am.axhline(idm["level"],color=IC,ls=":",lw=1.2,alpha=.9)
-        sw=("✅ SWEPT" if idm.get("swept") else "⏳ PENDING")
-        am.text(2,idm["level"],f"  IDM {sw}",color=IC,fontsize=7,va="bottom",fontfamily="monospace")
+        idm = state.active_idm
+        am.axhline(idm["level"], color=IC, ls=":", lw=1.3, alpha=0.9)
+        sw  = "✅ SWEPT" if idm.get("swept") else "⏳ PENDING"
+        am.text(2, idm["level"], f"  IDM {sw}", color=IC, fontsize=7,
+                va="bottom", fontfamily="monospace")
 
     if state.active_trap:
-        trap=state.active_trap
-        am.axhline(trap["level"],color=TC,ls=":",lw=1.4,alpha=.9)
-        am.text(2,trap["level"],f"  TRAP {trap['side']}",
-                color=TC,fontsize=7,va="bottom",fontfamily="monospace")
+        trap = state.active_trap
+        am.axhline(trap["level"], color=TC, ls=":", lw=1.5, alpha=0.9)
+        am.text(2, trap["level"], f"  TRAP {trap['side']}", color=TC,
+                fontsize=7, va="bottom", fontfamily="monospace")
 
     if state.last_signal and "fib_hi" in state.last_signal:
-        sig=state.last_signal
-        mid=(sig["fib_hi"]+sig["fib_lo"])/2
-        am.axhline(mid,color="#78909c",ls="-.",lw=.6,alpha=.4)
-        am.axhspan(sig["fib_lo"],mid,alpha=.04,color=BC)
-        am.axhspan(mid,sig["fib_hi"],alpha=.04,color=RC)
-        am.text(len(df)-2,mid," 0.5 Fib",color="#78909c",fontsize=6,ha="right",fontfamily="monospace")
+        sig = state.last_signal
+        mid = (sig["fib_hi"] + sig["fib_lo"]) / 2
+        am.axhline(mid, color="#78909c", ls="-.", lw=0.6, alpha=0.4)
+        am.axhspan(sig["fib_lo"], mid, alpha=0.04, color=BC)
+        am.axhspan(mid, sig["fib_hi"],  alpha=0.04, color=RC)
+        am.text(len(df)-2, mid, " 0.5 Fib", color="#78909c", fontsize=6,
+                ha="right", fontfamily="monospace")
 
     if state.last_signal:
-        sig=state.last_signal
-        am.axhline(sig["entry"],color=EC,lw=1.6,ls="-")
-        am.axhline(sig["sl"],   color=SC,lw=1.0,ls="--")
-        for tk,tc_ in zip(["tp1","tp2","tp3"],TPC):
-            if tk in sig: am.axhline(sig[tk],color=tc_,lw=.8,ls="-.")
+        sig = state.last_signal
+        am.axhline(sig["entry"], color=EC, lw=1.6, ls="-")
+        am.axhline(sig["sl"],    color=SC, lw=1.0, ls="--")
+        for tk, tc_ in zip(["tp1","tp2","tp3"], TPC):
+            if tk in sig: am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.")
 
     if entry_price:
-        am.axhline(entry_price,color=EC,lw=2.2,alpha=.9)
-        am.annotate(f"▶ ENTRY {entry_price:.5f}",xy=(len(df)-1,entry_price),
-                    color=EC,fontsize=8,ha="right",fontfamily="monospace")
+        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9)
+        am.annotate(f"▶ ENTRY {entry_price:.3f}", xy=(len(df)-1, entry_price),
+                    color=EC, fontsize=8, ha="right", fontfamily="monospace")
     if exit_price:
-        xc=BC if(pnl and pnl>0) else RC
-        am.axhline(exit_price,color=xc,lw=2.,ls="--",alpha=.9)
-        ps=f"+{pnl:.2f}" if pnl and pnl>0 else f"{pnl:.2f}"
-        am.annotate(f"◀ EXIT {exit_price:.5f}  P&L:{ps}",xy=(len(df)-1,exit_price),
-                    color=xc,fontsize=8,ha="right",fontfamily="monospace")
+        xc = BC if (pnl and pnl>0) else RC
+        am.axhline(exit_price, color=xc, lw=2.0, ls="--", alpha=0.9)
+        ps = f"+{pnl:.2f}" if (pnl and pnl>0) else f"{pnl:.2f}"
+        am.annotate(f"◀ EXIT {exit_price:.3f}  P&L:{ps}", xy=(len(df)-1, exit_price),
+                    color=xc, fontsize=8, ha="right", fontfamily="monospace")
 
+    # ── News event lines ──
     for ev in state.news_events:
         if not ev.dt_utc or not ev.is_red: continue
         ep = ev.dt_utc.timestamp()
-        for ci,crow in df.iterrows():
-            if crow["time"]>=ep:
-                am.axvline(ci,color=RC,lw=1.,ls="--",alpha=.5)
-                am.text(ci,df["high"].max(),"🔴",fontsize=8,ha="center"); break
+        for ci, crow in df.iterrows():
+            if crow["time"] >= ep:
+                am.axvline(ci, color=RC, lw=1.0, ls="--", alpha=0.5)
+                am.text(ci, price_max + pad*0.4, "🔴", fontsize=8, ha="center")
+                break
 
-    # ── Swing point markers ──
-    # n=8: only mark highs/lows that are the extreme over ±8 candles each side
-    # This prevents every bar being marked. ▼ red above swing highs, ▲ green below swing lows.
+    # ── Swing pivots — n=8 so only real significant highs/lows are marked ──
     swh, swl = _swing_pts(df, n=8)
-    marker_pad = price_range * 0.008   # 0.8% offset so markers clear the wick
+    mp = price_range * 0.007
     for i in swh:
-        am.plot(i, df.iloc[i]["high"] + marker_pad,
-                "v", color=RC, ms=6, alpha=0.85, zorder=5)
+        am.plot(i, df.loc[i,"high"]+mp, "v", color="#ff9800", ms=7, alpha=0.9, zorder=6)
     for i in swl:
-        am.plot(i, df.iloc[i]["low"] - marker_pad,
-                "^", color=BC, ms=6, alpha=0.85, zorder=5)
+        am.plot(i, df.loc[i,"low"] -mp, "^", color="#69f0ae", ms=7, alpha=0.9, zorder=6)
 
-    tc_=BC if state.trend_bias=="BULLISH" else(RC if state.trend_bias=="BEARISH" else "#90a4ae")
-    tl={"live":"📡 LIVE","entry":"🎯 ENTRY","exit":"🏁 CLOSED"}.get(chart_type,"")
-    blk=" 🚫NEWS" if state.block_trading else""
-    mkt="🟢" if is_market_open() else"🔴"
+    # ── Title & labels ──
+    tc_ = BC if state.trend_bias=="BULLISH" else (RC if state.trend_bias=="BEARISH" else "#90a4ae")
+    tl  = {"live":"📡 LIVE","entry":"🎯 ENTRY","exit":"🏁 CLOSED"}.get(chart_type,"")
+    blk = "  🚫NEWS" if state.block_trading else ""
+    mkt = "🟢" if is_market_open() else "🔴"
     am.set_title(
-        f"{tl}  {state.pair_display}  ·  {tf}  "
-        f"·  {mkt}  Bias:{state.trend_bias}  Zone:{state.premium_discount}  "
-        f"·  {state.current_price:.5f}  Sess:{state.session_now}{blk}",
-        color=tc_,fontsize=10,fontfamily="monospace",pad=8)
-    am.set_ylabel("Price",color="#90a4ae",fontsize=8)
-
-    al.set_xlim(0,1); al.set_ylim(0,1); al.axis("off")
-    ts=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    nxt=state.next_red_event
-    nxt_s=(f" | 🔴{nxt.title[:18]}@{nxt.dt_utc.astimezone(NY_TZ).strftime('%H:%Mh')}"
-           if nxt and nxt.dt_utc else"")
-    score_s=f"Score:{state.ob_score}/100  " if state.ob_score else""
-    al.text(.01,.5,
-        f"SMC SNIPER v5.1 [{state.trading_mode}]  ·  {state.pair_display}  sym:{state.active_symbol}  "
-        f"Bal:{state.account_balance:.2f}{state.account_currency}  "
-        f"Risk:{state.risk_pct*100:.0f}%  {score_s}"
-        f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
-        f"{nxt_s}  {ts}",
-        color="#444d56",fontsize=6,va="center",fontfamily="monospace")
+        f"{tl}  {state.pair_display}  ·  {tf}  ·  {mkt}  "
+        f"Bias:{state.trend_bias}  Zone:{state.premium_discount}  "
+        f"·  {state.current_price:.3f}  Sess:{state.session_now}{blk}",
+        color=tc_, fontsize=10, fontfamily="monospace", pad=8)
+    am.set_ylabel("Price", color="#90a4ae", fontsize=8)
 
     if reason and chart_type=="entry":
-        box_txt=(f"Score:{reason.score}  {reason.structure}  "
-                 f"{reason.pd_zone}  IDM:{reason.idm_sweep}  Sess:{reason.session}")
-        am.text(.01,.98,box_txt,transform=am.transAxes,
-                fontsize=7,va="top",fontfamily="monospace",color="#cdd9e5",
-                bbox=dict(boxstyle="round,pad=.3",fc="#161b22",ec="#30363d",alpha=.85))
+        am.text(0.01, 0.98,
+            f"Score:{reason.score}  {reason.structure}  "
+            f"{reason.pd_zone}  IDM:{reason.idm_sweep}  Sess:{reason.session}",
+            transform=am.transAxes, fontsize=7, va="top",
+            fontfamily="monospace", color="#cdd9e5",
+            bbox=dict(boxstyle="round,pad=.3", fc="#161b22", ec="#30363d", alpha=0.85))
 
-    plt.setp(am.get_xticklabels(),visible=False)
-    plt.setp(av.get_xticklabels(),visible=False)
-    plt.setp(ar.get_xticklabels(),visible=False)
-    path=f"/tmp/sniper_chart_{chart_type}.png"
-    plt.tight_layout()
-    plt.savefig(path,dpi=130,bbox_inches="tight",facecolor=fig.get_facecolor())
+    # ── Info bar ──
+    al.set_xlim(0,1); al.set_ylim(0,1); al.axis("off")
+    ts  = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    nxt = state.next_red_event
+    nxt_s = (f" | 🔴{nxt.title[:18]}@{nxt.dt_utc.astimezone(NY_TZ).strftime('%H:%Mh')}"
+             if nxt and nxt.dt_utc else "")
+    sc_s = f"Score:{state.ob_score}/100  " if state.ob_score else ""
+    al.text(0.01, 0.5,
+        f"SMC SNIPER v5.1 [{state.trading_mode}]  ·  {state.pair_display}  "
+        f"sym:{state.active_symbol}  Bal:{state.account_balance:.2f}{state.account_currency}  "
+        f"Risk:{state.risk_pct*100:.0f}%  {sc_s}"
+        f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} "
+        f"M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}{nxt_s}  {ts}",
+        color="#444d56", fontsize=6, va="center", fontfamily="monospace")
+
+    plt.setp(am.get_xticklabels(), visible=False)
+    plt.setp(av.get_xticklabels(), visible=False)
+    plt.setp(ar.get_xticklabels(), visible=False)
+    path = f"/tmp/sniper_chart_{chart_type}.png"
+    plt.savefig(path, dpi=130, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
     return path
 
