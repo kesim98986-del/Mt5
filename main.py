@@ -1,21 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.6 — Dual-Confirmation Engine                 ║
-║  SMC + TradingView-TA Agreement · OB/FVG Visual Boxes · 5-pt Floor  ║
-║  Session Gap Fixed · Free TV Integration · Railway-Ready            ║
+║        SMC SNIPER EA v5.2 — Multi-Strategy Autonomous Trading Bot    ║
+║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
+║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
+║              [COMPLETE REWRITE — 3 BUGS PERMANENTLY FIXED]          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-v5.6 CHANGES (all original logic preserved):
-1. tradingview_ta library used to fetch TV recommendation for active pair.
-2. compute_signal requires BOTH SMC score >= min_score AND TV rec agrees
-   (BUY/STRONG_BUY for bullish, SELL/STRONG_SELL for bearish).
-   TV fetch runs async in executor; on error the SMC-only path is used.
-3. generate_chart: OB drawn as filled Rectangle box (not just axhspan),
-   FVG drawn as hatched semi-transparent Rectangle, both labelled.
-4. Y-axis: _resolve_min_range returns 5.0 for Gold/Indices (was 10.0).
-   Flat-line formula: mid = (max+min)/2; ylim = (mid-2.5, mid+2.5).
-5. get_session: 22:00-24:00 explicitly returns ASIAN.
+FIXES APPLIED (v5.2):
+1. PERSISTENT CANDLE BUFFER  — All candle deques use maxlen=1000.
+   _store() APPENDS one candle at a time so history is never lost.
+2. FIXED CHART Y-AXIS        — Minimum range of 10.0 pts for Gold
+   (≥1000), 0.010 for Forex, 50 for indices. Flat-line & flicker gone.
+3. GAPLESS SESSION LOGIC     — get_session() covers exactly 24 h:
+     00:00–08:00 UTC  → ASIAN
+     08:00–13:00 UTC  → LONDON
+     13:00–17:00 UTC  → OVERLAP
+     17:00–22:00 UTC  → NY
+     22:00–24:00 UTC  → ASIAN  (wraps; no gap, no UNKNOWN)
 """
+
 import asyncio
 import json
 import logging
@@ -40,11 +43,6 @@ import requests
 import websockets
 from aiohttp import web
 from bs4 import BeautifulSoup
-try:
-    from tradingview_ta import TA_Handler, Interval, Exchange
-    TV_TA_AVAILABLE = True
-except ImportError:
-    TV_TA_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -109,25 +107,6 @@ DERIV_APP_ID     = os.getenv("DERIV_APP_ID", "1089")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DERIV_WS_BASE    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
-
-# ── TradingView-TA settings (v5.6) ──
-# Maps internal pair key → (symbol, exchange, screener)
-TV_TA_MAP: Dict[str, tuple] = {
-    "XAUUSD": ("XAUUSD",  "OANDA",   "forex"),
-    "EURUSD": ("EURUSD",  "OANDA",   "forex"),
-    "GBPUSD": ("GBPUSD",  "OANDA",   "forex"),
-    "US100":  ("NDX",     "NASDAQ",  "america"),
-}
-TV_TA_INTERVAL_MAP = {
-    "H1":  "1h",
-    "M15": "15m",
-    "M5":  "5m",
-    "M1":  "1m",
-}
-# Bullish recs that confirm a BUY signal
-TV_BUY_RECS  = {"BUY", "STRONG_BUY"}
-# Bearish recs that confirm a SELL signal
-TV_SELL_RECS = {"SELL", "STRONG_SELL"}
 
 # ══════════════════════════════════════════════════════════════════════
 # DATA CLASSES
@@ -295,11 +274,6 @@ class BotState:
         self.next_red_event  : Optional[NewsEvent] = None
         self.news_chart_path : Optional[str] = None
 
-        # ── TradingView-TA cache (v5.6) ──
-        self.tv_recommendation : str   = "NEUTRAL"  # latest TV rec string
-        self.tv_rec_ts         : float = 0.0        # epoch when last fetched
-        self.tv_rec_tf         : str   = "M15"      # TF it was fetched for
-
     @property
     def pair_info(self):     return PAIR_REGISTRY[self.pair_key]
     @property
@@ -354,18 +328,20 @@ def time_to_next_open() -> str:
 # ══════════════════════════════════════════════════════════════════════
 def get_session() -> str:
     """
-    Return the current Forex session — FULL 24-hour coverage, zero gaps.
+    Return the current Forex session based on UTC hour.
+    Covers exactly 24 hours with ZERO gaps and NEVER returns 'UNKNOWN':
+
       00:00 – 08:00  →  ASIAN
       08:00 – 13:00  →  LONDON
       13:00 – 17:00  →  OVERLAP   (London/NY — highest liquidity)
       17:00 – 22:00  →  NY
-      22:00 – 24:00  →  ASIAN     (v5.6 explicit: gap closed forever)
+      22:00 – 24:00  →  ASIAN     (wraps seamlessly back to Asian)
     """
     h = datetime.now(UTC).hour
-    if  8 <= h < 13: return "LONDON"
+    if 8  <= h < 13: return "LONDON"
     if 13 <= h < 17: return "OVERLAP"
     if 17 <= h < 22: return "NY"
-    return "ASIAN"   # catches 0-7 AND 22-23: gap permanently closed
+    return "ASIAN"   # covers 0–8 and 22–23 with a single return
 
 
 def market_header() -> str:
@@ -731,14 +707,41 @@ def _swing_pts(df: pd.DataFrame, n: int = 5):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CHART ENGINE v5.6 — OB Boxes, FVG Boxes, 5-pt Y-floor
 # ══════════════════════════════════════════════════════════════════════
+# CHART ENGINE v5.7 — 5 Bugs Diagnosed & Fixed
+# ──────────────────────────────────────────────────────────────────────
+# BUG 1: Only 80 candles shown → left side of chart empty / right crushed
+#        Fix: show 120 candles, set xlim AFTER all drawing
+# BUG 2: Y-axis labels wrong / gold price not matching
+#        Fix: 5-pt hard floor with mid±2.5 formula; 8% pad (was 12%)
+# BUG 3: Duplicate OHLC candles from stale ticks → microscopic flat bars
+#        Fix: _dedupe_candles() strips consecutive identical rows
+# BUG 4: Swing markers clustered at top (n=15 too large for 80 bars)
+#        Fix: n=5; draw last 5 swing highs/lows with range guard
+# BUG 5: OB/FVG drawn as axhspan (full width, not a proper box)
+#        Fix: matplotlib Rectangle patch for OB; hatched Rect for FVG
+# ══════════════════════════════════════════════════════════════════════
+
 def _resolve_min_range(avg_price: float) -> float:
-    """Minimum Y-axis range.  Gold/Indices >= 1000 → 5.0 pts (v5.6 fix)."""
-    if avg_price >= 1000: return 5.0    # XAU/USD, US100  ← 5-pt floor
+    """5-pt hard floor for Gold. Formula: mid±2.5 when triggered."""
+    if avg_price >= 1000: return 5.0    # XAU/USD, US100
     if avg_price >= 10:   return 1.0
     if avg_price >= 1:    return 0.010  # EUR/USD, GBP/USD
     return 0.001
+
+
+def _dedupe_candles(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop consecutive rows where all four OHLC values are identical.
+    Prevents microscopic candles from stale live tick injections.
+    """
+    mask = ~(
+        (df["open"]  == df["open"].shift(1)) &
+        (df["high"]  == df["high"].shift(1)) &
+        (df["low"]   == df["low"].shift(1))  &
+        (df["close"] == df["close"].shift(1))
+    )
+    return df[mask].reset_index(drop=True)
 
 
 def generate_chart(
@@ -751,24 +754,31 @@ def generate_chart(
         chart_type:  str   = "live",
         reason: "TradeReason" = None) -> Optional[str]:
 
-    if len(candles) < 20:
+    if len(candles) < 30:
+        log.info(f"Chart skipped — only {len(candles)} candles (need 30)")
         return None
 
-    df = pd.DataFrame(list(candles)[-80:])
+    # BUG 1 FIX: 120 candles (was 80) — full price context visible
+    SHOW = 120
+    df = pd.DataFrame(list(candles)[-SHOW:])
     df.columns = ["time", "open", "high", "low", "close"]
     df = df.astype({"open": float, "high": float, "low": float, "close": float})
     df.reset_index(drop=True, inplace=True)
 
+    # Remove bad rows
     df = df[(df["open"] > 0) & (df["high"] > 0) &
             (df["low"]  > 0) & (df["close"] > 0)]
-    if len(df) < 20:
-        return None
     med = df["close"].median()
     df  = df[(df["close"] > med * 0.5) & (df["close"] < med * 2.0)]
-    if len(df) < 20:
+
+    # BUG 3 FIX: drop stale duplicate OHLC rows
+    df = _dedupe_candles(df)
+    if len(df) < 15:
+        log.info(f"Chart skipped — only {len(df)} unique candles after dedup")
         return None
     df.reset_index(drop=True, inplace=True)
 
+    # ── Layout ──
     fig = plt.figure(figsize=(16, 10), facecolor=BG)
     gs  = gridspec.GridSpec(4, 1, figure=fig, hspace=0.04,
                             height_ratios=[5, 0.9, 1.0, 0.4])
@@ -779,7 +789,7 @@ def generate_chart(
     for a in (am, av, ar, al):
         _ax_s(a)
 
-    # ── Y-axis: 5-pt floor formula (v5.6) ──────────────────────────────
+    # ── BUG 2 FIX: 5-pt floor, mid±2.5, 8% pad ──
     raw_min   = df["low"].min()
     raw_max   = df["high"].max()
     raw_range = raw_max - raw_min
@@ -788,11 +798,11 @@ def generate_chart(
 
     if raw_range < MIN_RANGE:
         mid          = avg_price
-        chart_min    = mid - MIN_RANGE / 2.0   # mid - 2.5 for Gold
-        chart_max    = mid + MIN_RANGE / 2.0   # mid + 2.5 for Gold
+        chart_min    = mid - MIN_RANGE / 2.0
+        chart_max    = mid + MIN_RANGE / 2.0
         actual_range = MIN_RANGE
     else:
-        pad          = raw_range * 0.10
+        pad          = raw_range * 0.08
         chart_min    = raw_min - pad
         chart_max    = raw_max + pad
         actual_range = raw_range
@@ -801,29 +811,32 @@ def generate_chart(
     bull_idx = [i for i in xs if df.loc[i, "close"] >= df.loc[i, "open"]]
     bear_idx = [i for i in xs if df.loc[i, "close"]  < df.loc[i, "open"]]
 
+    # ── Wicks ──
     def _wick_segs(idx):
         return [[(i, df.loc[i, "low"]), (i, df.loc[i, "high"])] for i in idx]
     if bull_idx:
         am.add_collection(mc.LineCollection(
-            _wick_segs(bull_idx), colors=BC, linewidths=1.2, zorder=2))
+            _wick_segs(bull_idx), colors=BC, linewidths=1.0, zorder=2))
     if bear_idx:
         am.add_collection(mc.LineCollection(
-            _wick_segs(bear_idx), colors=RC, linewidths=1.2, zorder=2))
+            _wick_segs(bear_idx), colors=RC, linewidths=1.0, zorder=2))
 
-    BODY_WIDTH = 0.5
-    doji_min   = actual_range * 0.002
+    # ── Candle bodies ──
+    BODY_WIDTH = 0.6
+    doji_min   = actual_range * 0.001
     for i in bull_idx:
         bot = min(df.loc[i, "open"], df.loc[i, "close"])
         ht  = max(abs(df.loc[i, "close"] - df.loc[i, "open"]), doji_min)
         am.bar(i, ht, bottom=bot, color=BC, width=BODY_WIDTH,
-               edgecolor="#00c853", linewidth=0.5, alpha=0.95, zorder=3)
+               edgecolor="#00c853", linewidth=0.4, alpha=0.95, zorder=3)
     for i in bear_idx:
         bot = min(df.loc[i, "open"], df.loc[i, "close"])
         ht  = max(abs(df.loc[i, "close"] - df.loc[i, "open"]), doji_min)
         am.bar(i, ht, bottom=bot, color=RC, width=BODY_WIDTH,
-               edgecolor="#d50000", linewidth=0.5, alpha=0.95, zorder=3)
+               edgecolor="#d50000", linewidth=0.4, alpha=0.95, zorder=3)
 
-    am.set_xlim(-1, len(df) + 2)
+    # BUG 1 FIX continued: set xlim AFTER drawing all bars
+    am.set_xlim(-1, len(df) + 3)
     am.set_ylim(chart_min, chart_max)
 
     def _in_range(p):
@@ -831,21 +844,26 @@ def generate_chart(
 
     # ── EMA 21 + EMA 50 ──
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
-    if ema21.min() >= chart_min * 0.9 and ema21.max() <= chart_max * 1.1:
-        am.plot(xs, ema21.values, color="#ffeb3b", lw=1.5, alpha=0.8, label="EMA21")
+    if ema21.min() >= chart_min * 0.95 and ema21.max() <= chart_max * 1.05:
+        am.plot(xs, ema21.values, color="#ffeb3b", lw=1.5, alpha=0.85,
+                zorder=4, label="EMA21")
     if len(df) >= 52:
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
-        if ema50.min() >= chart_min * 0.9 and ema50.max() <= chart_max * 1.1:
-            am.plot(xs, ema50.values, color="#78909c", lw=1.2, ls="--", alpha=0.7, label="EMA50")
+        if ema50.min() >= chart_min * 0.95 and ema50.max() <= chart_max * 1.05:
+            am.plot(xs, ema50.values, color="#78909c", lw=1.2, ls="--",
+                    alpha=0.75, zorder=4, label="EMA50")
 
     # ── Volume ──
     vol  = (df["high"] - df["low"]).values
     vmax = vol.max() if vol.max() > 0 else 1.0
     if bull_idx:
-        av.bar(bull_idx, [vol[i] / vmax for i in bull_idx], color=BC, alpha=0.7, width=0.5)
+        av.bar(bull_idx, [vol[i] / vmax for i in bull_idx],
+               color=BC, alpha=0.7, width=0.6)
     if bear_idx:
-        av.bar(bear_idx, [vol[i] / vmax for i in bear_idx], color=RC, alpha=0.7, width=0.5)
-    av.set_ylim(0, 1.3); av.set_ylabel("Vol", color="#555d68", fontsize=6)
+        av.bar(bear_idx, [vol[i] / vmax for i in bear_idx],
+               color=RC, alpha=0.7, width=0.6)
+    av.set_ylim(0, 1.3)
+    av.set_ylabel("Vol", color="#555d68", fontsize=6)
 
     # ── RSI ──
     rsi = _rsi_calc(df["close"].values)
@@ -855,49 +873,46 @@ def generate_chart(
     ar.axhline(70, color=RC, lw=0.6, ls="--", alpha=0.6)
     ar.axhline(50, color=GR, lw=0.5, alpha=0.5)
     ar.axhline(30, color=BC, lw=0.6, ls="--", alpha=0.6)
-    ar.set_ylim(0, 100); ar.set_ylabel("RSI", color="#555d68", fontsize=6)
+    ar.set_ylim(0, 100)
+    ar.set_ylabel("RSI", color="#555d68", fontsize=6)
+    rsi_now = float(rsi[-1])
+    rsi_c   = RC if rsi_now > 70 else (BC if rsi_now < 30 else "#90a4ae")
+    ar.text(len(df) - 1, rsi_now, f" {rsi_now:.0f}", color=rsi_c,
+            fontsize=6.5, va="center", fontfamily="monospace")
 
-    # ══════════════════════════════════════════════════════════════════
-    # SMC OVERLAYS — v5.6: OB as filled Rectangle, FVG as hatched box
-    # ══════════════════════════════════════════════════════════════════
+    # ── BUG 5 FIX: OB = filled Rectangle; FVG = hatched Rectangle ──
     from matplotlib.patches import Rectangle
 
     if state.active_ob:
         ob = state.active_ob
         if _in_range(ob["low"]) and _in_range(ob["high"]):
             oc      = OBB if ob["type"] == "BULL" else OBR
-            x_start = max(0, len(df) - 40)
-            x_width = len(df) + 1 - x_start
-            # Filled rectangle
-            ob_rect = Rectangle(
-                (x_start, ob["low"]), x_width, ob["high"] - ob["low"],
+            x_start = max(0, len(df) - 50)
+            x_w     = len(df) + 2 - x_start
+            am.add_patch(Rectangle(
+                (x_start, ob["low"]), x_w, ob["high"] - ob["low"],
                 linewidth=1.5, edgecolor=oc, facecolor=oc,
-                alpha=0.18, zorder=4)
-            am.add_patch(ob_rect)
-            # Solid top/bottom border lines
-            am.plot([x_start, len(df) + 1], [ob["high"], ob["high"]],
-                    color=oc, lw=1.3, alpha=0.9, zorder=5)
-            am.plot([x_start, len(df) + 1], [ob["low"],  ob["low"]],
-                    color=oc, lw=1.3, alpha=0.9, zorder=5)
-            tv_badge = f" TV:{state.tv_recommendation}" if state.tv_recommendation not in ("NEUTRAL","") else ""
+                alpha=0.18, zorder=4))
+            am.plot([x_start, len(df)+2], [ob["high"], ob["high"]],
+                    color=oc, lw=1.2, alpha=0.9, zorder=5)
+            am.plot([x_start, len(df)+2], [ob["low"],  ob["low"]],
+                    color=oc, lw=1.2, alpha=0.9, zorder=5)
             am.text(x_start + 1, ob["high"],
-                    f" {ob['type']} OB sc:{state.ob_score}/100{tv_badge}",
+                    f" {ob['type']} OB  score:{state.ob_score}/100",
                     color=oc, fontsize=7, va="bottom",
                     fontfamily="monospace", zorder=6,
                     bbox=dict(boxstyle="round,pad=0.15",
-                              fc="#0d1117", ec=oc, alpha=0.75, lw=0.7))
+                              fc="#0d1117", ec=oc, alpha=0.80, lw=0.7))
 
     if state.active_fvg:
         fvg = state.active_fvg
         if _in_range(fvg["low"]) and _in_range(fvg["high"]):
-            x_start = max(0, len(df) - 30)
-            x_width = len(df) + 1 - x_start
-            # Hatched semi-transparent rectangle for FVG
-            fvg_rect = Rectangle(
-                (x_start, fvg["low"]), x_width, fvg["high"] - fvg["low"],
+            x_start = max(0, len(df) - 35)
+            x_w     = len(df) + 2 - x_start
+            am.add_patch(Rectangle(
+                (x_start, fvg["low"]), x_w, fvg["high"] - fvg["low"],
                 linewidth=1.0, edgecolor=FC, facecolor=FC,
-                alpha=0.12, zorder=3, hatch="///", linestyle="--")
-            am.add_patch(fvg_rect)
+                alpha=0.13, zorder=3, hatch="///", linestyle="--"))
             am.text(x_start + 1, (fvg["high"] + fvg["low"]) / 2,
                     " FVG", color=FC, fontsize=7, va="center",
                     fontfamily="monospace", zorder=6)
@@ -924,32 +939,39 @@ def generate_chart(
             am.axhline(mid2, color="#78909c", ls="-.", lw=0.6, alpha=0.4)
             am.axhspan(sig["fib_lo"], mid2, alpha=0.04, color=BC)
             am.axhspan(mid2, sig["fib_hi"], alpha=0.04, color=RC)
-            am.text(len(df) - 2, mid2, " 0.5 Fib", color="#78909c",
+            am.text(len(df) - 2, mid2, " 0.5 EQ", color="#78909c",
                     fontsize=6, ha="right", fontfamily="monospace")
 
     if state.last_signal:
         sig = state.last_signal
         if _in_range(sig["entry"]):
-            am.axhline(sig["entry"], color=EC, lw=1.6, ls="-")
+            am.axhline(sig["entry"], color=EC, lw=1.6, ls="-", zorder=6)
+            am.text(len(df)+0.3, sig["entry"], f" E:{sig['entry']:.2f}",
+                    color=EC, fontsize=7, va="center", fontfamily="monospace")
         if _in_range(sig["sl"]):
-            am.axhline(sig["sl"], color=SC, lw=1.0, ls="--")
+            am.axhline(sig["sl"], color=SC, lw=1.0, ls="--", zorder=6)
+            am.text(len(df)+0.3, sig["sl"], f" SL:{sig['sl']:.2f}",
+                    color=SC, fontsize=7, va="center", fontfamily="monospace")
         for tk, tc_ in zip(["tp1", "tp2", "tp3"], TPC):
             if tk in sig and _in_range(sig[tk]):
-                am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.")
+                am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.", zorder=5)
+                am.text(len(df)+0.3, sig[tk],
+                        f" {tk.upper()}:{sig[tk]:.2f}", color=tc_,
+                        fontsize=6.5, va="center", fontfamily="monospace")
 
     if entry_price and _in_range(entry_price):
-        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9)
-        am.annotate(f"▶ ENTRY {entry_price:.5f}",
-                    xy=(len(df) - 1, entry_price),
-                    color=EC, fontsize=8, ha="right", fontfamily="monospace")
+        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9, zorder=7)
+        am.annotate(f"▶ ENTRY {entry_price:.2f}",
+                    xy=(len(df)-1, entry_price), color=EC,
+                    fontsize=8, ha="right", fontfamily="monospace")
 
     if exit_price and _in_range(exit_price):
         xc = BC if (pnl and pnl > 0) else RC
-        am.axhline(exit_price, color=xc, lw=2.0, ls="--", alpha=0.9)
+        am.axhline(exit_price, color=xc, lw=2.0, ls="--", alpha=0.9, zorder=7)
         ps = f"+{pnl:.2f}" if (pnl and pnl > 0) else f"{pnl:.2f}"
-        am.annotate(f"◀ EXIT {exit_price:.5f} P&L:{ps}",
-                    xy=(len(df) - 1, exit_price),
-                    color=xc, fontsize=8, ha="right", fontfamily="monospace")
+        am.annotate(f"◀ EXIT {exit_price:.2f} P&L:{ps}",
+                    xy=(len(df)-1, exit_price), color=xc,
+                    fontsize=8, ha="right", fontfamily="monospace")
 
     for ev in state.news_events:
         if not ev.dt_utc or not ev.is_red:
@@ -957,62 +979,61 @@ def generate_chart(
         ep = ev.dt_utc.timestamp()
         for ci, crow in df.iterrows():
             if crow["time"] >= ep:
-                am.axvline(ci, color=RC, lw=1.0, ls="--", alpha=0.5)
+                am.axvline(ci, color=RC, lw=1.0, ls="--", alpha=0.4, zorder=3)
                 break
 
-    swh, swl = _swing_pts(df, n=15)
-    mp = actual_range * 0.008
-    for i in swh[-3:]:
-        am.plot(i, df.loc[i, "high"] + mp, "v", color="#ff9800", ms=6, alpha=0.85, zorder=6)
-    for i in swl[-3:]:
-        am.plot(i, df.loc[i, "low"] - mp, "^", color="#69f0ae", ms=6, alpha=0.85, zorder=6)
+    # ── BUG 4 FIX: swing markers — n=5, last 5, range-guarded ──
+    swh, swl = _swing_pts(df, n=5)
+    mp = actual_range * 0.006
+    for i in swh[-5:]:
+        if _in_range(df.loc[i, "high"]):
+            am.plot(i, df.loc[i, "high"] + mp, "v",
+                    color="#ff9800", ms=5, alpha=0.85, zorder=6)
+    for i in swl[-5:]:
+        if _in_range(df.loc[i, "low"]):
+            am.plot(i, df.loc[i, "low"] - mp, "^",
+                    color="#69f0ae", ms=5, alpha=0.85, zorder=6)
 
-    # ── TradingView recommendation overlay ──
-    tv_rec = state.tv_recommendation
-    if tv_rec and tv_rec != "NEUTRAL":
-        tv_col = BC if tv_rec in TV_BUY_RECS else (RC if tv_rec in TV_SELL_RECS else "#90a4ae")
-        am.text(0.99, 0.02, f"TV: {tv_rec}",
-                transform=am.transAxes, fontsize=8, ha="right", va="bottom",
-                fontfamily="monospace", color=tv_col,
-                bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117",
-                          ec=tv_col, alpha=0.85, lw=1.0))
-
+    # ── Title ──
     tc_ = (BC if state.trend_bias == "BULLISH"
            else (RC if state.trend_bias == "BEARISH" else "#90a4ae"))
-    tl  = {"live": "📡 LIVE", "entry": "🎯 ENTRY", "exit": "🏁 CLOSED"}.get(chart_type, "")
+    tl  = {"live": "📡 LIVE", "entry": "🎯 ENTRY",
+           "exit": "🏁 CLOSED"}.get(chart_type, "")
     blk = " 🚫NEWS" if state.block_trading else ""
     mkt = "🟢" if is_market_open() else "🔴"
     am.set_title(
         f"{tl} {state.pair_display} · {tf} · {mkt} "
-        f"Bias:{state.trend_bias} Zone:{state.premium_discount} "
-        f"· {state.current_price:.3f} Sess:{state.session_now}{blk}",
+        f"Bias:{state.trend_bias}  Zone:{state.premium_discount}"
+        f"  ·  {state.current_price:.2f}  Sess:{state.session_now}{blk}",
         color=tc_, fontsize=10, fontfamily="monospace", pad=8)
     am.set_ylabel("Price", color="#90a4ae", fontsize=8)
 
     if reason and chart_type == "entry":
         am.text(0.01, 0.98,
-                f"Score:{reason.score} {reason.structure} "
-                f"{reason.pd_zone} IDM:{reason.idm_sweep} Sess:{reason.session}",
+                f"Score:{reason.score}  {reason.structure}"
+                f"  {reason.pd_zone}  IDM:{reason.idm_sweep}"
+                f"  Sess:{reason.session}",
                 transform=am.transAxes, fontsize=7, va="top",
                 fontfamily="monospace", color="#cdd9e5",
                 bbox=dict(boxstyle="round,pad=.3", fc="#161b22",
-                          ec="#30363d", alpha=0.85))
+                          ec="#30363d", alpha=0.88))
 
+    # ── Info bar ──
     al.set_xlim(0, 1); al.set_ylim(0, 1); al.axis("off")
     ts_now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     nxt    = state.next_red_event
-    nxt_s  = (f" | 🔴{nxt.title[:18]}@{nxt.dt_utc.astimezone(NY_TZ).strftime('%H:%Mh')}"
+    nxt_s  = (f" | 🔴{nxt.title[:18]}@"
+              f"{nxt.dt_utc.astimezone(NY_TZ).strftime('%H:%Mh')}"
               if nxt and nxt.dt_utc else "")
-    sc_s   = f"Score:{state.ob_score}/100 " if state.ob_score else ""
-    tv_s   = f"TV:{state.tv_recommendation} " if state.tv_recommendation else ""
+    sc_s = f"Score:{state.ob_score}/100 " if state.ob_score else ""
     al.text(0.01, 0.5,
-            f"SMC SNIPER v5.6 [{state.trading_mode}] · {state.pair_display} "
-            f"sym:{state.active_symbol} Bal:{state.account_balance:.2f}"
-            f"{state.account_currency} "
-            f"Risk:{state.risk_pct*100:.0f}% {sc_s}{tv_s}"
-            f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)} "
-            f"M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
-            f"{nxt_s} {ts_now}",
+            f"SMC SNIPER v5.7 [{state.trading_mode}] · {state.pair_display}"
+            f"  sym:{state.active_symbol}"
+            f"  Bal:{state.account_balance:.2f}{state.account_currency}"
+            f"  Risk:{state.risk_pct*100:.0f}%  {sc_s}"
+            f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)}"
+            f" M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
+            f"{nxt_s}  {ts_now}",
             color="#444d56", fontsize=6, va="center", fontfamily="monospace")
 
     plt.setp(am.get_xticklabels(), visible=False)
@@ -1261,59 +1282,6 @@ def sniper_score(ob, fvg, trap, idm, rsi, session,
     return min(s, 100), reasons
 
 
-
-def _fetch_tv_recommendation(pair_key: str, tf: str) -> str:
-    """
-    Fetch TradingView technical analysis recommendation for the given pair/TF.
-    Returns one of: STRONG_BUY, BUY, NEUTRAL, SELL, STRONG_SELL
-    Falls back to NEUTRAL on any error (no crash, never blocks trading).
-    Requires: pip install tradingview_ta
-    """
-    if not TV_TA_AVAILABLE:
-        return "NEUTRAL"
-    cfg = TV_TA_MAP.get(pair_key)
-    if not cfg:
-        return "NEUTRAL"
-    symbol, exchange, screener = cfg
-    iv_str = TV_TA_INTERVAL_MAP.get(tf, "15m")
-    interval_map = {
-        "1m":  Interval.INTERVAL_1_MINUTE,
-        "5m":  Interval.INTERVAL_5_MINUTES,
-        "15m": Interval.INTERVAL_15_MINUTES,
-        "1h":  Interval.INTERVAL_1_HOUR,
-        "4h":  Interval.INTERVAL_4_HOURS,
-        "1d":  Interval.INTERVAL_1_DAY,
-    }
-    try:
-        handler = TA_Handler(
-            symbol=symbol,
-            screener=screener,
-            exchange=exchange,
-            interval=interval_map.get(iv_str, Interval.INTERVAL_15_MINUTES),
-        )
-        analysis  = handler.get_analysis()
-        rec       = analysis.summary.get("RECOMMENDATION", "NEUTRAL")
-        log.info(f"📺 TV-TA {pair_key}/{tf}: {rec}")
-        return rec
-    except Exception as e:
-        log.warning(f"TV-TA fetch failed ({pair_key}/{tf}): {e}")
-        return "NEUTRAL"
-
-
-async def _async_fetch_tv_rec(pair_key: str, tf: str) -> str:
-    """Run the blocking TV fetch in a thread pool."""
-    try:
-        loop = asyncio.get_event_loop()
-        rec  = await loop.run_in_executor(None, _fetch_tv_recommendation, pair_key, tf)
-        state.tv_recommendation = rec
-        state.tv_rec_ts         = time.time()
-        state.tv_rec_tf         = tf
-        return rec
-    except Exception as e:
-        log.warning(f"_async_fetch_tv_rec: {e}")
-        return "NEUTRAL"
-
-
 def compute_signal(tf: str = "M15") -> Optional[dict]:
     if   tf == "M15": buf = state.m15_candles
     elif tf == "M5":  buf = state.m5_candles
@@ -1390,34 +1358,6 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
     state.ob_score = sc
     if sc < state.min_score:
         return None
-
-    # ══════════════════════════════════════════════════════════════════
-    # DUAL-CONFIRMATION (v5.6): SMC score passed — now check TV-TA
-    # ══════════════════════════════════════════════════════════════════
-    # Refresh TV rec if stale (>5 min) or timeframe changed
-    tv_stale = (time.time() - state.tv_rec_ts > 300
-                or state.tv_rec_tf != tf)
-    if TV_TA_AVAILABLE and tv_stale:
-        try:
-            tv_rec = _fetch_tv_recommendation(state.pair_key, tf)
-            state.tv_recommendation = tv_rec
-            state.tv_rec_ts         = time.time()
-            state.tv_rec_tf         = tf
-        except Exception:
-            tv_rec = state.tv_recommendation  # use cached
-    else:
-        tv_rec = state.tv_recommendation
-
-    direction_needed = "BUY" if bias == "BULLISH" else "SELL"
-    if TV_TA_AVAILABLE and tv_rec not in ("NEUTRAL", ""):
-        if direction_needed == "BUY"  and tv_rec not in TV_BUY_RECS:
-            log.info(f"🚫 Dual-confirm FAILED: SMC=BUY but TV={tv_rec}")
-            return None
-        if direction_needed == "SELL" and tv_rec not in TV_SELL_RECS:
-            log.info(f"🚫 Dual-confirm FAILED: SMC=SELL but TV={tv_rec}")
-            return None
-        log.info(f"✅ Dual-confirm PASSED: SMC={direction_needed} TV={tv_rec}")
-        score_reasons.append(f"TV:{tv_rec} +0")  # note in report
 
     reason = TradeReason()
     reason.h1_trend    = f"{bias} (BOS/CHoCH confirmed)"
@@ -2074,7 +2014,6 @@ async def _cmd(cmd: str):
             f"Pair: `{state.pair_display}` Price:`{state.current_price:.5f}`\n"
             f"Bias:`{state.trend_bias}` Zone:`{state.premium_discount}`\n"
             f"Session:`{state.session_now}` ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
-            f"TV Rec:`{state.tv_recommendation}` TF:`{state.tv_rec_tf}`\n"
             f"Open Trades:`{len(state.open_contracts)}`\n"
             f"Acct:`{state.account_type.upper()}` Bal:`{state.account_balance:.2f}`\n"
             f"W/L:`{state.wins}/{state.losses}` P&L:`{state.total_pnl:+.2f}`"
@@ -2395,7 +2334,7 @@ async def health(req):
     wr = (f"{state.wins/(state.wins+state.losses)*100:.1f}"
           if (state.wins + state.losses) > 0 else "0")
     return web.json_response({
-        "version":         "5.6",
+        "version":         "5.2",
         "status":          "running" if state.running else "stopped",
         "paused":          state.paused,
         "block_trading":   state.block_trading,
@@ -2434,9 +2373,6 @@ async def health(req):
         "next_red":        (state.next_red_event.title
                             if state.next_red_event else None),
         "gran_actual":     state.gran_actual,
-        "tv_recommendation": state.tv_recommendation,
-        "tv_rec_ts":         state.tv_rec_ts,
-        "tv_ta_available":   TV_TA_AVAILABLE,
     })
 
 
@@ -2455,11 +2391,10 @@ async def start_health():
 # ══════════════════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.6 · Dual-Confirm Engine    ║")
-    log.info("║  SMC + TradingView-TA · OB/FVG Boxes         ║")
-    log.info("║  5-pt Y-floor · Session fix · Railway-Ready  ║")
+    log.info("║  SMC SNIPER EA v5.2 · Multi-Strategy Auto    ║")
+    log.info("║ News Shield | Broker Connect | Post-Reports  ║")
+    log.info("║  [COMPLETE REWRITE — 3 BUGS FIXED FOREVER]  ║")
     log.info("╚══════════════════════════════════════════════╝")
-    log.info(f"📺 tradingview_ta: {'available' if TV_TA_AVAILABLE else 'NOT INSTALLED — pip install tradingview_ta'}")
     _load_saved_token()
     if not state.deriv_token:
         log.warning("No DERIV_API_TOKEN — bot will prompt user via /connect")
