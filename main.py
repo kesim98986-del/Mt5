@@ -1,29 +1,43 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.2 — Multi-Strategy Autonomous Trading Bot    ║
+║        SMC SNIPER EA v5.4 — Multi-Strategy Autonomous Trading Bot    ║
+║  TradingView Webhook · Deriv Execution · API-Key Security · TV Link  ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
 ║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
-║              [COMPLETE REWRITE — 3 BUGS PERMANENTLY FIXED]          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-FIXES APPLIED (v5.2):
-1. PERSISTENT CANDLE BUFFER  — All candle deques use maxlen=1000.
-   _store() APPENDS one candle at a time so history is never lost.
-2. FIXED CHART Y-AXIS        — Minimum range of 10.0 pts for Gold
-   (≥1000), 0.010 for Forex, 50 for indices. Flat-line & flicker gone.
-3. GAPLESS SESSION LOGIC     — get_session() covers exactly 24 h:
-     00:00–08:00 UTC  → ASIAN
-     08:00–13:00 UTC  → LONDON
-     13:00–17:00 UTC  → OVERLAP
-     17:00–22:00 UTC  → NY
-     22:00–24:00 UTC  → ASIAN  (wraps; no gap, no UNKNOWN)
+NEW in v5.4:
+4. TRADINGVIEW WEBHOOK LISTENER
+   POST /webhook  — receives JSON from any TradingView alert.
+   Payload:  {"action":"buy","symbol":"Gold","sl":2180,"tp":2210,
+              "stake":2.0,"key":"YOUR_SECRET_KEY"}
+   Fields:
+   - "action"  : "buy" | "sell" | "close_all"
+   - "symbol"  : "Gold"|"XAUUSD" | "EUR/USD"|"EURUSD" |
+                 "GBP/USD"|"GBPUSD" | "NAS100"|"US100"
+   - "sl"      : stop-loss price   (optional)
+   - "tp"      : take-profit price (optional)
+   - "stake"   : trade size in USD (optional — uses risk_pct if omitted)
+   - "key"     : MUST match WEBHOOK_API_KEY env-var (403 if wrong)
+
+5. TRADINGVIEW CHART LINKS
+   /chart command now sends a clickable TradingView chart link to Telegram
+   instead of a Matplotlib PNG.
+   TV_SYMBOL env-var overrides the auto-derived symbol (e.g. "OANDA:XAUUSD").
+
+6. WEBHOOK LOG
+   Last 20 webhook hits tracked in state, visible in /health JSON.
+
+PRESERVED (v5.2):
+1. Persistent candle buffer  (maxlen=1000)
+2. Fixed Y-axis 5-pt floor
+3. Gapless session (22-24 -> ASIAN)
 """
 
 import asyncio
 import json
 import logging
 import os
-import shutil
 import time
 import traceback
 from collections import deque
@@ -108,6 +122,35 @@ DERIV_APP_ID     = os.getenv("DERIV_APP_ID", "1089")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DERIV_WS_BASE    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+# ── TradingView Webhook (v5.4) ──────────────────────────────────────
+# Set WEBHOOK_API_KEY in Railway Variables to any random secret string.
+# Use the same string in every TradingView alert JSON as "key":"YOUR_SECRET".
+# Leave blank ONLY for local testing (all requests accepted if blank).
+WEBHOOK_API_KEY    = os.getenv("WEBHOOK_API_KEY", "")
+
+# TradingView chart symbol override, e.g. "OANDA:XAUUSD"
+# Leave blank — bot derives it from the active pair automatically.
+TV_SYMBOL_OVERRIDE = os.getenv("TV_SYMBOL", "")
+
+# Normalise incoming TradingView symbol strings -> internal pair keys
+_TV_SYMBOL_MAP: Dict[str, str] = {
+    "gold":       "XAUUSD", "xauusd":    "XAUUSD",
+    "xau/usd":    "XAUUSD", "xau_usd":   "XAUUSD", "gc1!": "XAUUSD",
+    "eurusd":     "EURUSD", "eur/usd":   "EURUSD", "eur_usd": "EURUSD",
+    "gbpusd":     "GBPUSD", "gbp/usd":   "GBPUSD", "gbp_usd": "GBPUSD",
+    "us100":      "US100",  "nas100":    "US100",  "nasdaq":  "US100",
+    "ndx":        "US100",  "ustech100": "US100",
+}
+
+# TradingView chart links — used by /chart command instead of Matplotlib PNG
+_TV_CHART_BASE = "https://www.tradingview.com/chart/?symbol="
+_TV_PAIR_SYMBOLS: Dict[str, str] = {
+    "XAUUSD": "OANDA:XAUUSD",
+    "EURUSD": "OANDA:EURUSD",
+    "GBPUSD": "OANDA:GBPUSD",
+    "US100":  "NASDAQ:NDX",
+}
 
 # ══════════════════════════════════════════════════════════════════════
 # DATA CLASSES
@@ -274,6 +317,11 @@ class BotState:
         self.news_last_fetch = 0.0
         self.next_red_event  : Optional[NewsEvent] = None
         self.news_chart_path : Optional[str] = None
+
+        # ── TradingView Webhook log (v5.4) ──
+        # Stores last 20 incoming webhook hits for /health visibility
+        self.webhook_log     : List[dict] = []
+        self.last_webhook_ts : float      = 0.0
 
     @property
     def pair_info(self):     return PAIR_REGISTRY[self.pair_key]
@@ -710,21 +758,19 @@ def _swing_pts(df: pd.DataFrame, n: int = 5):
 # ══════════════════════════════════════════════════════════════════════
 # FIX #2: CHART ENGINE — Fixed Y-axis (no flat line, no flicker)
 # ══════════════════════════════════════════════════════════════════════
-# SMC Visual Mapping Colours
-BOS_COLOR = "#2196f3"   # Blue for BOS lines
-CHOCH_COLOR = "#ff5722" # Orange for CHoCH lines
-LIQ_COLOR = "#e91e63"   # Pink for liquidity sweeps
-
 def _resolve_min_range(avg_price: float) -> float:
     """
     Return the minimum acceptable Y-axis range based on price level.
-    FIXED 5.0 PIP RANGE for Mini App stability — no more flickering.
 
-    This ensures chart always has at least 5.0 points of range,
-    preventing flat lines and visual instability.
+    Gold / Indices (>= 1000):   10.0  points
+    Mid-range (>= 10):           1.0  points
+    Forex majors (>= 1):         0.010 (100 pips)
+    Exotic micro (<  1):         0.001
     """
-    # FIXED 5.0 RANGE — Override for Mini App dashboard stability
-    return 5.0
+    if avg_price >= 1000: return 10.0    # XAU/USD, US100
+    if avg_price >= 10:   return 1.0
+    if avg_price >= 1:    return 0.010   # EUR/USD, GBP/USD
+    return 0.001
 
 
 def generate_chart(
@@ -771,23 +817,19 @@ def generate_chart(
         _ax_s(a)
 
     # ══════════════════════════════════════════════════════════════════
-    # FIX #2: Y-AXIS SCALING — FIXED 5.0 PIP RANGE for Mini App stability
-    # The 'Flat Line' Surgical Fix: Force Y-axis to always have minimum
-    # range of 5.0 points. No more flickering or flat lines.
+    # FIX #2: Y-AXIS SCALING — guaranteed minimum range; no flat line
     # ══════════════════════════════════════════════════════════════════
     raw_min   = df["low"].min()
     raw_max   = df["high"].max()
     raw_range = raw_max - raw_min
     avg_price = (raw_max + raw_min) / 2.0
 
-    # FIXED 5.0 PIP RANGE — Mini App stability fix
-    MIN_RANGE = 5.0
+    MIN_RANGE = _resolve_min_range(avg_price)
 
     if raw_range < MIN_RANGE:
-        # Force-expand around the centre price (mid - 2.5, mid + 2.5)
-        mid = (raw_max + raw_min) / 2
-        chart_min    = mid - 2.5
-        chart_max    = mid + 2.5
+        # Force-expand around the centre price
+        chart_min    = avg_price - MIN_RANGE / 2.0
+        chart_max    = avg_price + MIN_RANGE / 2.0
         actual_range = MIN_RANGE
     else:
         pad          = raw_range * 0.12   # 12 % breathing room
@@ -868,101 +910,39 @@ def generate_chart(
     def _in_range(price):
         return chart_min <= price <= chart_max
 
-    # ════════════════════════════════════════════════════════════════════
-    # VISUAL SMC MAPPING — Order Blocks, FVG, BOS/CHoCH, Liquidity Sweeps
-    # ════════════════════════════════════════════════════════════════════
-
-    # Draw BOS / CHoCH lines with labels
-    struct = _bos_choch(df) if len(df) >= 20 else None
-    if struct and _in_range(struct["level"]):
-        struct_color = BOS_COLOR if struct["type"] == "BOS" else CHOCH_COLOR
-        struct_style = "-" if struct["type"] == "BOS" else "--"
-        am.axhline(struct["level"], color=struct_color, ls=struct_style, 
-                   lw=2.0, alpha=0.9, zorder=7)
-        am.text(len(df) - 3, struct["level"],
-                f" {struct['type']} {struct['direction'][:4]}",
-                color=struct_color, fontsize=8, fontweight="bold",
-                va="bottom" if struct["direction"] == "BULLISH" else "top",
-                fontfamily="monospace", zorder=8,
-                bbox=dict(boxstyle="round,pad=.2", fc="#0d1117", 
-                          ec=struct_color, alpha=0.8))
-
-    # Draw Order Block rectangles
     if state.active_ob:
         ob = state.active_ob
         if _in_range(ob["low"]) and _in_range(ob["high"]):
             oc  = OBB if ob["type"] == "BULL" else OBR
-            # Draw filled rectangle for OB
-            ob_rect = mpatches.Rectangle(
-                (len(df) - 35, ob["low"]),
-                35, ob["high"] - ob["low"],
-                linewidth=2, edgecolor=oc, facecolor=oc,
-                alpha=0.2, zorder=4)
-            am.add_patch(ob_rect)
-            # Add border lines
-            am.axhline(ob["high"], color=oc, ls="--", lw=1.2, alpha=0.9)
-            am.axhline(ob["low"],  color=oc, ls="--", lw=1.2, alpha=0.9)
+            xs0 = max(0, len(df) - 35) / len(df)
+            am.axhspan(ob["low"], ob["high"], xmin=xs0, alpha=0.15, color=oc)
+            am.axhline(ob["high"], color=oc, ls="--", lw=0.9, alpha=0.8)
+            am.axhline(ob["low"],  color=oc, ls="--", lw=0.9, alpha=0.8)
             am.text(2, ob["high"],
                     f" {ob['type']} OB sc:{state.ob_score}/100",
-                    color=oc, fontsize=8, fontweight="bold",
-                    va="bottom", fontfamily="monospace",
-                    bbox=dict(boxstyle="round,pad=.2", fc="#0d1117", 
-                              ec=oc, alpha=0.8))
+                    color=oc, fontsize=7, va="bottom", fontfamily="monospace")
 
-    # Draw FVG (Fair Value Gap) shaded boxes
     if state.active_fvg:
         fvg = state.active_fvg
         if _in_range(fvg["low"]) and _in_range(fvg["high"]):
-            # Draw shaded FVG box
-            fvg_rect = mpatches.Rectangle(
-                (len(df) - 25, fvg["low"]),
-                25, fvg["high"] - fvg["low"],
-                linewidth=1.5, edgecolor=FC, facecolor=FC,
-                alpha=0.25, hatch="//", zorder=4)
-            am.add_patch(fvg_rect)
-            am.text(len(df) - 12, fvg["high"],
-                    f" FVG {fvg['type']}",
-                    color=FC, fontsize=7, fontweight="bold",
-                    va="bottom", fontfamily="monospace",
-                    bbox=dict(boxstyle="round,pad=.2", fc="#0d1117", 
-                              ec=FC, alpha=0.8))
+            am.axhspan(fvg["low"], fvg["high"], alpha=0.13, color=FC)
+            am.text(2, fvg["high"], " FVG", color=FC, fontsize=7,
+                    va="bottom", fontfamily="monospace")
 
-    # Draw IDM (Inducement) lines with sweep markers
     if state.active_idm:
         idm = state.active_idm
         if _in_range(idm["level"]):
-            am.axhline(idm["level"], color=IC, ls=":", lw=1.5, alpha=0.9)
-            sw = "SWEPT ✓" if idm.get("swept") else "PENDING"
-            # Mark liquidity sweep with 'X' if swept
-            if idm.get("swept"):
-                am.plot(len(df) - 5, idm["level"], "x", 
-                        color=LIQ_COLOR, ms=12, mew=3, zorder=9)
-                am.text(len(df) - 8, idm["level"],
-                        " LIQ ", color=LIQ_COLOR, fontsize=7,
-                        fontweight="bold", va="center",
-                        fontfamily="monospace",
-                        bbox=dict(boxstyle="round,pad=.2", fc="#0d1117", 
-                                  ec=LIQ_COLOR, alpha=0.9))
+            am.axhline(idm["level"], color=IC, ls=":", lw=1.3, alpha=0.9)
+            sw = "SWEPT" if idm.get("swept") else "PENDING"
             am.text(2, idm["level"], f" IDM {sw}", color=IC, fontsize=7,
                     va="bottom", fontfamily="monospace")
 
-    # Draw Trap (Equal Highs/Lows) with liquidity sweep markers
     if state.active_trap:
         trap = state.active_trap
         if _in_range(trap["level"]):
-            am.axhline(trap["level"], color=TC, ls=":", lw=1.8, alpha=0.9)
-            # Mark liquidity sweep with 'X' and 'LIQ' label
-            if trap.get("swept"):
-                am.plot(len(df) - 3, trap["level"], "x",
-                        color=LIQ_COLOR, ms=14, mew=3, zorder=9)
-                am.text(len(df) - 6, trap["level"],
-                        " LIQ SWEEP ", color=LIQ_COLOR, fontsize=8,
-                        fontweight="bold", va="center",
-                        fontfamily="monospace",
-                        bbox=dict(boxstyle="round,pad=.3", fc="#0d1117", 
-                                  ec=LIQ_COLOR, alpha=0.9))
-            am.text(2, trap["level"], f" TRAP {trap['side']} {trap.get('type', '')}",
-                    color=TC, fontsize=7, va="bottom", fontfamily="monospace")
+            am.axhline(trap["level"], color=TC, ls=":", lw=1.5, alpha=0.9)
+            am.text(2, trap["level"], f" TRAP {trap['side']}", color=TC,
+                    fontsize=7, va="bottom", fontfamily="monospace")
 
     if state.last_signal and "fib_hi" in state.last_signal:
         sig = state.last_signal
@@ -2070,32 +2050,21 @@ async def _cmd(cmd: str):
             reply_markup=kb_main())
 
     elif cmd in ("/chart", "cmd_chart"):
-        buf_for_chart = (state.m15_candles if state.exec_tf == "M15"
-                         else state.m5_candles)
-        chart_tf = state.exec_tf
-        if len(buf_for_chart) >= 20:
-            path = generate_chart(buf_for_chart, chart_tf, chart_type="live")
-            if path:
-                pe     = ("🟢" if state.premium_discount == "DISCOUNT"
-                          else "🔴" if state.premium_discount == "PREMIUM" else "⚪")
-                blk    = " 🚫NEWS BLOCK" if state.block_trading else ""
-                md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
-                await tg_async(
-                    f"{market_header()}\n\n"
-                    f"📊 *{state.pair_display} {chart_tf}* [{md_lbl}]{blk}\n"
-                    f"Price:`{state.current_price:.5f}` Bias:`{state.trend_bias}`\n"
-                    f"Zone:{pe}`{state.premium_discount}` Score:`{state.ob_score}/100`\n"
-                    f"Session:`{state.session_now}` ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
-                    f"IDM:{'✅' if state.active_idm and state.active_idm.get('swept') else '⏳'} "
-                    f"Trap:{'✅' if state.active_trap and state.active_trap.get('swept') else '⏳'}",
-                    photo_path=path, reply_markup=kb_main())
-                return
+        # ── v5.4: Send TradingView chart link instead of Matplotlib PNG ──
+        pe     = ("🟢" if state.premium_discount == "DISCOUNT"
+                  else "🔴" if state.premium_discount == "PREMIUM" else "⚪")
+        blk    = " 🚫NEWS BLOCK" if state.block_trading else ""
+        md_lbl = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
+        tv_url = _tv_chart_url()
         await tg_async(
             f"{market_header()}\n\n"
-            f"⚠️ *Chart not ready*\n"
-            f"{chart_tf}:`{len(buf_for_chart)}` bars (needs 20+) "
-            f"sym:`{state.active_symbol}`\n"
-            f"WS:`{'connected' if state.ws else 'disconnected'}`",
+            f"📊 *{state.pair_display} {state.exec_tf}* [{md_lbl}]{blk}\n"
+            f"Price:`{state.current_price:.5f}` Bias:`{state.trend_bias}`\n"
+            f"Zone:{pe}`{state.premium_discount}` Score:`{state.ob_score}/100`\n"
+            f"Session:`{state.session_now}` ATR:`{'OK' if state.atr_filter_ok else 'LOW'}`\n"
+            f"IDM:{'✅' if state.active_idm and state.active_idm.get('swept') else '⏳'} "
+            f"Trap:{'✅' if state.active_trap and state.active_trap.get('swept') else '⏳'}\n\n"
+            f"📈 [Open TradingView Chart]({tv_url})",
             reply_markup=kb_main())
 
     elif cmd in ("/history", "cmd_history"):
@@ -2352,54 +2321,222 @@ async def ws_loop():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# DASHBOARD IMAGE GENERATOR — Telegram Mini App
+# TRADINGVIEW WEBHOOK ENGINE  (v5.4)
 # ══════════════════════════════════════════════════════════════════════
-DASHBOARD_PATH = "/tmp/dashboard.png"
 
-def create_dashboard_image() -> Optional[str]:
+def _tv_symbol_to_pair(raw: str) -> Optional[str]:
     """
-    Create a comprehensive dashboard image for Telegram Mini App.
-    Includes:
-    - Price chart with candlesticks
-    - Visual SMC Mapping (OB, FVG, BOS/CHoCH, Liquidity Sweeps)
-    - Fixed 5.0 Pip Range for stable display (no flicker)
-    - Bot status overlay
+    Convert any TradingView symbol string to an internal PAIR_REGISTRY key.
+    Returns None if unrecognised.
     """
-    # Use the execution timeframe buffer
-    buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
-    
-    if len(buf) < 20:
-        # Create a placeholder image if no data
-        fig, ax = plt.subplots(figsize=(16, 10), facecolor=BG)
-        ax.set_facecolor(PB)
-        ax.text(0.5, 0.5, "⏳ Waiting for market data...",
-                transform=ax.transAxes, fontsize=24, color="#90a4ae",
-                ha="center", va="center", fontfamily="monospace")
-        ax.axis("off")
-        plt.savefig(DASHBOARD_PATH, dpi=130, bbox_inches="tight", facecolor=BG)
-        plt.close(fig)
-        return DASHBOARD_PATH
+    return _TV_SYMBOL_MAP.get(raw.lower().strip())
 
-    # Generate the full chart with SMC overlays
-    path = generate_chart(buf, state.exec_tf, chart_type="live")
-    
-    if path:
-        # Copy to dashboard.png for consistent serving
-        import shutil
-        shutil.copy(path, DASHBOARD_PATH)
-        return DASHBOARD_PATH
-    
-    return None
+
+def _tv_chart_url(pair_key: str = None) -> str:
+    """Return the TradingView chart URL for the given (or active) pair."""
+    if TV_SYMBOL_OVERRIDE:
+        sym = TV_SYMBOL_OVERRIDE
+    else:
+        sym = _TV_PAIR_SYMBOLS.get(pair_key or state.pair_key,
+                                    f"OANDA:{state.pair_key}")
+    return _TV_CHART_BASE + sym
+
+
+def _log_webhook(action: str, symbol: str, result: str):
+    """Append a webhook hit to the rolling log (max 20 entries)."""
+    state.webhook_log.append({
+        "ts":     datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
+        "action": action,
+        "symbol": symbol,
+        "result": result,
+    })
+    if len(state.webhook_log) > 20:
+        state.webhook_log.pop(0)
+    state.last_webhook_ts = time.time()
+
+
+async def _execute_webhook_trade(direction: str,
+                                  pair_key:  str,
+                                  sl:        Optional[float],
+                                  tp:        Optional[float],
+                                  stake:     float) -> str:
+    """
+    Core execution path for a TradingView-triggered trade.
+    Switches pair if different from active, then fires open_contract().
+    Returns a human-readable result string for logging / Telegram.
+    """
+    # ── Guard rails ──
+    if state.paused:
+        return "REJECTED — bot is paused"
+    if state.block_trading:
+        return f"REJECTED — news block: {state.block_reason}"
+    if not state.broker_connected:
+        return "REJECTED — broker not connected"
+    if not is_market_open():
+        return "REJECTED — market closed"
+
+    # ── Switch pair if webhook targets a different one ──
+    if pair_key and pair_key != state.pair_key:
+        log.info(f"📡 Webhook pair switch: {state.pair_key} → {pair_key}")
+        state.pair_key       = pair_key
+        state.small_acc_mode = False
+        if state.ws:
+            try:
+                await subscribe_pair(pair_key)
+            except Exception as e:
+                log.warning(f"Webhook pair switch failed: {e}")
+
+    # ── Build a synthetic signal so SL/TP info is preserved ──
+    entry = state.current_price
+    risk  = abs(entry - sl) if sl else (entry * 0.001)
+    if risk == 0:
+        risk = entry * 0.001
+
+    # Inject SL/TP into last_signal so post-trade reports show them
+    state.last_signal = {
+        "direction": direction,
+        "entry":     entry,
+        "sl":        sl if sl else (
+            entry - risk if direction == "BUY" else entry + risk),
+        "tp1":       tp if tp else (
+            entry + risk * 2 if direction == "BUY" else entry - risk * 2),
+        "tp2":       tp if tp else (
+            entry + risk * 3 if direction == "BUY" else entry - risk * 3),
+        "tp3":       tp if tp else (
+            entry + risk * 4 if direction == "BUY" else entry - risk * 4),
+        "ob_score":  0,
+        "session":   get_session(),
+        "struct":    "WEBHOOK",
+        "bias":      "BULLISH" if direction == "BUY" else "BEARISH",
+        "source":    "tradingview",
+    }
+
+    cid = await open_contract(direction, stake)
+    if cid:
+        return f"OPENED {direction} cid:{cid} stake:{stake:.2f}"
+    return "FAILED — open_contract returned None"
+
+
+async def webhook(req: web.Request) -> web.Response:
+    """
+    POST /webhook
+    ─────────────
+    TradingView alert JSON format (paste into TradingView alert message box):
+
+        {
+          "action":  "{{strategy.order.action}}",
+          "symbol":  "{{ticker}}",
+          "sl":      {{strategy.order.contracts}},
+          "tp":      {{plot_0}},
+          "stake":   2.0,
+          "key":     "YOUR_SECRET_KEY"
+        }
+
+    Or a minimal manual alert:
+        {"action":"buy","symbol":"Gold","key":"YOUR_SECRET_KEY"}
+
+    Supported actions:  buy | sell | close_all
+    """
+    # ── 1. Parse body ──
+    try:
+        data = await req.json()
+    except Exception:
+        log.warning("Webhook: invalid JSON body")
+        return web.json_response(
+            {"ok": False, "error": "invalid JSON"}, status=400)
+
+    # ── 2. API-key security check ──
+    if WEBHOOK_API_KEY:                            # key enforcement is ON
+        incoming_key = str(data.get("key", ""))
+        if incoming_key != WEBHOOK_API_KEY:
+            ip = req.remote or "unknown"
+            log.warning(f"Webhook 403: bad key from {ip}")
+            _log_webhook(
+                data.get("action", "?"),
+                data.get("symbol", "?"),
+                "REJECTED — bad API key")
+            return web.json_response(
+                {"ok": False, "error": "forbidden"}, status=403)
+    else:
+        log.warning("⚠️ WEBHOOK_API_KEY not set — accepting all requests "
+                    "(set it in Railway Variables for production)")
+
+    action  = str(data.get("action", "")).lower().strip()
+    raw_sym = str(data.get("symbol", "")).strip()
+    sl_raw  = data.get("sl")
+    tp_raw  = data.get("tp")
+    stake   = float(data.get("stake", 0) or 0)
+
+    # ── 3. Validate action ──
+    if action not in ("buy", "sell", "close_all"):
+        msg = f"unknown action: {action!r}"
+        log.warning(f"Webhook: {msg}")
+        _log_webhook(action, raw_sym, f"REJECTED — {msg}")
+        return web.json_response({"ok": False, "error": msg}, status=422)
+
+    # ── 4. Resolve symbol → pair ──
+    pair_key = _tv_symbol_to_pair(raw_sym) if raw_sym else state.pair_key
+    if pair_key is None:
+        # Unknown symbol — fall back to active pair but warn
+        log.warning(f"Webhook: unknown symbol {raw_sym!r}, "
+                    f"using active pair {state.pair_key}")
+        pair_key = state.pair_key
+
+    # ── 5. Parse SL / TP ──
+    sl = float(sl_raw) if sl_raw not in (None, "", 0) else None
+    tp = float(tp_raw) if tp_raw not in (None, "", 0) else None
+
+    # ── 6. Compute stake (risk_pct of balance if not provided) ──
+    if stake <= 0:
+        stake = max(
+            PAIR_REGISTRY[pair_key][3],
+            round(state.account_balance * state.risk_pct, 2))
+
+    log.info(f"📡 WEBHOOK  action={action}  sym={raw_sym}→{pair_key}  "
+             f"sl={sl}  tp={tp}  stake={stake:.2f}")
+
+    # ── 7. Execute ──
+    if action == "close_all":
+        n      = await close_all()
+        result = f"CLOSED {n} contracts"
+        await tg_async(
+            f"📡 *TradingView Webhook*\n"
+            f"Action: `close_all`\n"
+            f"Result: ✅ `{result}`\n"
+            f"Chart: [TradingView]({_tv_chart_url(pair_key)})",
+            reply_markup=kb_main())
+    else:
+        direction = "BUY" if action == "buy" else "SELL"
+        result    = await _execute_webhook_trade(
+            direction, pair_key, sl, tp, stake)
+        success   = result.startswith("OPENED")
+        icon      = "✅" if success else "❌"
+        sl_txt    = f"`{sl:.5f}`"  if sl else "_auto_"
+        tp_txt    = f"`{tp:.5f}`"  if tp else "_auto_"
+        tv_url    = _tv_chart_url(pair_key)
+        await tg_async(
+            f"📡 *TradingView Webhook*  {icon}\n\n"
+            f"Action: `{direction}`  Pair: `{pair_key}`\n"
+            f"Entry:  `{state.current_price:.5f}`\n"
+            f"SL: {sl_txt}   TP: {tp_txt}\n"
+            f"Stake: `{stake:.2f} {state.account_currency}`\n\n"
+            f"Result: `{result}`\n\n"
+            f"📊 [Open TradingView Chart]({tv_url})",
+            reply_markup=kb_main())
+
+    _log_webhook(action, raw_sym, result)
+    log.info(f"📡 Webhook result: {result}")
+    return web.json_response({"ok": True, "result": result})
 
 
 # ══════════════════════════════════════════════════════════════════════
-# HEALTH SERVER + TELEGRAM MINI APP DASHBOARD
+# HEALTH / STATUS SERVER
 # ══════════════════════════════════════════════════════════════════════
 async def health(req):
     wr = (f"{state.wins/(state.wins+state.losses)*100:.1f}"
           if (state.wins + state.losses) > 0 else "0")
     return web.json_response({
-        "version":         "5.2",
+        "version":         "5.4",
         "status":          "running" if state.running else "stopped",
         "paused":          state.paused,
         "block_trading":   state.block_trading,
@@ -2430,317 +2567,53 @@ async def health(req):
         "total_pnl":       state.total_pnl,
         "open_contracts":  len(state.open_contracts),
         "history":         len(state.trade_history),
-        "h1":   len(state.h1_candles),
-        "m15":  len(state.m15_candles),
-        "m5":   len(state.m5_candles),
-        "m1":   len(state.m1_candles),
+        "h1":              len(state.h1_candles),
+        "m15":             len(state.m15_candles),
+        "m5":              len(state.m5_candles),
+        "m1":              len(state.m1_candles),
         "news_events":     len(state.news_events),
         "next_red":        (state.next_red_event.title
                             if state.next_red_event else None),
         "gran_actual":     state.gran_actual,
+        # Webhook stats
+        "webhook_key_set": bool(WEBHOOK_API_KEY),
+        "webhook_last_ts": state.last_webhook_ts,
+        "webhook_log":     state.webhook_log[-5:],
     })
-
-
-async def serve_chart(req):
-    """Serve the dashboard.png chart image"""
-    # Generate fresh dashboard image
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, create_dashboard_image)
-    
-    if os.path.exists(DASHBOARD_PATH):
-        return web.FileResponse(
-            DASHBOARD_PATH,
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate",
-                     "Pragma": "no-cache", "Expires": "0"}
-        )
-    return web.Response(text="Chart not available", status=404)
-
-
-async def serve_dashboard(req):
-    """
-    Serve the Telegram Mini App Dashboard HTML page.
-    Dark-themed, auto-refreshes every 1 second.
-    Shows: Chart, Balance, Active Trades, Current Session, Bot Status.
-    """
-    wr = (f"{state.wins/(state.wins+state.losses)*100:.1f}%"
-          if (state.wins + state.losses) > 0 else "N/A")
-    
-    market_status = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
-    bot_status = "🚫 BLOCKED" if state.block_trading else ("🛑 PAUSED" if state.paused else "🟢 ACTIVE")
-    acct_type = "🔴 REAL" if state.account_type == "real" else "🟢 DEMO"
-    mode_icon = "🎯" if state.trading_mode == "SNIPER" else "⚡"
-    
-    next_news = ""
-    if state.next_red_event and state.next_red_event.dt_utc:
-        mins = int((state.next_red_event.dt_utc - datetime.now(UTC)).total_seconds() // 60)
-        if mins > 0:
-            next_news = f"🔴 {state.next_red_event.title[:30]} in {mins}m"
-    
-    html = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <meta http-equiv="refresh" content="1">
-    <title>SMC SNIPER EA v5.2 Dashboard</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        body {{
-            background: #0d1117;
-            color: #e6edf3;
-            font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
-            min-height: 100vh;
-            padding: 8px;
-        }}
-        .header {{
-            background: linear-gradient(135deg, #161b22 0%, #1f2937 100%);
-            border: 1px solid #30363d;
-            border-radius: 12px;
-            padding: 12px;
-            margin-bottom: 8px;
-            text-align: center;
-        }}
-        .title {{
-            font-size: 16px;
-            font-weight: bold;
-            color: #58a6ff;
-            margin-bottom: 4px;
-        }}
-        .subtitle {{
-            font-size: 11px;
-            color: #8b949e;
-        }}
-        .chart-container {{
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 12px;
-            padding: 8px;
-            margin-bottom: 8px;
-            text-align: center;
-        }}
-        .chart-img {{
-            width: 100%;
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-        }}
-        .status-grid {{
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 8px;
-            margin-bottom: 8px;
-        }}
-        .status-card {{
-            background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
-            border: 1px solid #30363d;
-            border-radius: 10px;
-            padding: 10px;
-        }}
-        .status-card.full {{
-            grid-column: span 2;
-        }}
-        .status-label {{
-            font-size: 10px;
-            color: #8b949e;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 4px;
-        }}
-        .status-value {{
-            font-size: 14px;
-            font-weight: bold;
-            color: #e6edf3;
-        }}
-        .status-value.green {{ color: #3fb950; }}
-        .status-value.red {{ color: #f85149; }}
-        .status-value.blue {{ color: #58a6ff; }}
-        .status-value.yellow {{ color: #d29922; }}
-        .status-value.purple {{ color: #a371f7; }}
-        
-        .info-row {{
-            display: flex;
-            justify-content: space-between;
-            padding: 6px 0;
-            border-bottom: 1px solid #21262d;
-            font-size: 11px;
-        }}
-        .info-row:last-child {{
-            border-bottom: none;
-        }}
-        .info-label {{
-            color: #8b949e;
-        }}
-        .info-value {{
-            color: #e6edf3;
-            font-weight: 500;
-        }}
-        
-        .footer {{
-            text-align: center;
-            font-size: 9px;
-            color: #484f58;
-            padding: 8px;
-        }}
-        
-        .news-alert {{
-            background: linear-gradient(135deg, #3d1a1a 0%, #2d0000 100%);
-            border: 1px solid #f85149;
-            border-radius: 8px;
-            padding: 8px;
-            margin-bottom: 8px;
-            text-align: center;
-            font-size: 11px;
-            color: #ff7b72;
-        }}
-        
-        .trade-info {{
-            background: linear-gradient(135deg, #1a3d1a 0%, #0d2d0d 100%);
-            border: 1px solid #3fb950;
-        }}
-        
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.5; }}
-        }}
-        .live-indicator {{
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            background: #3fb950;
-            border-radius: 50%;
-            margin-right: 6px;
-            animation: pulse 1s infinite;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="title">🤖 SMC SNIPER EA v5.2</div>
-        <div class="subtitle"><span class="live-indicator"></span>Live Dashboard · Auto-Refresh 1s</div>
-    </div>
-    
-    {"<div class='news-alert'>" + next_news + "</div>" if next_news else ""}
-    
-    <div class="chart-container">
-        <img src="/chart?t={int(time.time())}" class="chart-img" alt="Trading Chart" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 400 200%22><rect fill=%22%23161b22%22 width=%22400%22 height=%22200%22/><text x=%22200%22 y=%22100%22 fill=%22%238b949e%22 text-anchor=%22middle%22 font-family=%22monospace%22>Loading chart...</text></svg>'">
-    </div>
-    
-    <div class="status-grid">
-        <div class="status-card">
-            <div class="status-label">💰 Balance</div>
-            <div class="status-value green">{state.account_balance:.2f} {state.account_currency}</div>
-        </div>
-        <div class="status-card">
-            <div class="status-label">📊 Active Trades</div>
-            <div class="status-value blue">{len(state.open_contracts)}</div>
-        </div>
-        <div class="status-card">
-            <div class="status-label">🕐 Session</div>
-            <div class="status-value yellow">{state.session_now}</div>
-        </div>
-        <div class="status-card">
-            <div class="status-label">🤖 Bot Status</div>
-            <div class="status-value {'green' if not state.paused and not state.block_trading else 'red'}">{bot_status}</div>
-        </div>
-    </div>
-    
-    <div class="status-card full" style="margin-bottom: 8px;">
-        <div class="info-row">
-            <span class="info-label">Market</span>
-            <span class="info-value">{market_status}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Account</span>
-            <span class="info-value">{acct_type} {state.account_id}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Mode</span>
-            <span class="info-value">{mode_icon} {state.trading_mode}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Pair</span>
-            <span class="info-value">{state.pair_display}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Price</span>
-            <span class="info-value">{state.current_price:.5f}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Trend Bias</span>
-            <span class="info-value">{state.trend_bias}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Zone</span>
-            <span class="info-value">{state.premium_discount}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Score</span>
-            <span class="info-value">{state.ob_score}/100</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Risk</span>
-            <span class="info-value">{state.risk_pct*100:.0f}%</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Win Rate</span>
-            <span class="info-value">{wr}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">W/L</span>
-            <span class="info-value">{state.wins}/{state.losses}</span>
-        </div>
-        <div class="info-row">
-            <span class="info-label">Total P&L</span>
-            <span class="info-value {'green' if state.total_pnl >= 0 else 'red'}">{state.total_pnl:+.2f}</span>
-        </div>
-    </div>
-    
-    <div class="footer">
-        SMC SNIPER EA v5.2 · Railway Deployment · {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")} UTC
-    </div>
-</body>
-</html>'''
-    
-    return web.Response(
-        text=html,
-        content_type="text/html",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
-    )
 
 
 async def start_health():
     app = web.Application()
-    # Dashboard routes for Telegram Mini App
-    app.router.add_get("/",        serve_dashboard)  # Main dashboard HTML
-    app.router.add_get("/chart",   serve_chart)      # Serve dashboard.png
-    # Health/status endpoints
+    app.router.add_get("/",        health)
     app.router.add_get("/health",  health)
-    app.router.add_get("/api/status", health)
+    app.router.add_post("/webhook", webhook)      # ← TradingView endpoint
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info(f"Dashboard & Health Server started on :{PORT}")
-
+    wk_status = ("🔑 API key SET" if WEBHOOK_API_KEY
+                 else "⚠️ NO API KEY — set WEBHOOK_API_KEY in Railway!")
+    log.info(f"🌐 Health:  http://0.0.0.0:{PORT}/health")
+    log.info(f"📡 Webhook: http://0.0.0.0:{PORT}/webhook  ({wk_status})")
 
 
 # ══════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════
 async def main():
-    log.info("=" * 70)
-    log.info("  SMC SNIPER EA v5.2 - Multi-Strategy Autonomous Trading Bot")
-    log.info("  Telegram Mini App Dashboard + Visual SMC Mapping")
-    log.info("  News Shield | Broker Connect | Post-Trade Reports")
-    log.info("  [FIXED: 5.0 Pip Range | Session Gap | Railway-Ready]")
-    log.info("=" * 70)
+    log.info("╔══════════════════════════════════════════════╗")
+    log.info("║  SMC SNIPER EA v5.4 · TradingView Webhooks   ║")
+    log.info("║ TV Chart Links | Webhook Security | Deriv    ║")
+    log.info("║ News Shield | Post-Reports | Amharic | Auto  ║")
+    log.info("╚══════════════════════════════════════════════╝")
+    if WEBHOOK_API_KEY:
+        log.info(f"🔑 Webhook API key: SET (length={len(WEBHOOK_API_KEY)})")
+    else:
+        log.warning("⚠️  WEBHOOK_API_KEY not set — all webhook requests accepted!")
+    if TV_SYMBOL_OVERRIDE:
+        log.info(f"📺 TradingView symbol override: {TV_SYMBOL_OVERRIDE}")
     _load_saved_token()
     if not state.deriv_token:
-        log.warning("No DERIV_API_TOKEN - bot will prompt user via /connect")
-    log.info(f"Starting Dashboard on PORT {PORT}...")
+        log.warning("No DERIV_API_TOKEN — bot will prompt user via /connect")
     await asyncio.gather(
         start_health(),
         ws_loop(),
@@ -2756,5 +2629,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Shutting down...")
+        log.info("Shutting down…")
         state.running = False
