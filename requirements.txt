@@ -9,3 +9,4 @@ tzdata==2024.1
 python-dotenv==1.0.1
 asyncio==3.4.3
 tradingview_ta
+mplfinance
