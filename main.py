@@ -3,7 +3,7 @@
 ║        SMC SNIPER EA v5.3 — Multi-Strategy Autonomous Trading Bot    ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
 ║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
-║              [CHART FIXED — mplfinance hlines validator error]       ║
+║            [FULL CODE — ALL FUNCTIONS RESTORED & CHART FIX]          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -651,7 +651,7 @@ async def news_block_monitor():
         await asyncio.sleep(60)
 
 # ==================================================
-# 13. CHART ENGINE (FIXED: hlines validator error)
+# 13. CHART ENGINE (FIXED: panel indices and ratios)
 # ==================================================
 BG = "#0d1117"; PB = "#161b22"; GR = "#1e2a38"
 BC = "#00e676"; RC = "#ff1744"
@@ -737,13 +737,14 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         add_plots.append(mpf.make_addplot(ema50, color='#78909c', width=1.2, linestyle='--', panel=0))
 
+    # RSI - now placed on panel=1 (since volume=False, panels: 0 = price, 1 = RSI)
     rsi = _rsi_calc(df["close"].values)
     rsi_series = pd.Series(rsi, index=df.index)
-    add_plots.append(mpf.make_addplot(rsi_series, color='#90a4ae', width=1.2, panel=2, ylabel='RSI'))
+    add_plots.append(mpf.make_addplot(rsi_series, color='#90a4ae', width=1.2, panel=1, ylabel='RSI'))
     rsi_70 = pd.Series([70] * len(df), index=df.index)
     rsi_30 = pd.Series([30] * len(df), index=df.index)
-    add_plots.append(mpf.make_addplot(rsi_70, color='#d50000', width=0.6, linestyle='--', panel=2))
-    add_plots.append(mpf.make_addplot(rsi_30, color='#00c853', width=0.6, linestyle='--', panel=2))
+    add_plots.append(mpf.make_addplot(rsi_70, color='#d50000', width=0.6, linestyle='--', panel=1))
+    add_plots.append(mpf.make_addplot(rsi_30, color='#00c853', width=0.6, linestyle='--', panel=1))
 
     hlines_dict = {'hlines': [], 'colors': [], 'linestyle': [], 'linewidths': []}
     if state.last_signal:
@@ -789,14 +790,13 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
              f"Bias:{state.trend_bias}  Zone:{state.premium_discount} · {state.current_price:.2f} "
              f"Sess:{state.session_now}{' 🚫NEWS' if state.block_trading else ''}")
 
-    # FIX: Always pass hlines_dict (never None) and wrap in try/except
     try:
         fig, axes = mpf.plot(
             df, type='candle', style=s, title=title, ylabel='Price', volume=False,
-            addplot=add_plots, figsize=(12,8), panel_ratios=(5,1,1.2), returnfig=True,
+            addplot=add_plots, figsize=(12,8), panel_ratios=(5, 1.5), returnfig=True,
             tight_layout=True, scale_width_adjustment=dict(candle=0.8, volume=0.8),
             update_width_config=dict(candle_linewidth=1.2, candle_width=0.8),
-            hlines=hlines_dict,   # pass dict even if empty
+            hlines=hlines_dict,
             warn_too_much_data=1000, ylim=(y_min, y_max)
         )
     except Exception as e:
@@ -872,14 +872,301 @@ def generate_history_chart() -> Optional[str]:
     return path
 
 # ==================================================
-# 14. SMC SNIPER BRAIN (signal logic)
+# 14. SMC SNIPER BRAIN (All signal functions restored)
 # ==================================================
-# (All the signal functions are the same as before, omitted here for brevity.
-#  They are included in the full code but I'm truncating to keep the answer length manageable.
-#  The full version from earlier should be used.)
-# ==================================================
-# ... (insert all signal functions: _bos_choch, _pd_zone, _idm, _equal_hl, _ob, _fvg, _atr, _get_trend, sniper_score, compute_signal, check_trade_mgmt) ...
-# ==================================================
+def _bos_choch(df: pd.DataFrame) -> Optional[dict]:
+    H, L = _swing_pts(df)
+    if len(H) < 2 or len(L) < 2:
+        return None
+    lsh, psh = H[-1], H[-2]
+    lsl, psl = L[-1], L[-2]
+    lc = df["close"].iloc[-1]
+    if lc > df["high"].iloc[lsh] and lsh > psh:
+        return {"type": "BOS", "direction": "BULLISH", "level": df["high"].iloc[lsh]}
+    if lc < df["low"].iloc[lsl] and lsl > psl:
+        return {"type": "BOS", "direction": "BEARISH", "level": df["low"].iloc[lsl]}
+    if df["high"].iloc[lsh] < df["high"].iloc[psh] and lc > df["high"].iloc[lsh]:
+        return {"type": "CHoCH", "direction": "BULLISH", "level": df["high"].iloc[lsh]}
+    if df["low"].iloc[lsl] > df["low"].iloc[psl] and lc < df["low"].iloc[lsl]:
+        return {"type": "CHoCH", "direction": "BEARISH", "level": df["low"].iloc[lsl]}
+    return None
+
+def _pd_zone(df: pd.DataFrame) -> tuple:
+    hi, lo = df["high"].max(), df["low"].min()
+    r = hi - lo
+    if r == 0:
+        return "NEUTRAL", hi, lo
+    fib_hi, fib_lo = hi - r * 0.382, lo + r * 0.382
+    c = df["close"].iloc[-1]
+    if c <= fib_lo: return "DISCOUNT", fib_hi, fib_lo
+    if c >= fib_hi: return "PREMIUM", fib_hi, fib_lo
+    return "EQUILIBRIUM", fib_hi, fib_lo
+
+def _idm(df: pd.DataFrame, direction: str) -> Optional[dict]:
+    H, L = _swing_pts(df, n=3)
+    if direction == "BULLISH" and len(L) >= 2:
+        lvl = df["low"].iloc[L[-2]]
+        last = df.iloc[-1]
+        return {"side": "BUY", "level": lvl, "swept": last["low"] < lvl and last["close"] > lvl}
+    if direction == "BEARISH" and len(H) >= 2:
+        lvl = df["high"].iloc[H[-2]]
+        last = df.iloc[-1]
+        return {"side": "SELL", "level": lvl, "swept": last["high"] > lvl and last["close"] < lvl}
+    return None
+
+def _equal_hl(df: pd.DataFrame) -> Optional[dict]:
+    tol = 0.0003 if state.pair_key in ("EURUSD", "GBPUSD") else 0.0005
+    r = df.iloc[-25:]
+    hs, ls = r["high"].values, r["low"].values
+    for i in range(len(hs)-1, 1, -1):
+        for j in range(i-1, max(i-8,0), -1):
+            if abs(hs[i]-hs[j])/hs[j] < tol:
+                lvl = (hs[i]+hs[j])/2
+                last = df.iloc[-1]
+                if last["high"] > lvl and last["close"] < lvl:
+                    return {"side": "SELL", "level": lvl, "swept": True, "type": "EQL_HIGHS"}
+            if abs(ls[i]-ls[j])/ls[j] < tol:
+                lvl = (ls[i]+ls[j])/2
+                last = df.iloc[-1]
+                if last["low"] < lvl and last["close"] > lvl:
+                    return {"side": "BUY", "level": lvl, "swept": True, "type": "EQL_LOWS"}
+    return None
+
+def _ob(df: pd.DataFrame, direction: str) -> Optional[dict]:
+    lk = min(30, len(df)-3)
+    r = df.iloc[-lk:].reset_index(drop=True)
+    ab = (r["close"]-r["open"]).abs().mean()
+    if direction == "BULLISH":
+        for i in range(len(r)-3,1,-1):
+            c, nc = r.iloc[i], r.iloc[i+1]
+            if c["close"] < c["open"] and nc["close"] > c["high"] and abs(nc["close"]-nc["open"]) > ab*1.5:
+                return {"type": "BULL", "high": c["high"], "low": c["low"],
+                        "body_hi": max(c["open"],c["close"]),
+                        "body_lo": min(c["open"],c["close"]),
+                        "displacement": round(abs(nc["close"]-nc["open"])/ab,2)}
+    elif direction == "BEARISH":
+        for i in range(len(r)-3,1,-1):
+            c, nc = r.iloc[i], r.iloc[i+1]
+            if c["close"] > c["open"] and nc["close"] < c["low"] and abs(nc["close"]-nc["open"]) > ab*1.5:
+                return {"type": "BEAR", "high": c["high"], "low": c["low"],
+                        "body_hi": max(c["open"],c["close"]),
+                        "body_lo": min(c["open"],c["close"]),
+                        "displacement": round(abs(nc["close"]-nc["open"])/ab,2)}
+    return None
+
+def _fvg(df: pd.DataFrame, ob: dict) -> Optional[dict]:
+    if ob is None:
+        return None
+    thr = 0.03 if state.pair_key in ("EURUSD","GBPUSD") else 0.05
+    r = df.iloc[-min(25,len(df)-3):].reset_index(drop=True)
+    if ob["type"] == "BULL":
+        for i in range(len(r)-3,0,-1):
+            c1, c3 = r.iloc[i], r.iloc[i+2]
+            gp = (c3["low"]-c1["high"])/c1["high"]*100
+            if c1["high"] < c3["low"] and gp >= thr:
+                return {"type":"BULL","high":c3["low"],"low":c1["high"],"gap_pct":gp}
+    elif ob["type"] == "BEAR":
+        for i in range(len(r)-3,0,-1):
+            c1, c3 = r.iloc[i], r.iloc[i+2]
+            gp = (c1["low"]-c3["high"])/c1["low"]*100
+            if c1["low"] > c3["high"] and gp >= thr:
+                return {"type":"BEAR","high":c1["low"],"low":c3["high"],"gap_pct":gp}
+    return None
+
+def _atr(df: pd.DataFrame, n: int = 14) -> float:
+    if len(df) < n+1:
+        return 0.
+    tr = np.maximum(df["high"]-df["low"],
+                    np.maximum(abs(df["high"]-df["close"].shift(1)),
+                               abs(df["low"]-df["close"].shift(1))))
+    return float(tr.iloc[-n:].mean())
+
+def _get_trend(tf_name: str) -> str:
+    buf = state.h1_candles if tf_name == "H1" else state.m15_candles
+    if len(buf) < 30:
+        return "NEUTRAL"
+    df = pd.DataFrame(list(buf))
+    df.columns = ["time","open","high","low","close"]
+    r = _bos_choch(df)
+    if r:
+        state.trend_bias = r["direction"]
+    else:
+        c = df["close"].values[-20:]
+        state.trend_bias = "BULLISH" if np.polyfit(np.arange(len(c)),c,1)[0] > 0 else "BEARISH"
+    return state.trend_bias
+
+def sniper_score(ob, fvg, trap, idm, rsi, session, atr_ok, ema_ok, candle_ok, struct_type, disp) -> tuple:
+    s, reasons = 0, []
+    if fvg: s+=20; reasons.append("FVG +20")
+    if trap and trap.get("swept"): s+=15; reasons.append("LiqTrap✅ +15")
+    if idm and idm.get("swept"): s+=15; reasons.append("IDM✅ +15")
+    if ob and disp>=2.0: s+=10; reasons.append(f"Disp{disp:.1f}x +10")
+    if struct_type=="BOS": s+=10; reasons.append("BOS +10")
+    if struct_type=="CHoCH": s+=8; reasons.append("CHoCH +8")
+    if session=="OVERLAP": s+=10; reasons.append("Overlap +10")
+    if session in ("LONDON","NY"): s+=7; reasons.append(f"{session} +7")
+    if atr_ok: s+=5; reasons.append("ATR✅ +5")
+    if ema_ok: s+=5; reasons.append("EMA✅ +5")
+    if candle_ok: s+=5; reasons.append("Candle✅ +5")
+    if ob:
+        if ob["type"]=="BULL" and rsi<40: s+=5; reasons.append(f"RSI{rsi:.0f}(OS) +5")
+        if ob["type"]=="BEAR" and rsi>60: s+=5; reasons.append(f"RSI{rsi:.0f}(OB) +5")
+    return min(s,100), reasons
+
+def compute_signal(tf: str = "M15") -> Optional[dict]:
+    if tf == "M15": buf = state.m15_candles
+    elif tf == "M5": buf = state.m5_candles
+    elif tf == "M1": buf = state.m1_candles
+    else: return None
+    if len(buf) < 40:
+        return None
+
+    df = pd.DataFrame(list(buf))
+    df.columns = ["time","open","high","low","close"]
+
+    bias = _get_trend(state.trend_tf)
+    if bias == "NEUTRAL":
+        return None
+
+    struct = _bos_choch(df)
+    if struct is None or struct["direction"] != bias:
+        return None
+
+    pd_zone, fib_hi, fib_lo = _pd_zone(df)
+    state.premium_discount = pd_zone
+    if (bias == "BULLISH" and pd_zone != "DISCOUNT") or (bias == "BEARISH" and pd_zone != "PREMIUM"):
+        return None
+
+    idm = _idm(df, bias)
+    state.active_idm = idm
+    if idm is None:
+        return None
+
+    trap = _equal_hl(df)
+    state.active_trap = trap
+    if trap is not None and trap["side"] != ("BUY" if bias == "BULLISH" else "SELL"):
+        trap = None
+        state.active_trap = None
+
+    ob_ = _ob(df, bias)
+    if ob_ is None:
+        return None
+    state.active_ob = ob_
+
+    fvg_ = _fvg(df, ob_)
+    state.active_fvg = fvg_
+    rsi_now = float(_rsi_calc(df["close"].values)[-1])
+
+    session = get_session()
+    state.session_now = session
+    if state.pair_key == "XAUUSD" and session not in ("LONDON","NY","OVERLAP"):
+        return None
+
+    atr_v = _atr(df)
+    thresholds = {"XAUUSD":0.5, "EURUSD":0.0005, "GBPUSD":0.0006, "US100":5.}
+    atr_ok = atr_v >= thresholds.get(state.pair_key, .0001)
+    state.atr_filter_ok = atr_ok
+    if not atr_ok:
+        return None
+
+    ema50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    price = df["close"].iloc[-1]
+    ema_ok = (price > ema50 if bias == "BULLISH" else price < ema50)
+
+    last = df.iloc[-1]
+    candle_ok = (last["close"] > last["open"] if bias == "BULLISH" else last["close"] < last["open"])
+
+    disp = ob_.get("displacement", 1.)
+    sc, score_reasons = sniper_score(ob_, fvg_, trap, idm, rsi_now, session,
+                                     atr_ok, ema_ok, candle_ok, struct["type"], disp)
+    state.ob_score = sc
+    if sc < state.min_score:
+        return None
+
+    # TradingView confirmation (optional)
+    tv_confirmed = False
+    tv_message = ""
+    if TV_AVAILABLE and state.tv_symbol:
+        tv_confirmed, tv_message = check_tradingview("BUY" if bias == "BULLISH" else "SELL")
+        if not tv_confirmed:
+            log.info(f"TradingView rejection: {tv_message}")
+            return None
+
+    reason = TradeReason()
+    reason.h1_trend = f"{bias} (BOS/CHoCH confirmed)"
+    reason.structure = struct["type"]
+    reason.pd_zone = pd_zone
+    reason.idm_sweep = f"{'✅ Swept' if idm.get('swept') else '⏳ Pending'} @{idm['level']:.5f}"
+    reason.trap_sweep = f"{'✅ Swept' if trap and trap.get('swept') else 'None'}"
+    reason.ob_type = f"{ob_['type']} disp:{disp:.1f}x"
+    reason.fvg_present = fvg_ is not None
+    reason.session = session
+    reason.atr_state = f"{'✅ OK' if atr_ok else '⚠️ LOW'} ({atr_v:.5f})"
+    reason.ema_confirm = f"Price {'above' if price>ema50 else 'below'} EMA50 ✅"
+    reason.rsi_level = rsi_now
+    reason.candle_conf = f"{'Bullish' if candle_ok and bias=='BULLISH' else 'Bearish'} close ✅"
+    reason.score = sc
+    reason.entry_logic = " + ".join(score_reasons)
+    if tv_confirmed:
+        reason.tv_confirm = tv_message
+
+    if bias == "BULLISH":
+        entry = ob_["body_hi"]
+        sl = ob_["low"] * 0.9995
+    else:
+        entry = ob_["body_lo"]
+        sl = ob_["high"] * 1.0005
+
+    risk = abs(entry - sl)
+    if risk == 0:
+        return None
+    mult = 1 if bias == "BULLISH" else -1
+    tp1 = entry + risk * state.tp1_r * mult
+    tp2 = entry + risk * state.tp2_r * mult
+    tp3 = entry + risk * state.tp3_r * mult
+    stake = max(1., round(max(PAIR_REGISTRY[state.pair_key][3],
+                              state.account_balance * state.risk_pct), 2))
+
+    sig = {
+        "direction": "BUY" if bias == "BULLISH" else "SELL",
+        "entry": round(entry,5), "sl": round(sl,5),
+        "tp1": round(tp1,5), "tp2": round(tp2,5), "tp3": round(tp3,5),
+        "risk_r": round(risk,5), "stake": stake,
+        "struct": struct["type"], "ob": ob_, "fvg": fvg_,
+        "trap": trap, "idm": idm, "ob_score": sc, "rsi": rsi_now,
+        "pd_zone": pd_zone, "fib_hi": fib_hi, "fib_lo": fib_lo,
+        "session": session, "tf": tf, "bias": bias,
+        "reason": reason, "score_reasons": score_reasons,
+        "tv_confirmed": tv_confirmed,
+        "ts": datetime.now(UTC).isoformat(),
+    }
+    state.last_signal = sig
+    return sig
+
+def check_trade_mgmt():
+    for cid, info in list(state.open_contracts.items()):
+        sig = info.get("signal")
+        if not sig:
+            continue
+        p = state.current_price
+        d = info["direction"]
+        if not info["be_moved"]:
+            if (d == "BUY" and p >= sig["tp1"]) or (d == "SELL" and p <= sig["tp1"]):
+                info["be_moved"] = True
+                sig["sl"] = sig["entry"]
+        buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
+        if len(buf) >= 10:
+            df = pd.DataFrame(list(buf)[-30:])
+            df.columns = ["time","open","high","low","close"]
+            swh, swl = _swing_pts(df, n=3)
+            if d == "BUY" and swl:
+                t = df["low"].iloc[swl[-1]] * 0.9998
+                if t > sig["sl"]:
+                    sig["sl"] = t
+            elif d == "SELL" and swh:
+                t = df["high"].iloc[swh[-1]] * 1.0002
+                if t < sig["sl"]:
+                    sig["sl"] = t
 
 # ==================================================
 # 15. DERIV WEBSOCKET & TRADE EXECUTION
@@ -1704,7 +1991,7 @@ async def main():
     log.info("╔══════════════════════════════════════════════╗")
     log.info("║  SMC SNIPER EA v5.3 · Multi-Strategy Auto    ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  [CHART FIXED — mplfinance hlines validator] ║")
+    log.info("║  [ALL FUNCTIONS RESTORED & CHART FIXED]      ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
