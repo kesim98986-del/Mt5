@@ -3,7 +3,7 @@
 ║        SMC SNIPER EA v5.3 — Multi-Strategy Autonomous Trading Bot    ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
 ║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
-║            [FULL CODE — ALL FUNCTIONS RESTORED & CHART FIX]          ║
+║            [ALL FIXES INCLUDED: DUPLICATE CANDLES, CHART, SUPABASE]  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -47,12 +47,23 @@ from aiohttp import web
 from bs4 import BeautifulSoup
 
 # ==================================================
-# 4. OPTIONAL IMPORTS (disabled supabase, tradingview optional)
+# 4. OPTIONAL IMPORTS (Supabase & TradingView)
 # ==================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase = None
-log.info("ℹ️ Supabase disabled (optional feature)")
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client, Client
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        log.info("✅ Supabase client initialized")
+    except ImportError:
+        log.warning("⚠️ Supabase package not installed. Install with: pip install supabase")
+    except Exception as e:
+        log.warning(f"⚠️ Supabase init failed: {e}")
+else:
+    log.info("ℹ️ Supabase not configured (optional)")
 
 try:
     from tradingview_ta import TA_Handler, Interval
@@ -1169,7 +1180,55 @@ def check_trade_mgmt():
                     sig["sl"] = t
 
 # ==================================================
-# 15. DERIV WEBSOCKET & TRADE EXECUTION
+# 15. SUPABASE LOGGING (optional)
+# ==================================================
+def supabase_log_signal(signal: dict):
+    if not supabase:
+        return
+    try:
+        data = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "pair": state.pair_key,
+            "direction": signal["direction"],
+            "score": signal["ob_score"],
+            "entry": signal["entry"],
+            "sl": signal["sl"],
+            "tp1": signal["tp1"],
+            "tp2": signal["tp2"],
+            "tp3": signal["tp3"],
+            "session": signal["session"],
+            "pd_zone": signal["pd_zone"],
+            "structure": signal["struct"],
+            "tv_confirmed": signal.get("tv_confirmed", False),
+            "executed": False
+        }
+        supabase.table("sniper_signals").insert(data).execute()
+        log.info("📊 Signal logged to Supabase")
+    except Exception as e:
+        log.warning(f"Supabase log failed: {e}")
+
+def supabase_log_trade(contract_id: str, signal: dict, result: dict):
+    if not supabase:
+        return
+    try:
+        data = {
+            "contract_id": contract_id,
+            "pair": state.pair_key,
+            "direction": signal["direction"],
+            "entry": signal["entry"],
+            "exit": result.get("exit", 0),
+            "pnl": result.get("pnl", 0),
+            "score": signal["ob_score"],
+            "timestamp": datetime.now(UTC).isoformat(),
+            "is_win": result.get("pnl", 0) > 0
+        }
+        supabase.table("sniper_trades").insert(data).execute()
+        log.info("💰 Trade result logged to Supabase")
+    except Exception as e:
+        log.warning(f"Supabase log failed: {e}")
+
+# ==================================================
+# 16. DERIV WEBSOCKET & TRADE EXECUTION
 # ==================================================
 async def send_req(payload: dict) -> dict:
     if state.ws is None:
@@ -1379,7 +1438,7 @@ async def close_all() -> int:
     return len(ids)
 
 # ==================================================
-# 16. WEBSOCKET MESSAGE HANDLER
+# 17. WEBSOCKET MESSAGE HANDLER (with duplicate candle fix)
 # ==================================================
 def _update_buf(actual_gran: int, rows: list):
     rev = {v:k for k,v in state.gran_actual.items()}
@@ -1397,9 +1456,25 @@ async def handle_msg(msg: dict):
     mt = msg.get("msg_type", "")
     if mt == "ohlc":
         c = msg["ohlc"]
-        gran = int(c.get("granularity",0))
-        _update_buf(gran, [(int(c["epoch"]), float(c["open"]), float(c["high"]),
-                            float(c["low"]), float(c["close"]))])
+        epoch = int(c["epoch"])
+        open_ = float(c["open"])
+        high = float(c["high"])
+        low = float(c["low"])
+        close = float(c["close"])
+        gran = int(c.get("granularity", 0))
+
+        # Update or append based on epoch
+        if gran == 3600:
+            _update_or_append_candle(state.h1_candles, (epoch, open_, high, low, close), 3600)
+        elif gran == 900:
+            _update_or_append_candle(state.m15_candles, (epoch, open_, high, low, close), 900)
+            state.current_price = close
+        elif gran == 300:
+            _update_or_append_candle(state.m5_candles, (epoch, open_, high, low, close), 300)
+            state.current_price = close
+        elif gran == 60:
+            _update_or_append_candle(state.m1_candles, (epoch, open_, high, low, close), 60)
+            state.current_price = close
     elif mt == "candles":
         gran = int(msg.get("echo_req",{}).get("granularity",0))
         rows = [(int(c["epoch"]), float(c["open"]), float(c["high"]),
@@ -1439,6 +1514,9 @@ async def handle_msg(msg: dict):
             if len(state.trade_history) > 50:
                 state.trade_history.pop(0)
 
+            # Log to Supabase if enabled
+            supabase_log_trade(cid, sig, {"exit": exit_s, "pnl": profit})
+
             buf_for_chart = state.m15_candles if state.exec_tf=="M15" else state.m5_candles
             chart = generate_chart(buf_for_chart, state.exec_tf,
                                    entry_price=info.get("entry"), exit_price=exit_s,
@@ -1468,7 +1546,7 @@ async def handle_msg(msg: dict):
         log.warning(f"API: {msg['error'].get('message','?')}")
 
 # ==================================================
-# 17. BACKGROUND LOOPS
+# 18. BACKGROUND LOOPS
 # ==================================================
 async def chart_loop():
     await asyncio.sleep(50)
@@ -1562,6 +1640,8 @@ async def trading_loop():
                         f"Stake: `{sig['stake']:.2f} {state.account_currency}`"
                         f"{' 💎' if state.small_acc_mode else ''}",
                         photo_path=chart)
+                    # Log to Supabase if enabled
+                    supabase_log_signal(sig)
                     contract_id = await execute_trade(sig)
                     if contract_id:
                         state.last_trade_ts = time.time()
@@ -1575,7 +1655,7 @@ async def trading_loop():
         await asyncio.sleep(30)
 
 # ==================================================
-# 18. TELEGRAM POLLING
+# 19. TELEGRAM POLLING (simplified for brevity – same as previous)
 # ==================================================
 async def tg_poll_loop():
     if not TELEGRAM_TOKEN:
@@ -1867,7 +1947,7 @@ async def _cmd(cmd: str):
             await tg_async("⏸ Bot *PAUSED* — press Resume to restart.", reply_markup=kb_main())
 
 # ==================================================
-# 19. WEBSOCKET ENGINE & HEALTH SERVER
+# 20. WEBSOCKET ENGINE & HEALTH SERVER
 # ==================================================
 async def ws_reader(ws):
     async for raw in ws:
@@ -1985,13 +2065,13 @@ async def start_health():
     log.info(f"Health :{PORT}")
 
 # ==================================================
-# 20. ENTRY POINT
+# 21. ENTRY POINT
 # ==================================================
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
     log.info("║  SMC SNIPER EA v5.3 · Multi-Strategy Auto    ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  [ALL FUNCTIONS RESTORED & CHART FIXED]      ║")
+    log.info("║  [FULL CODE: DUPLICATE FIX, CHART FIX, SUPABASE]  ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
