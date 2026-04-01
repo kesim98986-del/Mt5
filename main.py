@@ -1,11 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.5 — Production‑Ready Autonomous Bot          ║
+║        SMC SNIPER EA v5.4 — Fully Customizable Trading Bot          ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║    [FINAL FIX: No Duplicate Candles, Professional Chart Scaling]     ║
+║   Duplicate Candle Fix | Chart Fix | Supabase | Custom Settings      ║
+║               [Score / Timeframe / Top-Down Analysis]                ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
+# ==================================================
+# 1. STANDARD LIBRARY IMPORTS
+# ==================================================
 import asyncio
 import json
 import logging
@@ -18,7 +22,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-# ==================== SETUP LOGGING FIRST ====================
+# ==================================================
+# 2. SETUP LOGGING IMMEDIATELY
+# ==================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -26,7 +32,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("SNIPER")
 
-# ==================== REQUIRED IMPORTS ====================
+# ==================================================
+# 3. REQUIRED THIRD-PARTY IMPORTS
+# ==================================================
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -38,17 +46,22 @@ import websockets
 from aiohttp import web
 from bs4 import BeautifulSoup
 
-# ==================== OPTIONAL IMPORTS (Supabase / TradingView) ====================
+# ==================================================
+# 4. OPTIONAL IMPORTS (Supabase & TradingView)
+# ==================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase = None
+
 if SUPABASE_URL and SUPABASE_KEY:
     try:
-        from supabase import create_client
+        from supabase import create_client, Client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         log.info("✅ Supabase client initialized")
+    except ImportError:
+        log.warning("⚠️ Supabase package not installed. Install with: pip install supabase")
     except Exception as e:
-        log.warning(f"Supabase init failed: {e}")
+        log.warning(f"⚠️ Supabase init failed: {e}")
 else:
     log.info("ℹ️ Supabase not configured (optional)")
 
@@ -59,67 +72,97 @@ try:
 except ImportError:
     TV_AVAILABLE = False
     log.info("ℹ️ TradingView TA not installed (optional)")
+except Exception as e:
+    TV_AVAILABLE = False
+    log.warning(f"⚠️ TradingView init failed: {e}")
 
-# ==================== CONSTANTS ====================
+# ==================================================
+# 5. CONSTANTS & REGISTRIES
+# ==================================================
 NY_TZ = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
-PAIR_REGISTRY = {
+PAIR_REGISTRY: Dict[str, tuple] = {
     "XAUUSD": ("frxXAUUSD", "OTC_XAUUSD", 0.01, 1.0, "XAU/USD 🥇", "METAL", "FX_IDC:XAUUSD"),
     "EURUSD": ("frxEURUSD", "OTC_EURUSD", 0.0001, 1.0, "EUR/USD 🇪🇺", "FOREX", "FX:EURUSD"),
     "GBPUSD": ("frxGBPUSD", "OTC_GBPUSD", 0.0001, 1.0, "GBP/USD 🇬🇧", "FOREX", "FX:GBPUSD"),
     "US100":  ("frxUS100",  "OTC_NDX",    0.1,    1.0, "NASDAQ 💻",   "INDEX", "NASDAQ:US100"),
 }
 
-GRAN_FALLBACKS = {3600: [3600,7200], 900: [900,600,1800], 300: [300,180,600], 60: [60,120]}
+GRAN_FALLBACKS = {
+    3600: [3600, 7200],
+    900:  [900, 600, 1800],
+    300:  [300, 180, 600],
+    60:   [60, 120],
+}
 
-MARKET_OPEN_HOUR = 22
+SESSIONS = {
+    "ASIAN":   (0,  8),
+    "LONDON":  (8,  13),
+    "OVERLAP": (13, 17),
+    "NY":      (17, 22),
+}
+
+BEST_SESSIONS = {
+    "METAL": ["LONDON", "NY", "OVERLAP"],
+    "FOREX": ["LONDON", "NY", "OVERLAP"],
+    "INDEX": ["NY", "OVERLAP"],
+}
+
+MARKET_OPEN_HOUR  = 22
 MARKET_CLOSE_HOUR = 21
+
 TOKEN_FILE = Path("/tmp/.deriv_token")
+
 PRE_NEWS_BLOCK = 30 * 60
 POST_NEWS_WAIT = 15 * 60
-NEWS_INTERVAL = 12 * 3600
+NEWS_INTERVAL  = 12 * 3600
 CHART_INTERVAL = int(os.getenv("CHART_INTERVAL", "300"))
-PORT = int(os.getenv("PORT", "8080"))
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DERIV_WS_BASE = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+PORT           = int(os.getenv("PORT", "8080"))
 
-# ==================== DATA CLASSES ====================
+DERIV_APP_ID     = os.getenv("DERIV_APP_ID", "1089")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DERIV_WS_BASE    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+# ==================================================
+# 6. DATA CLASSES
+# ==================================================
 class NewsEvent:
     __slots__ = ("time_et","currency","impact","title","actual","forecast","prev","dt_utc")
     def __init__(self, time_et, currency, impact, title, actual="", forecast="", prev=""):
-        self.time_et = time_et
+        self.time_et  = time_et
         self.currency = currency
-        self.impact = impact
-        self.title = title
-        self.actual = actual
+        self.impact   = impact
+        self.title    = title
+        self.actual   = actual
         self.forecast = forecast
-        self.prev = prev
-        self.dt_utc = None
+        self.prev     = prev
+        self.dt_utc   = None
+
     @property
-    def is_red(self): return self.impact == "high"
+    def is_red(self):    return self.impact == "high"
     @property
     def is_orange(self): return self.impact == "medium"
 
+
 class TradeReason:
     def __init__(self):
-        self.h1_trend = ""
-        self.structure = ""
-        self.pd_zone = ""
-        self.idm_sweep = ""
-        self.trap_sweep = ""
-        self.ob_type = ""
+        self.h1_trend    = ""
+        self.structure   = ""
+        self.pd_zone     = ""
+        self.idm_sweep   = ""
+        self.trap_sweep  = ""
+        self.ob_type     = ""
         self.fvg_present = False
-        self.session = ""
-        self.atr_state = ""
+        self.session     = ""
+        self.atr_state   = ""
         self.ema_confirm = ""
-        self.rsi_level = 0.0
-        self.score = 0
+        self.rsi_level   = 0.0
+        self.score       = 0
         self.candle_conf = ""
         self.entry_logic = ""
-        self.tv_confirm = ""
+        self.tv_confirm  = ""
 
     def build_report(self, direction: str) -> str:
         arrow = "📈 BUY" if direction == "BUY" else "📉 SELL"
@@ -155,98 +198,106 @@ class TradeReason:
 
     def build_amharic(self, direction: str) -> str:
         arrow = "ወደ ላይ (BUY)" if direction == "BUY" else "ወደ ታች (SELL)"
-        return (f"🤖 *ቦቱ ዝርዝር ምክንያት:*\nአቅጣጫ: `{arrow}`\n"
-                f"• ዋና ዝንባሌ: `{self.h1_trend}`\n"
-                f"• IDM ተወስዷል: `{self.idm_sweep}`\n"
-                f"• ወጥመድ ተወስዷል: `{self.trap_sweep}`\n"
-                f"• OB ዓይነት: `{self.ob_type}`\n"
-                f"• ዞን: `{self.pd_zone}`\n"
-                f"• ሰሽን: `{self.session}`\n"
-                f"• ውሳኔ ምክንያት: `{self.entry_logic}`")
+        return (
+            f"🤖 *ቦቱ ዝርዝር ምክንያት:*\n"
+            f"አቅጣጫ: `{arrow}`\n"
+            f"• ዋና ዝንባሌ: `{self.h1_trend}`\n"
+            f"• IDM ተወስዷል: `{self.idm_sweep}`\n"
+            f"• ወጥመድ ተወስዷል: `{self.trap_sweep}`\n"
+            f"• OB ዓይነት: `{self.ob_type}`\n"
+            f"• ዞን: `{self.pd_zone}`\n"
+            f"• ሰሽን: `{self.session}`\n"
+            f"• ውሳኔ ምክንያት: `{self.entry_logic}`"
+        )
 
-# ==================== BOT STATE ====================
+
+# ==================================================
+# 7. BOT STATE
+# ==================================================
 class BotState:
     def __init__(self):
-        self.deriv_token = os.getenv("DERIV_API_TOKEN", "")
+        self.deriv_token      = os.getenv("DERIV_API_TOKEN", "")
         self.broker_connected = False
-        self.account_type = "unknown"
-        self.account_id = ""
-        self.account_balance = 0.0
+        self.account_type     = "unknown"
+        self.account_id       = ""
+        self.account_balance  = 0.0
         self.account_currency = "USD"
-        self.awaiting_token = False
+        self.awaiting_token   = False
+        self.awaiting_custom_score = False  # for manual score input
 
-        self.running = True
-        self.paused = False
-        self.autonomous = True
+        self.running       = True
+        self.paused        = False
+        self.autonomous    = True
         self.block_trading = False
-        self.block_reason = ""
+        self.block_reason  = ""
 
         self.trading_mode = "SNIPER"
-        self.min_score = int(os.getenv("MIN_SCORE", "75"))
-        self.trend_tf = "H1"
-        self.exec_tf = "M15"
-        self.conf_tf = "M5"
+        self.min_score    = int(os.getenv("MIN_SCORE", "75"))
+        self.trend_tf     = "H1"
+        self.exec_tf      = "M15"
+        self.conf_tf      = "M5"
+        self.top_down     = True   # enable top-down confirmation by default
 
-        self.pair_key = "XAUUSD"
-        self.active_symbol = ""
-        self.risk_pct = 0.01
-        self.tp1_r = 2.0
-        self.tp2_r = 4.0
-        self.tp3_r = 6.0
+        self.pair_key       = "XAUUSD"
+        self.active_symbol  = ""
+        self.risk_pct       = 0.01
+        self.tp1_r          = 2.0
+        self.tp2_r          = 4.0
+        self.tp3_r          = 6.0
         self.small_acc_mode = False
 
-        # Candle buffers (maxlen=1000 ensures we never lose history)
-        self.h1_candles = deque(maxlen=1000)
+        self.h1_candles  = deque(maxlen=1000)
         self.m15_candles = deque(maxlen=1000)
-        self.m5_candles = deque(maxlen=1000)
-        self.m1_candles = deque(maxlen=1000)
-        self.gran_actual = {3600:3600, 900:900, 300:300, 60:60}
+        self.m5_candles  = deque(maxlen=1000)
+        self.m1_candles  = deque(maxlen=1000)
+        self.gran_actual = {3600: 3600, 900: 900, 300: 300, 60: 60}
 
-        self.current_price = 0.0
-        self.trend_bias = "NEUTRAL"
-        self.last_signal = None
-        self.active_ob = None
-        self.active_fvg = None
-        self.active_trap = None
-        self.active_idm = None
+        self.current_price    = 0.0
+        self.trend_bias       = "NEUTRAL"
+        self.last_signal      = None
+        self.active_ob        = None
+        self.active_fvg       = None
+        self.active_trap      = None
+        self.active_idm       = None
         self.premium_discount = "NEUTRAL"
-        self.ob_score = 0
-        self.session_now = "ASIAN"
-        self.atr_filter_ok = True
-        self.market_open = True
+        self.ob_score         = 0
+        self.session_now      = "ASIAN"
+        self.atr_filter_ok    = True
+        self.market_open      = True
 
-        self.ws = None
-        self.req_id = 1
-        self.pending_reqs = {}
+        self.ws             = None
+        self.req_id         = 1
+        self.pending_reqs   = {}
         self.subscribed_sym = None
-        self.ws_task = None
+        self.ws_task        = None
 
-        self.open_contracts = {}
-        self.trade_count = 0
-        self.wins = 0
-        self.losses = 0
-        self.total_pnl = 0.0
-        self.trade_history = []
-        self.last_trade_ts = 0.0
+        self.open_contracts : Dict[str, dict] = {}
+        self.trade_count    = 0
+        self.wins           = 0
+        self.losses         = 0
+        self.total_pnl      = 0.0
+        self.trade_history  : List[dict] = []
+        self.last_trade_ts  = 0.0
         self.signal_cooldown = 300
 
-        self.news_events = []
+        self.news_events     : List[NewsEvent] = []
         self.news_last_fetch = 0.0
-        self.next_red_event = None
-        self.news_chart_path = None
+        self.next_red_event  : Optional[NewsEvent] = None
+        self.news_chart_path : Optional[str] = None
 
         self.tv_last_check = 0.0
         self.tv_confirmed = False
         self.tv_signal = None
 
     @property
-    def pair_info(self): return PAIR_REGISTRY[self.pair_key]
+    def pair_info(self):     return PAIR_REGISTRY[self.pair_key]
     @property
-    def pair_display(self): return self.pair_info[4]
+    def pair_display(self):  return self.pair_info[4]
     @property
     def pair_category(self): return self.pair_info[5]
     @property
-    def tv_symbol(self): return self.pair_info[6] if len(self.pair_info) > 6 else None
+    def tv_symbol(self):     return self.pair_info[6] if len(self.pair_info) > 6 else None
+
 
 state = BotState()
 
@@ -260,23 +311,26 @@ def _load_saved_token():
     except Exception as e:
         log.warning(f"Token load: {e}")
 
-# ==================== MARKET & SESSION HELPERS ====================
+# ==================================================
+# 8. MARKET HOURS & SESSION
+# ==================================================
 def is_market_open() -> bool:
     now = datetime.now(UTC)
-    wd = now.weekday()
-    h = now.hour
+    wd  = now.weekday()
+    h   = now.hour
     if wd == 4 and h >= 21: return False
-    if wd == 5: return False
-    if wd == 6 and h < 22: return False
+    if wd == 5:              return False
+    if wd == 6 and h < 22:  return False
     return True
 
 def time_to_next_open() -> str:
-    now = datetime.now(UTC)
-    wd = now.weekday()
-    days_to_sun = (6 - wd) % 7
+    now          = datetime.now(UTC)
+    wd           = now.weekday()
+    days_to_sun  = (6 - wd) % 7
     if days_to_sun == 0 and now.hour >= 22:
         days_to_sun = 7
-    next_open = (now + timedelta(days=days_to_sun)).replace(hour=22, minute=0, second=0, microsecond=0)
+    next_open = (now + timedelta(days=days_to_sun)).replace(
+        hour=22, minute=0, second=0, microsecond=0)
     delta = next_open - now
     h, rem = divmod(int(delta.total_seconds()), 3600)
     m = rem // 60
@@ -284,7 +338,7 @@ def time_to_next_open() -> str:
 
 def get_session() -> str:
     h = datetime.now(UTC).hour
-    if 8 <= h < 13: return "LONDON"
+    if 8  <= h < 13: return "LONDON"
     if 13 <= h < 17: return "OVERLAP"
     if 17 <= h < 22: return "NY"
     return "ASIAN"
@@ -294,7 +348,9 @@ def market_header() -> str:
         return f"🟢 Market is *OPEN* · Session: `{get_session()}`"
     return f"🔴 Market is *CLOSED* · Opens in `{time_to_next_open()}`"
 
-# ==================== TRADINGVIEW CONFIRMATION ====================
+# ==================================================
+# 9. TRADINGVIEW CONFIRMATION (optional)
+# ==================================================
 def check_tradingview(direction: str) -> tuple:
     if not TV_AVAILABLE or not state.tv_symbol:
         return False, "TradingView not available"
@@ -323,9 +379,12 @@ def check_tradingview(direction: str) -> tuple:
         log.warning(f"TradingView check failed: {e}")
         return False, f"TV error: {e}"
 
-# ==================== TELEGRAM KEYBOARDS (simplified) ====================
+# ==================================================
+# 10. KEYBOARDS (Telegram)
+# ==================================================
 def kb_main():
-    block_lbl = ("🚫 Blocked" if state.block_trading else ("🛑 Paused" if state.paused else "🟢 Active"))
+    block_lbl = ("🚫 Blocked" if state.block_trading
+                 else ("🛑 Paused" if state.paused else "🟢 Active"))
     return {"inline_keyboard": [
         [{"text": "📊 Status", "callback_data": "cmd_status"},
          {"text": "📰 News",   "callback_data": "cmd_news"}],
@@ -339,13 +398,17 @@ def kb_main():
     ]}
 
 def kb_settings():
-    r = state.risk_pct * 100
+    r  = state.risk_pct * 100
     sm = "✅" if state.small_acc_mode else "○"
     md = "🎯 Sniper" if state.trading_mode == "SNIPER" else "⚡ Scalper"
+    td = "✅" if state.top_down else "○"
     return {"inline_keyboard": [
         [{"text": f"🎛 Mode: {md}", "callback_data": "cmd_mode_menu"}],
         [{"text": "💱 Select Pair", "callback_data": "cmd_pair_menu"}],
         [{"text": f"{sm} 💎 Small Acc ($10)", "callback_data": "cmd_small_acc"}],
+        [{"text": f"🎯 Min Score: {state.min_score}", "callback_data": "cmd_score_menu"}],
+        [{"text": f"⏱️ Timeframes", "callback_data": "cmd_tf_menu"}],
+        [{"text": f"{td} Top‑Down Analysis", "callback_data": "cmd_top_down"}],
         [{"text": f"{'✅' if r==1 else '○'} 1% Risk", "callback_data": "cmd_risk_1"},
          {"text": f"{'✅' if r==3 else '○'} 3% Risk", "callback_data": "cmd_risk_3"},
          {"text": f"{'✅' if r==5 else '○'} 5% Risk", "callback_data": "cmd_risk_5"}],
@@ -375,31 +438,78 @@ def kb_pair_menu():
 def kb_connect():
     return {"inline_keyboard": [
         [{"text": "📋 How to get Token", "callback_data": "cmd_token_help"}],
-        [{"text": "⬅️ Cancel", "callback_data": "cmd_back"}],
+        [{"text": "⬅️ Cancel",           "callback_data": "cmd_back"}],
     ]}
 
-# ==================== TELEGRAM SEND HELPERS ====================
+def kb_score():
+    # buttons for 10,20,...,100 and a custom option
+    buttons = []
+    for i in range(10, 101, 10):
+        buttons.append({"text": str(i), "callback_data": f"cmd_score_{i}"})
+    # group in rows of 4
+    rows = [buttons[i:i+4] for i in range(0, len(buttons), 4)]
+    rows.append([{"text": "✏️ Custom", "callback_data": "cmd_score_custom"}])
+    rows.append([{"text": "⬅️ Back", "callback_data": "cmd_settings"}])
+    return {"inline_keyboard": rows}
+
+def kb_tf():
+    return {"inline_keyboard": [
+        [{"text": "Trend TF", "callback_data": "cmd_tf_trend"}],
+        [{"text": "Execution TF", "callback_data": "cmd_tf_exec"}],
+        [{"text": "Confirmation TF", "callback_data": "cmd_tf_conf"}],
+        [{"text": "⬅️ Back", "callback_data": "cmd_settings"}],
+    ]}
+
+def kb_tf_trend():
+    return {"inline_keyboard": [
+        [{"text": "H1", "callback_data": "cmd_tf_trend_H1"},
+         {"text": "M15", "callback_data": "cmd_tf_trend_M15"}],
+        [{"text": "M5", "callback_data": "cmd_tf_trend_M5"},
+         {"text": "M1", "callback_data": "cmd_tf_trend_M1"}],
+        [{"text": "⬅️ Back", "callback_data": "cmd_tf_menu"}],
+    ]}
+
+def kb_tf_exec():
+    return {"inline_keyboard": [
+        [{"text": "M15", "callback_data": "cmd_tf_exec_M15"},
+         {"text": "M5", "callback_data": "cmd_tf_exec_M5"},
+         {"text": "M1", "callback_data": "cmd_tf_exec_M1"}],
+        [{"text": "⬅️ Back", "callback_data": "cmd_tf_menu"}],
+    ]}
+
+def kb_tf_conf():
+    return {"inline_keyboard": [
+        [{"text": "M5", "callback_data": "cmd_tf_conf_M5"},
+         {"text": "M1", "callback_data": "cmd_tf_conf_M1"}],
+        [{"text": "⬅️ Back", "callback_data": "cmd_tf_menu"}],
+    ]}
+
+# ==================================================
+# 11. TELEGRAM HELPER FUNCTIONS
+# ==================================================
 def tg_send(text: str, photo_path: str = None, reply_markup=None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    base   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     markup = reply_markup if reply_markup is not None else kb_main()
     try:
         if photo_path:
             with open(photo_path, "rb") as fh:
-                requests.post(f"{base}/sendPhoto", data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": text[:1024],
+                r = requests.post(f"{base}/sendPhoto", data={
+                    "chat_id":      TELEGRAM_CHAT_ID,
+                    "caption":      text[:1024],
                     "reply_markup": json.dumps(markup),
-                    "parse_mode": "Markdown",
+                    "parse_mode":   "Markdown",
                 }, files={"photo": fh}, timeout=20)
         else:
-            requests.post(f"{base}/sendMessage", json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
+            r = requests.post(f"{base}/sendMessage", json={
+                "chat_id":      TELEGRAM_CHAT_ID,
+                "text":         text,
                 "reply_markup": markup,
-                "parse_mode": "Markdown",
+                "parse_mode":   "Markdown",
             }, timeout=10)
+        if r.status_code not in (200, 201):
+            log.warning(f"TG {r.status_code}: {r.text[:100]}")
     except Exception as e:
         log.error(f"tg_send: {e}")
 
@@ -416,22 +526,30 @@ async def tg_async(text: str, photo_path: str = None, reply_markup=None):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: tg_send(text, photo_path, reply_markup))
 
-# ==================== NEWS ENGINE (Forex Factory) ====================
-FF_HEADERS = {"User-Agent": "Mozilla/5.0 ...", "Accept-Language": "en-US,en;q=0.9"}
+# ==================================================
+# 12. NEWS ENGINE (Forex Factory)
+# ==================================================
+FF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 def _parse_ff_time(ts: str, base: datetime) -> Optional[datetime]:
     ts = ts.strip().lower()
-    if not ts or ts in ("all day","tentative","","—"):
+    if not ts or ts in ("all day", "tentative", "", "—"):
         return base.replace(hour=0, minute=0, second=0)
     try:
         t = datetime.strptime(ts, "%I:%M%p")
-        return base.replace(hour=t.hour, minute=t.minute, second=0, tzinfo=NY_TZ).astimezone(UTC)
+        return base.replace(
+            hour=t.hour, minute=t.minute, second=0,
+            tzinfo=NY_TZ).astimezone(UTC)
     except Exception:
         return None
 
 def fetch_news() -> List[NewsEvent]:
-    events = []
+    events: List[NewsEvent] = []
     today = datetime.now(NY_TZ)
-    for offset in (0,1):
+    for offset in (0, 1):
         target = today + timedelta(days=offset)
         url = f"https://www.forexfactory.com/calendar?day={target.strftime('%b%d.%Y').lower()}"
         try:
@@ -460,17 +578,20 @@ def fetch_news() -> List[NewsEvent]:
                 title = ec.get_text(strip=True) if ec else ""
                 if not title or not currency:
                     continue
-                if currency not in {"USD","XAU"}:
+                if currency not in {"USD", "XAU"}:
                     continue
-                if impact not in {"high","medium"}:
+                if impact not in {"high", "medium"}:
                     continue
+
                 def _gt(sel):
                     el = row.select_one(sel)
                     return el.get_text(strip=True) if el else ""
-                ev = NewsEvent(cur_time, currency, impact, title,
-                               _gt(".calendar__actual"),
-                               _gt(".calendar__forecast"),
-                               _gt(".calendar__previous"))
+
+                ev = NewsEvent(
+                    cur_time, currency, impact, title,
+                    _gt(".calendar__actual"),
+                    _gt(".calendar__forecast"),
+                    _gt(".calendar__previous"))
                 ev.dt_utc = _parse_ff_time(cur_time, target)
                 events.append(ev)
         except Exception as e:
@@ -496,7 +617,7 @@ def _news_block() -> tuple:
         if 0 < until <= PRE_NEWS_BLOCK:
             return True, f"🚨 Red news in {int(until//60)}m: *{ev.title}*"
         if 0 < after <= POST_NEWS_WAIT:
-            remain = int((POST_NEWS_WAIT - after)//60)
+            remain = int((POST_NEWS_WAIT - after) // 60)
             return True, f"⏳ Post-news cooldown: {remain}m left (*{ev.title}*)"
     return False, ""
 
@@ -531,23 +652,23 @@ def generate_news_chart() -> Optional[str]:
     for ev in evs[:18]:
         t = ev.dt_utc.astimezone(NY_TZ).strftime("%I:%M%p") if ev.dt_utc else ev.time_et
         rows.append([t, ev.currency, "🔴" if ev.is_red else "🟠", ev.title[:40], ev.forecast or "—", ev.actual or "—"])
-    cols = ["Time (ET)","Curr","Impact","Event","Forecast","Actual"]
-    widths = [0.10,0.06,0.07,0.44,0.14,0.15]
+    cols = ["Time (ET)", "Curr", "Impact", "Event", "Forecast", "Actual"]
+    widths = [0.10, 0.06, 0.07, 0.44, 0.14, 0.15]
     fig, ax = plt.subplots(figsize=(14, max(4, len(rows)*0.42+1.8)), facecolor="#0d1117")
     ax.axis("off")
     tbl = ax.table(cellText=rows, colLabels=cols, cellLoc="left", loc="center", colWidths=widths)
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(8)
-    tbl.scale(1,1.5)
+    tbl.scale(1, 1.5)
     for j in range(len(cols)):
-        tbl[0,j].set_facecolor("#1f2937")
-        tbl[0,j].set_text_props(color="#cdd9e5", fontweight="bold", fontfamily="monospace")
+        tbl[0, j].set_facecolor("#1f2937")
+        tbl[0, j].set_text_props(color="#cdd9e5", fontweight="bold", fontfamily="monospace")
     for i, ev in enumerate(evs[:18]):
         rc = "#2d0000" if ev.is_red else "#2d1a00" if ev.is_orange else "#161b22"
         tc = "#ff6b6b" if ev.is_red else "#ffa94d" if ev.is_orange else "#90a4ae"
         for j in range(len(cols)):
-            tbl[i+1,j].set_facecolor(rc)
-            tbl[i+1,j].set_text_props(color=tc, fontfamily="monospace")
+            tbl[i+1, j].set_facecolor(rc)
+            tbl[i+1, j].set_text_props(color=tc, fontfamily="monospace")
     nxt = state.next_red_event
     nxt_s = f" | Next🔴: {nxt.title[:22]}@{nxt.dt_utc.astimezone(NY_TZ).strftime('%I:%M%p ET')}" if nxt and nxt.dt_utc else ""
     ax.set_title(f"📰 Forex Factory — USD & XAU News · {now_ny.strftime('%A %b %d %Y %I:%M%p ET')}{nxt_s}",
@@ -589,9 +710,15 @@ async def news_block_monitor():
             log.error(f"news_block_monitor: {e}")
         await asyncio.sleep(60)
 
-# ==================== CHART ENGINE (FINAL FIX) ====================
+# ==================================================
+# 13. CHART ENGINE (FIXED: panel indices and ratios)
+# ==================================================
 BG = "#0d1117"; PB = "#161b22"; GR = "#1e2a38"
 BC = "#00e676"; RC = "#ff1744"
+OBB = "#00bcd4"; OBR = "#ff9800"
+FC = "#ce93d8"; TC = "#ffeb3b"; IC = "#80cbc4"
+EC = "#2979ff"; SC = "#f44336"
+TPC = ["#69f0ae", "#40c4ff", "#b388ff"]
 
 def _ax_s(ax):
     ax.set_facecolor(PB)
@@ -601,7 +728,7 @@ def _ax_s(ax):
     ax.grid(axis="y", color=GR, linewidth=0.4, alpha=0.6)
 
 def _rsi_calc(p: np.ndarray, n: int = 14) -> np.ndarray:
-    if len(p) < n+1:
+    if len(p) < n + 1:
         return np.full(len(p), 50.)
     d = np.diff(p)
     g = np.where(d > 0, d, 0.)
@@ -622,11 +749,12 @@ def _swing_pts(df: pd.DataFrame, n: int = 5):
     return H, L
 
 def _dedupe_candles(df: pd.DataFrame) -> pd.DataFrame:
-    # Remove consecutive identical rows
-    mask = ~((df["open"] == df["open"].shift(1)) &
-             (df["high"] == df["high"].shift(1)) &
-             (df["low"] == df["low"].shift(1)) &
-             (df["close"] == df["close"].shift(1)))
+    mask = ~(
+        (df["open"] == df["open"].shift(1)) &
+        (df["high"] == df["high"].shift(1)) &
+        (df["low"] == df["low"].shift(1)) &
+        (df["close"] == df["close"].shift(1))
+    )
     df = df[mask].reset_index(drop=True)
     if "time" in df.columns:
         df = df.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
@@ -635,47 +763,41 @@ def _dedupe_candles(df: pd.DataFrame) -> pd.DataFrame:
 def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
                    exit_price: float = None, direction: str = None, pnl: float = None,
                    chart_type: str = "live", reason: "TradeReason" = None) -> Optional[str]:
-    if len(candles) < 10:
+    if len(candles) < 20:
         log.info(f"Chart skipped — only {len(candles)} candles")
         return None
 
-    # Convert to DataFrame
     df = pd.DataFrame(list(candles))
     df.columns = ["time", "open", "high", "low", "close"]
-    df = df.astype({"open":float, "high":float, "low":float, "close":float})
+    df = df.astype({"open": float, "high": float, "low": float, "close": float})
 
-    # Basic cleaning
     df = df[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)]
     med = df["close"].median()
     df = df[(df["close"] > med * 0.5) & (df["close"] < med * 2.0)]
     df = _dedupe_candles(df)
 
-    # Use last 50 candles for chart
-    SHOW = 50
+    SHOW = 40
     df = df.tail(SHOW).reset_index(drop=True)
     if len(df) < 10:
-        log.info(f"Chart skipped — only {len(df)} clean candles")
         return None
 
-    # Convert to datetime index
     df["date"] = pd.to_datetime(df["time"], unit="s")
     df.set_index("date", inplace=True)
 
-    # Y-axis: min/max of visible candles + 5% padding
-    y_min = df["low"].min()
-    y_max = df["high"].max()
-    padding = (y_max - y_min) * 0.05
-    y_min -= padding
-    y_max += padding
+    raw_min, raw_max = df["low"].min(), df["high"].max()
+    if state.pair_key == "XAUUSD":
+        y_min, y_max = raw_min - 0.5, raw_max + 0.5
+    else:
+        pr = raw_max - raw_min
+        y_min, y_max = raw_min - pr * 0.05, raw_max + pr * 0.05
 
-    # Indicators
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
     add_plots = [mpf.make_addplot(ema21, color='#ffeb3b', width=1.5, panel=0)]
     if len(df) >= 50:
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         add_plots.append(mpf.make_addplot(ema50, color='#78909c', width=1.2, linestyle='--', panel=0))
 
-    # RSI on panel 1
+    # RSI - now placed on panel=1 (since volume=False, panels: 0 = price, 1 = RSI)
     rsi = _rsi_calc(df["close"].values)
     rsi_series = pd.Series(rsi, index=df.index)
     add_plots.append(mpf.make_addplot(rsi_series, color='#90a4ae', width=1.2, panel=1, ylabel='RSI'))
@@ -684,7 +806,6 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
     add_plots.append(mpf.make_addplot(rsi_70, color='#d50000', width=0.6, linestyle='--', panel=1))
     add_plots.append(mpf.make_addplot(rsi_30, color='#00c853', width=0.6, linestyle='--', panel=1))
 
-    # Horizontal lines (entry/SL/TP)
     hlines_dict = {'hlines': [], 'colors': [], 'linestyle': [], 'linewidths': []}
     if state.last_signal:
         sig = state.last_signal
@@ -710,7 +831,6 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         hlines_dict['linestyle'].append('--')
         hlines_dict['linewidths'].append(2)
 
-    # Style
     mc_style = mpf.make_marketcolors(
         up='#00c853', down='#d50000',
         edge={'up':'#00e676','down':'#ff1744'},
@@ -734,8 +854,8 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         fig, axes = mpf.plot(
             df, type='candle', style=s, title=title, ylabel='Price', volume=False,
             addplot=add_plots, figsize=(12,8), panel_ratios=(5, 1.5), returnfig=True,
-            tight_layout=True, scale_width_adjustment=dict(candle=0.6, volume=0.8),
-            update_width_config=dict(candle_linewidth=1.2, candle_width=0.6),
+            tight_layout=True, scale_width_adjustment=dict(candle=0.8, volume=0.8),
+            update_width_config=dict(candle_linewidth=1.2, candle_width=0.8),
             hlines=hlines_dict,
             warn_too_much_data=1000, ylim=(y_min, y_max)
         )
@@ -745,7 +865,6 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
 
     ax_main = axes[0]
 
-    # Add annotations (OB, FVG, etc.)
     def _in_range(p): return y_min <= p <= y_max
     if state.active_ob:
         ob = state.active_ob
@@ -768,7 +887,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
             ax_main.axhline(trap["level"], color='#e040fb', ls=':', lw=1.5, alpha=0.9)
 
     ts_now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    info_text = (f"SMC SNIPER v5.5 [{state.trading_mode}] · {state.pair_display} · "
+    info_text = (f"SMC SNIPER v5.4 [{state.trading_mode}] · {state.pair_display} · "
                  f"Bal:{state.account_balance:.2f}{state.account_currency} · "
                  f"Risk:{state.risk_pct*100:.0f}% · Last {len(df)} candles · {ts_now}")
     fig.text(0.5, 0.01, info_text, ha='center', va='bottom', fontsize=6, color='#8b949e', fontfamily='monospace')
@@ -805,35 +924,39 @@ def generate_history_chart() -> Optional[str]:
     ax2.axhline(0, color=GR, lw=.8)
     ax2.set_ylabel("Cumulative", color="#90a4ae", fontsize=8)
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99, .01, f"SMC SNIPER v5.5 · {ts}", color="#444d56", fontsize=7, ha="right")
+    fig.text(.99, .01, f"SMC SNIPER v5.4 · {ts}", color="#444d56", fontsize=7, ha="right")
     path = "/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return path
 
-# ==================== SMC SNIPER BRAIN (All functions restored) ====================
+# ==================================================
+# 14. SMC SNIPER BRAIN (All signal functions restored)
+# ==================================================
 def _bos_choch(df: pd.DataFrame) -> Optional[dict]:
     H, L = _swing_pts(df)
-    if len(H)<2 or len(L)<2: return None
+    if len(H) < 2 or len(L) < 2:
+        return None
     lsh, psh = H[-1], H[-2]
     lsl, psl = L[-1], L[-2]
     lc = df["close"].iloc[-1]
     if lc > df["high"].iloc[lsh] and lsh > psh:
-        return {"type":"BOS","direction":"BULLISH","level":df["high"].iloc[lsh]}
+        return {"type": "BOS", "direction": "BULLISH", "level": df["high"].iloc[lsh]}
     if lc < df["low"].iloc[lsl] and lsl > psl:
-        return {"type":"BOS","direction":"BEARISH","level":df["low"].iloc[lsl]}
+        return {"type": "BOS", "direction": "BEARISH", "level": df["low"].iloc[lsl]}
     if df["high"].iloc[lsh] < df["high"].iloc[psh] and lc > df["high"].iloc[lsh]:
-        return {"type":"CHoCH","direction":"BULLISH","level":df["high"].iloc[lsh]}
+        return {"type": "CHoCH", "direction": "BULLISH", "level": df["high"].iloc[lsh]}
     if df["low"].iloc[lsl] > df["low"].iloc[psl] and lc < df["low"].iloc[lsl]:
-        return {"type":"CHoCH","direction":"BEARISH","level":df["low"].iloc[lsl]}
+        return {"type": "CHoCH", "direction": "BEARISH", "level": df["low"].iloc[lsl]}
     return None
 
 def _pd_zone(df: pd.DataFrame) -> tuple:
     hi, lo = df["high"].max(), df["low"].min()
     r = hi - lo
-    if r == 0: return "NEUTRAL", hi, lo
-    fib_hi, fib_lo = hi - r*0.382, lo + r*0.382
+    if r == 0:
+        return "NEUTRAL", hi, lo
+    fib_hi, fib_lo = hi - r * 0.382, lo + r * 0.382
     c = df["close"].iloc[-1]
     if c <= fib_lo: return "DISCOUNT", fib_hi, fib_lo
     if c >= fib_hi: return "PREMIUM", fib_hi, fib_lo
@@ -844,29 +967,29 @@ def _idm(df: pd.DataFrame, direction: str) -> Optional[dict]:
     if direction == "BULLISH" and len(L) >= 2:
         lvl = df["low"].iloc[L[-2]]
         last = df.iloc[-1]
-        return {"side":"BUY","level":lvl,"swept": last["low"] < lvl and last["close"] > lvl}
+        return {"side": "BUY", "level": lvl, "swept": last["low"] < lvl and last["close"] > lvl}
     if direction == "BEARISH" and len(H) >= 2:
         lvl = df["high"].iloc[H[-2]]
         last = df.iloc[-1]
-        return {"side":"SELL","level":lvl,"swept": last["high"] > lvl and last["close"] < lvl}
+        return {"side": "SELL", "level": lvl, "swept": last["high"] > lvl and last["close"] < lvl}
     return None
 
 def _equal_hl(df: pd.DataFrame) -> Optional[dict]:
-    tol = 0.0003 if state.pair_key in ("EURUSD","GBPUSD") else 0.0005
+    tol = 0.0003 if state.pair_key in ("EURUSD", "GBPUSD") else 0.0005
     r = df.iloc[-25:]
     hs, ls = r["high"].values, r["low"].values
-    for i in range(len(hs)-1,1,-1):
+    for i in range(len(hs)-1, 1, -1):
         for j in range(i-1, max(i-8,0), -1):
             if abs(hs[i]-hs[j])/hs[j] < tol:
                 lvl = (hs[i]+hs[j])/2
                 last = df.iloc[-1]
                 if last["high"] > lvl and last["close"] < lvl:
-                    return {"side":"SELL","level":lvl,"swept":True,"type":"EQL_HIGHS"}
+                    return {"side": "SELL", "level": lvl, "swept": True, "type": "EQL_HIGHS"}
             if abs(ls[i]-ls[j])/ls[j] < tol:
                 lvl = (ls[i]+ls[j])/2
                 last = df.iloc[-1]
                 if last["low"] < lvl and last["close"] > lvl:
-                    return {"side":"BUY","level":lvl,"swept":True,"type":"EQL_LOWS"}
+                    return {"side": "BUY", "level": lvl, "swept": True, "type": "EQL_LOWS"}
     return None
 
 def _ob(df: pd.DataFrame, direction: str) -> Optional[dict]:
@@ -877,22 +1000,23 @@ def _ob(df: pd.DataFrame, direction: str) -> Optional[dict]:
         for i in range(len(r)-3,1,-1):
             c, nc = r.iloc[i], r.iloc[i+1]
             if c["close"] < c["open"] and nc["close"] > c["high"] and abs(nc["close"]-nc["open"]) > ab*1.5:
-                return {"type":"BULL","high":c["high"],"low":c["low"],
-                        "body_hi":max(c["open"],c["close"]),
-                        "body_lo":min(c["open"],c["close"]),
-                        "displacement":round(abs(nc["close"]-nc["open"])/ab,2)}
+                return {"type": "BULL", "high": c["high"], "low": c["low"],
+                        "body_hi": max(c["open"],c["close"]),
+                        "body_lo": min(c["open"],c["close"]),
+                        "displacement": round(abs(nc["close"]-nc["open"])/ab,2)}
     elif direction == "BEARISH":
         for i in range(len(r)-3,1,-1):
             c, nc = r.iloc[i], r.iloc[i+1]
             if c["close"] > c["open"] and nc["close"] < c["low"] and abs(nc["close"]-nc["open"]) > ab*1.5:
-                return {"type":"BEAR","high":c["high"],"low":c["low"],
-                        "body_hi":max(c["open"],c["close"]),
-                        "body_lo":min(c["open"],c["close"]),
-                        "displacement":round(abs(nc["close"]-nc["open"])/ab,2)}
+                return {"type": "BEAR", "high": c["high"], "low": c["low"],
+                        "body_hi": max(c["open"],c["close"]),
+                        "body_lo": min(c["open"],c["close"]),
+                        "displacement": round(abs(nc["close"]-nc["open"])/ab,2)}
     return None
 
 def _fvg(df: pd.DataFrame, ob: dict) -> Optional[dict]:
-    if ob is None: return None
+    if ob is None:
+        return None
     thr = 0.03 if state.pair_key in ("EURUSD","GBPUSD") else 0.05
     r = df.iloc[-min(25,len(df)-3):].reset_index(drop=True)
     if ob["type"] == "BULL":
@@ -910,7 +1034,8 @@ def _fvg(df: pd.DataFrame, ob: dict) -> Optional[dict]:
     return None
 
 def _atr(df: pd.DataFrame, n: int = 14) -> float:
-    if len(df) < n+1: return 0.
+    if len(df) < n+1:
+        return 0.
     tr = np.maximum(df["high"]-df["low"],
                     np.maximum(abs(df["high"]-df["close"].shift(1)),
                                abs(df["low"]-df["close"].shift(1))))
@@ -918,7 +1043,8 @@ def _atr(df: pd.DataFrame, n: int = 14) -> float:
 
 def _get_trend(tf_name: str) -> str:
     buf = state.h1_candles if tf_name == "H1" else state.m15_candles
-    if len(buf) < 30: return "NEUTRAL"
+    if len(buf) < 30:
+        return "NEUTRAL"
     df = pd.DataFrame(list(buf))
     df.columns = ["time","open","high","low","close"]
     r = _bos_choch(df)
@@ -952,33 +1078,39 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
     elif tf == "M5": buf = state.m5_candles
     elif tf == "M1": buf = state.m1_candles
     else: return None
-    if len(buf) < 40: return None
+    if len(buf) < 40:
+        return None
 
     df = pd.DataFrame(list(buf))
     df.columns = ["time","open","high","low","close"]
 
     bias = _get_trend(state.trend_tf)
-    if bias == "NEUTRAL": return None
+    if bias == "NEUTRAL":
+        return None
 
     struct = _bos_choch(df)
-    if struct is None or struct["direction"] != bias: return None
+    if struct is None or struct["direction"] != bias:
+        return None
 
     pd_zone, fib_hi, fib_lo = _pd_zone(df)
     state.premium_discount = pd_zone
-    if (bias == "BULLISH" and pd_zone != "DISCOUNT") or (bias == "BEARISH" and pd_zone != "PREMIUM"): return None
+    if (bias == "BULLISH" and pd_zone != "DISCOUNT") or (bias == "BEARISH" and pd_zone != "PREMIUM"):
+        return None
 
     idm = _idm(df, bias)
     state.active_idm = idm
-    if idm is None: return None
+    if idm is None:
+        return None
 
     trap = _equal_hl(df)
     state.active_trap = trap
-    if trap is not None and trap["side"] != ("BUY" if bias=="BULLISH" else "SELL"):
+    if trap is not None and trap["side"] != ("BUY" if bias == "BULLISH" else "SELL"):
         trap = None
         state.active_trap = None
 
     ob_ = _ob(df, bias)
-    if ob_ is None: return None
+    if ob_ is None:
+        return None
     state.active_ob = ob_
 
     fvg_ = _fvg(df, ob_)
@@ -987,32 +1119,37 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
 
     session = get_session()
     state.session_now = session
-    if state.pair_key == "XAUUSD" and session not in ("LONDON","NY","OVERLAP"): return None
+    if state.pair_key == "XAUUSD" and session not in ("LONDON","NY","OVERLAP"):
+        return None
 
     atr_v = _atr(df)
     thresholds = {"XAUUSD":0.5, "EURUSD":0.0005, "GBPUSD":0.0006, "US100":5.}
     atr_ok = atr_v >= thresholds.get(state.pair_key, .0001)
     state.atr_filter_ok = atr_ok
-    if not atr_ok: return None
+    if not atr_ok:
+        return None
 
     ema50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
     price = df["close"].iloc[-1]
-    ema_ok = (price > ema50 if bias=="BULLISH" else price < ema50)
+    ema_ok = (price > ema50 if bias == "BULLISH" else price < ema50)
 
     last = df.iloc[-1]
-    candle_ok = (last["close"] > last["open"] if bias=="BULLISH" else last["close"] < last["open"])
+    candle_ok = (last["close"] > last["open"] if bias == "BULLISH" else last["close"] < last["open"])
 
     disp = ob_.get("displacement", 1.)
     sc, score_reasons = sniper_score(ob_, fvg_, trap, idm, rsi_now, session,
                                      atr_ok, ema_ok, candle_ok, struct["type"], disp)
     state.ob_score = sc
-    if sc < state.min_score: return None
+    # Log score breakdown for debugging
+    log.info(f"💡 Score details: {score_reasons} (total {sc})")
+    if sc < state.min_score:
+        return None
 
     # TradingView confirmation (optional)
     tv_confirmed = False
     tv_message = ""
     if TV_AVAILABLE and state.tv_symbol:
-        tv_confirmed, tv_message = check_tradingview("BUY" if bias=="BULLISH" else "SELL")
+        tv_confirmed, tv_message = check_tradingview("BUY" if bias == "BULLISH" else "SELL")
         if not tv_confirmed:
             log.info(f"TradingView rejection: {tv_message}")
             return None
@@ -1043,8 +1180,9 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
         sl = ob_["high"] * 1.0005
 
     risk = abs(entry - sl)
-    if risk == 0: return None
-    mult = 1 if bias=="BULLISH" else -1
+    if risk == 0:
+        return None
+    mult = 1 if bias == "BULLISH" else -1
     tp1 = entry + risk * state.tp1_r * mult
     tp2 = entry + risk * state.tp2_r * mult
     tp3 = entry + risk * state.tp3_r * mult
@@ -1052,7 +1190,7 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
                               state.account_balance * state.risk_pct), 2))
 
     sig = {
-        "direction": "BUY" if bias=="BULLISH" else "SELL",
+        "direction": "BUY" if bias == "BULLISH" else "SELL",
         "entry": round(entry,5), "sl": round(sl,5),
         "tp1": round(tp1,5), "tp2": round(tp2,5), "tp3": round(tp3,5),
         "risk_r": round(risk,5), "stake": stake,
@@ -1070,28 +1208,34 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
 def check_trade_mgmt():
     for cid, info in list(state.open_contracts.items()):
         sig = info.get("signal")
-        if not sig: continue
+        if not sig:
+            continue
         p = state.current_price
         d = info["direction"]
         if not info["be_moved"]:
             if (d == "BUY" and p >= sig["tp1"]) or (d == "SELL" and p <= sig["tp1"]):
                 info["be_moved"] = True
                 sig["sl"] = sig["entry"]
-        buf = state.m15_candles if state.exec_tf=="M15" else state.m5_candles
+        buf = state.m15_candles if state.exec_tf == "M15" else state.m5_candles
         if len(buf) >= 10:
             df = pd.DataFrame(list(buf)[-30:])
             df.columns = ["time","open","high","low","close"]
             swh, swl = _swing_pts(df, n=3)
             if d == "BUY" and swl:
                 t = df["low"].iloc[swl[-1]] * 0.9998
-                if t > sig["sl"]: sig["sl"] = t
+                if t > sig["sl"]:
+                    sig["sl"] = t
             elif d == "SELL" and swh:
                 t = df["high"].iloc[swh[-1]] * 1.0002
-                if t < sig["sl"]: sig["sl"] = t
+                if t < sig["sl"]:
+                    sig["sl"] = t
 
-# ==================== SUPABASE LOGGING (optional) ====================
+# ==================================================
+# 15. SUPABASE LOGGING (optional)
+# ==================================================
 def supabase_log_signal(signal: dict):
-    if not supabase: return
+    if not supabase:
+        return
     try:
         data = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -1115,7 +1259,8 @@ def supabase_log_signal(signal: dict):
         log.warning(f"Supabase log failed: {e}")
 
 def supabase_log_trade(contract_id: str, signal: dict, result: dict):
-    if not supabase: return
+    if not supabase:
+        return
     try:
         data = {
             "contract_id": contract_id,
@@ -1133,7 +1278,9 @@ def supabase_log_trade(contract_id: str, signal: dict, result: dict):
     except Exception as e:
         log.warning(f"Supabase log failed: {e}")
 
-# ==================== DERIV WEBSOCKET & TRADE EXECUTION ====================
+# ==================================================
+# 16. DERIV WEBSOCKET & TRADE EXECUTION
+# ==================================================
 async def send_req(payload: dict) -> dict:
     if state.ws is None:
         raise RuntimeError("WS not connected")
@@ -1302,10 +1449,9 @@ async def execute_trade(signal: dict) -> Optional[str]:
         response = await send_req(contract_params)
         if "error" in response:
             log.error(f"❌ Trade execution FAILED: {response['error'].get('message','Unknown')}")
-            log.error(f"   Full response: {json.dumps(response, indent=2)}")
             return None
         if "buy" not in response:
-            log.error(f"❌ Unexpected response format: {json.dumps(response, indent=2)}")
+            log.error(f"❌ Unexpected response: {response}")
             return None
         contract_id = str(response["buy"]["contract_id"])
         log.info(f"✅ Trade EXECUTED! Contract ID: {contract_id}")
@@ -1320,8 +1466,7 @@ async def execute_trade(signal: dict) -> Optional[str]:
         state.trade_count += 1
         return contract_id
     except Exception as e:
-        log.error(f"❌ Trade execution EXCEPTION: {type(e).__name__}: {e}")
-        log.error(traceback.format_exc())
+        log.error(f"❌ Trade execution EXCEPTION: {e}")
         return None
 
 async def close_contract(cid: str) -> bool:
@@ -1343,7 +1488,9 @@ async def close_all() -> int:
         await close_contract(cid)
     return len(ids)
 
-# ==================== WEBSOCKET MESSAGE HANDLER (duplicate candle fix) ====================
+# ==================================================
+# 17. WEBSOCKET MESSAGE HANDLER (with duplicate candle fix)
+# ==================================================
 def _update_buf(actual_gran: int, rows: list):
     rev = {v:k for k,v in state.gran_actual.items()}
     nom = rev.get(actual_gran, actual_gran)
@@ -1449,7 +1596,9 @@ async def handle_msg(msg: dict):
     elif "error" in msg:
         log.warning(f"API: {msg['error'].get('message','?')}")
 
-# ==================== BACKGROUND LOOPS ====================
+# ==================================================
+# 18. BACKGROUND LOOPS
+# ==================================================
 async def chart_loop():
     await asyncio.sleep(50)
     while state.running:
@@ -1512,14 +1661,15 @@ async def trading_loop():
                     f"Sess:{state.session_now} ATR_ok:{state.atr_filter_ok}")
             else:
                 log.info(f"🎯 SIGNAL DETECTED! Score: {sig['ob_score']}/100, Direction: {sig['direction']}")
-                if sig['ob_score'] >= 80:
-                    log.info(f"⭐ HIGH SCORE ({sig['ob_score']} >= 80) — PROCEEDING TO TRADE EXECUTION")
-                    if state.trading_mode == "SNIPER":
+                if sig['ob_score'] >= state.min_score:
+                    log.info(f"⭐ SCORE ({sig['ob_score']} >= {state.min_score}) — PROCEEDING")
+                    if state.trading_mode == "SNIPER" and state.top_down:
                         sig_conf = compute_signal(state.conf_tf)
                         if sig_conf and sig_conf["direction"] == sig["direction"]:
                             log.info(f"✅ Confirmation TF ({state.conf_tf}) confirms {sig['direction']}")
                         else:
-                            log.info(f"⚠️ Confirmation TF ({state.conf_tf}) mismatch — executing anyway")
+                            log.info(f"⚠️ Confirmation TF ({state.conf_tf}) mismatch — skipping")
+                            continue
                     buf_for_chart = state.m15_candles if state.exec_tf=="M15" else state.m5_candles
                     chart = generate_chart(buf_for_chart, state.exec_tf,
                                            entry_price=sig["entry"],
@@ -1556,7 +1706,9 @@ async def trading_loop():
             log.error(f"trading_loop: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(30)
 
-# ==================== TELEGRAM POLLING ====================
+# ==================================================
+# 19. TELEGRAM POLLING
+# ==================================================
 async def tg_poll_loop():
     if not TELEGRAM_TOKEN:
         log.warning("No TELEGRAM_TOKEN")
@@ -1604,6 +1756,18 @@ async def _handle_upd(upd: dict):
         if state.awaiting_token and text and not text.startswith("/"):
             await _process_token(text)
             return
+        if state.awaiting_custom_score:
+            try:
+                score = int(text.strip())
+                if 10 <= score <= 100:
+                    state.min_score = score
+                    state.awaiting_custom_score = False
+                    await tg_async(f"✅ Minimum score set to {score}", reply_markup=kb_settings())
+                else:
+                    await tg_async("❌ Please enter a number between 10 and 100.", reply_markup=kb_score())
+            except ValueError:
+                await tg_async("❌ Invalid number. Please enter a number between 10 and 100.", reply_markup=kb_score())
+            return
         await _cmd(text)
     elif "callback_query" in upd:
         cq = upd["callback_query"]
@@ -1646,7 +1810,7 @@ async def _cmd(cmd: str):
         conn = "✅ Connected" if state.broker_connected else "❌ Not connected — tap 🔗 Connect Broker"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.5*\n\n"
+            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.4*\n\n"
             f"Status: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\n"
             f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
             f"Bal: `{state.account_balance:.2f} {state.account_currency}`\n"
@@ -1832,6 +1996,43 @@ async def _cmd(cmd: str):
     elif cmd == "cmd_risk_5":
         state.risk_pct = 0.05; state.small_acc_mode = False
         await tg_async("✅ Risk → 5%", reply_markup=kb_settings())
+    # ========== NEW SETTINGS HANDLERS ==========
+    elif cmd == "cmd_score_menu":
+        await tg_async("🎯 Select minimum score for signal execution:", reply_markup=kb_score())
+    elif cmd.startswith("cmd_score_"):
+        val = cmd.replace("cmd_score_", "")
+        if val == "custom":
+            state.awaiting_custom_score = True
+            await tg_async("✏️ Enter a number between 10 and 100:", reply_markup=None)
+        else:
+            score = int(val)
+            state.min_score = score
+            await tg_async(f"✅ Minimum score set to {score}", reply_markup=kb_settings())
+    elif cmd == "cmd_tf_menu":
+        await tg_async("⏱️ Select which timeframe to change:", reply_markup=kb_tf())
+    elif cmd == "cmd_tf_trend":
+        await tg_async("📈 Select trend timeframe:", reply_markup=kb_tf_trend())
+    elif cmd == "cmd_tf_exec":
+        await tg_async("⚡ Select execution timeframe:", reply_markup=kb_tf_exec())
+    elif cmd == "cmd_tf_conf":
+        await tg_async("✅ Select confirmation timeframe:", reply_markup=kb_tf_conf())
+    elif cmd.startswith("cmd_tf_trend_"):
+        tf = cmd.replace("cmd_tf_trend_", "")
+        state.trend_tf = tf
+        await tg_async(f"✅ Trend TF set to {tf}", reply_markup=kb_tf())
+    elif cmd.startswith("cmd_tf_exec_"):
+        tf = cmd.replace("cmd_tf_exec_", "")
+        state.exec_tf = tf
+        await tg_async(f"✅ Execution TF set to {tf}", reply_markup=kb_tf())
+    elif cmd.startswith("cmd_tf_conf_"):
+        tf = cmd.replace("cmd_tf_conf_", "")
+        state.conf_tf = tf
+        await tg_async(f"✅ Confirmation TF set to {tf}", reply_markup=kb_tf())
+    elif cmd == "cmd_top_down":
+        state.top_down = not state.top_down
+        status = "ON" if state.top_down else "OFF"
+        await tg_async(f"🔄 Top‑down analysis turned {status}", reply_markup=kb_settings())
+    # ==========================================
     elif cmd in ("/stop","cmd_stop"):
         state.paused = True
         n = await close_all()
@@ -1846,7 +2047,9 @@ async def _cmd(cmd: str):
             state.paused = True
             await tg_async("⏸ Bot *PAUSED* — press Resume to restart.", reply_markup=kb_main())
 
-# ==================== WEBSOCKET ENGINE & HEALTH SERVER ====================
+# ==================================================
+# 20. WEBSOCKET ENGINE & HEALTH SERVER
+# ==================================================
 async def ws_reader(ws):
     async for raw in ws:
         try:
@@ -1866,7 +2069,7 @@ async def ws_run(ws):
         acct_icon = "🔴 REAL" if state.account_type=="real" else "🟢 DEMO"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.5 Online*\n"
+            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.4 Online*\n"
             f"Broker: {acct_icon} `{state.account_id}`\nStrategy: `{md_lbl}`\n"
             f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair:`{state.pair_display}` sym:`{state.active_symbol}`\n"
@@ -1912,7 +2115,7 @@ async def ws_loop():
 async def health(req):
     wr = f"{state.wins/(state.wins+state.losses)*100:.1f}" if (state.wins+state.losses)>0 else "0"
     return web.json_response({
-        "version": "5.5",
+        "version": "5.4",
         "status": "running" if state.running else "stopped",
         "paused": state.paused,
         "block_trading": state.block_trading,
@@ -1920,6 +2123,10 @@ async def health(req):
         "autonomous": state.autonomous,
         "mode": state.trading_mode,
         "min_score": state.min_score,
+        "trend_tf": state.trend_tf,
+        "exec_tf": state.exec_tf,
+        "conf_tf": state.conf_tf,
+        "top_down": state.top_down,
         "market_open": is_market_open(),
         "session": get_session(),
         "broker_connected": state.broker_connected,
@@ -1951,6 +2158,7 @@ async def health(req):
         "next_red": state.next_red_event.title if state.next_red_event else None,
         "gran_actual": state.gran_actual,
         "tv_available": TV_AVAILABLE,
+        "supabase_enabled": supabase is not None,
     })
 
 async def start_health():
@@ -1962,11 +2170,14 @@ async def start_health():
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info(f"Health :{PORT}")
 
-# ==================== ENTRY POINT ====================
+# ==================================================
+# 21. ENTRY POINT
+# ==================================================
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.5 · Production Ready       ║")
-    log.info("║  [NO DUPLICATE CANDLES | PROFESSIONAL CHART] ║")
+    log.info("║  SMC SNIPER EA v5.4 · Fully Customizable     ║")
+    log.info("║ News Shield | Broker Connect | Post-Reports  ║")
+    log.info("║  [DUPLICATE FIX | CHART FIX | CUSTOM SETTINGS]║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
