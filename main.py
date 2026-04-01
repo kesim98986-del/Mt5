@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.3 — Multi-Strategy Autonomous Trading Bot    ║
+║        SMC SNIPER EA v5.4 — Multi-Strategy Autonomous Trading Bot    ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
 ║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
-║            [ALL FIXES INCLUDED: DUPLICATE CANDLES, CHART, SUPABASE]  ║
+║            [FULL FIX: CANDLE UPDATE, CHART SCALING, EXECUTION]       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -59,7 +59,7 @@ if SUPABASE_URL and SUPABASE_KEY:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         log.info("✅ Supabase client initialized")
     except ImportError:
-        log.warning("⚠️ Supabase package not installed. Install with: pip install supabase")
+        log.warning("⚠️ Supabase package not installed")
     except Exception as e:
         log.warning(f"⚠️ Supabase init failed: {e}")
 else:
@@ -662,7 +662,7 @@ async def news_block_monitor():
         await asyncio.sleep(60)
 
 # ==================================================
-# 13. CHART ENGINE (FIXED: panel indices and ratios)
+# 13. CHART ENGINE (FIXED: last 50 candles, 5% padding, bar width 0.6)
 # ==================================================
 BG = "#0d1117"; PB = "#161b22"; GR = "#1e2a38"
 BC = "#00e676"; RC = "#ff1744"
@@ -714,6 +714,7 @@ def _dedupe_candles(df: pd.DataFrame) -> pd.DataFrame:
 def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
                    exit_price: float = None, direction: str = None, pnl: float = None,
                    chart_type: str = "live", reason: "TradeReason" = None) -> Optional[str]:
+    # Use last 50 candles only
     if len(candles) < 20:
         log.info(f"Chart skipped — only {len(candles)} candles")
         return None
@@ -722,12 +723,14 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
     df.columns = ["time", "open", "high", "low", "close"]
     df = df.astype({"open": float, "high": float, "low": float, "close": float})
 
+    # Basic cleaning
     df = df[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)]
     med = df["close"].median()
     df = df[(df["close"] > med * 0.5) & (df["close"] < med * 2.0)]
     df = _dedupe_candles(df)
 
-    SHOW = 40
+    # Use last 50 candles
+    SHOW = 50
     df = df.tail(SHOW).reset_index(drop=True)
     if len(df) < 10:
         return None
@@ -735,20 +738,19 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
     df["date"] = pd.to_datetime(df["time"], unit="s")
     df.set_index("date", inplace=True)
 
+    # Calculate y limits based on last 50 candles only
     raw_min, raw_max = df["low"].min(), df["high"].max()
-    if state.pair_key == "XAUUSD":
-        y_min, y_max = raw_min - 0.5, raw_max + 0.5
-    else:
-        pr = raw_max - raw_min
-        y_min, y_max = raw_min - pr * 0.05, raw_max + pr * 0.05
+    padding = (raw_max - raw_min) * 0.05
+    y_min, y_max = raw_min - padding, raw_max + padding
 
+    # Indicators
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
     add_plots = [mpf.make_addplot(ema21, color='#ffeb3b', width=1.5, panel=0)]
     if len(df) >= 50:
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         add_plots.append(mpf.make_addplot(ema50, color='#78909c', width=1.2, linestyle='--', panel=0))
 
-    # RSI - now placed on panel=1 (since volume=False, panels: 0 = price, 1 = RSI)
+    # RSI on panel 1
     rsi = _rsi_calc(df["close"].values)
     rsi_series = pd.Series(rsi, index=df.index)
     add_plots.append(mpf.make_addplot(rsi_series, color='#90a4ae', width=1.2, panel=1, ylabel='RSI'))
@@ -757,6 +759,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
     add_plots.append(mpf.make_addplot(rsi_70, color='#d50000', width=0.6, linestyle='--', panel=1))
     add_plots.append(mpf.make_addplot(rsi_30, color='#00c853', width=0.6, linestyle='--', panel=1))
 
+    # Horizontal lines
     hlines_dict = {'hlines': [], 'colors': [], 'linestyle': [], 'linewidths': []}
     if state.last_signal:
         sig = state.last_signal
@@ -782,6 +785,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         hlines_dict['linestyle'].append('--')
         hlines_dict['linewidths'].append(2)
 
+    # Style
     mc_style = mpf.make_marketcolors(
         up='#00c853', down='#d50000',
         edge={'up':'#00e676','down':'#ff1744'},
@@ -805,8 +809,8 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         fig, axes = mpf.plot(
             df, type='candle', style=s, title=title, ylabel='Price', volume=False,
             addplot=add_plots, figsize=(12,8), panel_ratios=(5, 1.5), returnfig=True,
-            tight_layout=True, scale_width_adjustment=dict(candle=0.8, volume=0.8),
-            update_width_config=dict(candle_linewidth=1.2, candle_width=0.8),
+            tight_layout=True, scale_width_adjustment=dict(candle=0.6, volume=0.8),
+            update_width_config=dict(candle_linewidth=1.2, candle_width=0.6),
             hlines=hlines_dict,
             warn_too_much_data=1000, ylim=(y_min, y_max)
         )
@@ -838,7 +842,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
             ax_main.axhline(trap["level"], color='#e040fb', ls=':', lw=1.5, alpha=0.9)
 
     ts_now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    info_text = (f"SMC SNIPER v5.3 [{state.trading_mode}] · {state.pair_display} · "
+    info_text = (f"SMC SNIPER v5.4 [{state.trading_mode}] · {state.pair_display} · "
                  f"Bal:{state.account_balance:.2f}{state.account_currency} · "
                  f"Risk:{state.risk_pct*100:.0f}% · Last {len(df)} candles · {ts_now}")
     fig.text(0.5, 0.01, info_text, ha='center', va='bottom', fontsize=6, color='#8b949e', fontfamily='monospace')
@@ -875,7 +879,7 @@ def generate_history_chart() -> Optional[str]:
     ax2.axhline(0, color=GR, lw=.8)
     ax2.set_ylabel("Cumulative", color="#90a4ae", fontsize=8)
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99, .01, f"SMC SNIPER v5.3 · {ts}", color="#444d56", fontsize=7, ha="right")
+    fig.text(.99, .01, f"SMC SNIPER v5.4 · {ts}", color="#444d56", fontsize=7, ha="right")
     path = "/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -1397,10 +1401,12 @@ async def execute_trade(signal: dict) -> Optional[str]:
     try:
         response = await send_req(contract_params)
         if "error" in response:
-            log.error(f"❌ Trade execution FAILED: {response['error'].get('message','Unknown')}")
+            error_msg = response["error"].get("message", "Unknown error")
+            log.error(f"❌ Trade execution FAILED: {error_msg}")
+            log.error(f"   Full response: {json.dumps(response, indent=2)}")
             return None
         if "buy" not in response:
-            log.error(f"❌ Unexpected response: {response}")
+            log.error(f"❌ Unexpected response format: {json.dumps(response, indent=2)}")
             return None
         contract_id = str(response["buy"]["contract_id"])
         log.info(f"✅ Trade EXECUTED! Contract ID: {contract_id}")
@@ -1415,7 +1421,8 @@ async def execute_trade(signal: dict) -> Optional[str]:
         state.trade_count += 1
         return contract_id
     except Exception as e:
-        log.error(f"❌ Trade execution EXCEPTION: {e}")
+        log.error(f"❌ Trade execution EXCEPTION: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
         return None
 
 async def close_contract(cid: str) -> bool:
@@ -1746,7 +1753,7 @@ async def _cmd(cmd: str):
         conn = "✅ Connected" if state.broker_connected else "❌ Not connected — tap 🔗 Connect Broker"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.3*\n\n"
+            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.4*\n\n"
             f"Status: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\n"
             f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
             f"Bal: `{state.account_balance:.2f} {state.account_currency}`\n"
@@ -1968,7 +1975,7 @@ async def ws_run(ws):
         acct_icon = "🔴 REAL" if state.account_type=="real" else "🟢 DEMO"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.3 Online*\n"
+            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.4 Online*\n"
             f"Broker: {acct_icon} `{state.account_id}`\nStrategy: `{md_lbl}`\n"
             f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair:`{state.pair_display}` sym:`{state.active_symbol}`\n"
@@ -2014,7 +2021,7 @@ async def ws_loop():
 async def health(req):
     wr = f"{state.wins/(state.wins+state.losses)*100:.1f}" if (state.wins+state.losses)>0 else "0"
     return web.json_response({
-        "version": "5.3",
+        "version": "5.4",
         "status": "running" if state.running else "stopped",
         "paused": state.paused,
         "block_trading": state.block_trading,
@@ -2069,9 +2076,9 @@ async def start_health():
 # ==================================================
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.3 · Multi-Strategy Auto    ║")
+    log.info("║  SMC SNIPER EA v5.4 · Multi-Strategy Auto    ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  [FULL CODE: DUPLICATE FIX, CHART FIX, SUPABASE]  ║")
+    log.info("║  [FULL FIX: CANDLE UPDATE, CHART SCALING, EXECUTION] ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
