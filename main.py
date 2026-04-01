@@ -1,9 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.4 — Fully Customizable Trading Bot          ║
+║        SMC SNIPER EA v5.5 — Robust Live Data & Auto‑Reconnect       ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║   Duplicate Candle Fix | Chart Fix | Supabase | Custom Settings      ║
-║               [Score / Timeframe / Top‑Down Analysis]                ║
+║   Duplicate Candle Fix | Auto‑Resubscribe | Full Custom Settings     ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -251,6 +250,7 @@ class BotState:
         self.m5_candles  = deque(maxlen=1000)
         self.m1_candles  = deque(maxlen=1000)
         self.gran_actual = {3600: 3600, 900: 900, 300: 300, 60: 60}
+        self.last_ohlc_time = 0  # timestamp of last received ohlc
 
         self.current_price    = 0.0
         self.trend_bias       = "NEUTRAL"
@@ -380,7 +380,7 @@ def check_tradingview(direction: str) -> tuple:
         return False, f"TV error: {e}"
 
 # ==================================================
-# 10. KEYBOARDS (Telegram)
+# 10. KEYBOARDS (Telegram) – unchanged
 # ==================================================
 def kb_main():
     block_lbl = ("🚫 Blocked" if state.block_trading
@@ -525,7 +525,7 @@ async def tg_async(text: str, photo_path: str = None, reply_markup=None):
     await loop.run_in_executor(None, lambda: tg_send(text, photo_path, reply_markup))
 
 # ==================================================
-# 12. NEWS ENGINE (Forex Factory)
+# 12. NEWS ENGINE (unchanged)
 # ==================================================
 FF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -709,7 +709,7 @@ async def news_block_monitor():
         await asyncio.sleep(60)
 
 # ==================================================
-# 13. CHART ENGINE (FIXED: panel indices, ratios, duplicate prevention)
+# 13. CHART ENGINE (unchanged from working version)
 # ==================================================
 BG = "#0d1117"; PB = "#161b22"; GR = "#1e2a38"
 BC = "#00e676"; RC = "#ff1744"
@@ -795,7 +795,6 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         add_plots.append(mpf.make_addplot(ema50, color='#78909c', width=1.2, linestyle='--', panel=0))
 
-    # RSI - placed on panel=1 (since volume=False, panels: 0 = price, 1 = RSI)
     rsi = _rsi_calc(df["close"].values)
     rsi_series = pd.Series(rsi, index=df.index)
     add_plots.append(mpf.make_addplot(rsi_series, color='#90a4ae', width=1.2, panel=1, ylabel='RSI'))
@@ -885,7 +884,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
             ax_main.axhline(trap["level"], color='#e040fb', ls=':', lw=1.5, alpha=0.9)
 
     ts_now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    info_text = (f"SMC SNIPER v5.4 [{state.trading_mode}] · {state.pair_display} · "
+    info_text = (f"SMC SNIPER v5.5 [{state.trading_mode}] · {state.pair_display} · "
                  f"Bal:{state.account_balance:.2f}{state.account_currency} · "
                  f"Risk:{state.risk_pct*100:.0f}% · Last {len(df)} candles · {ts_now}")
     fig.text(0.5, 0.01, info_text, ha='center', va='bottom', fontsize=6, color='#8b949e', fontfamily='monospace')
@@ -922,7 +921,7 @@ def generate_history_chart() -> Optional[str]:
     ax2.axhline(0, color=GR, lw=.8)
     ax2.set_ylabel("Cumulative", color="#90a4ae", fontsize=8)
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99, .01, f"SMC SNIPER v5.4 · {ts}", color="#444d56", fontsize=7, ha="right")
+    fig.text(.99, .01, f"SMC SNIPER v5.5 · {ts}", color="#444d56", fontsize=7, ha="right")
     path = "/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -1138,7 +1137,6 @@ def compute_signal(tf: str = "M15") -> Optional[dict]:
     sc, score_reasons = sniper_score(ob_, fvg_, trap, idm, rsi_now, session,
                                      atr_ok, ema_ok, candle_ok, struct["type"], disp)
     state.ob_score = sc
-    # Log score breakdown for debugging
     log.info(f"💡 Score details: {score_reasons} (total {sc})")
     if sc < state.min_score:
         return None
@@ -1324,8 +1322,10 @@ def _update_or_append_candle(deque_obj: deque, new_candle: tuple, nom: int):
     epoch = new_candle[0]
     if deque_obj and deque_obj[-1][0] == epoch:
         deque_obj[-1] = new_candle
+        log.debug(f"Updated candle epoch {epoch} for granularity {nom}")
     else:
         deque_obj.append(new_candle)
+        log.debug(f"Appended new candle epoch {epoch} for granularity {nom}")
 
 def _store(nom: int, rows: list):
     if nom == 3600:
@@ -1362,10 +1362,11 @@ async def _fetch(sym: str, nom: int) -> int:
             state.gran_actual[nom] = ag
             _store(nom, rows)
             log.info(f"✅ {len(rows)} {lbl.get(nom,'?')} (g={ag}) {sym}")
-            asyncio.ensure_future(send_req({
+            # Subscribe for live updates
+            await send_req({
                 "ticks_history": sym, "end": "latest",
                 "count": 1, "granularity": ag,
-                "style": "candles", "subscribe": 1}))
+                "style": "candles", "subscribe": 1})
             return len(rows)
         except asyncio.TimeoutError:
             log.warning(f"Timeout g={ag}")
@@ -1413,81 +1414,8 @@ async def subscribe_pair(key: str):
     log.info(f"subscribe_pair done: {sym} H1:{h} M15:{m} M5:{f} M1:{o}")
     return h, m, f, o
 
-async def execute_trade(signal: dict) -> Optional[str]:
-    if not state.broker_connected:
-        log.error("❌ Cannot execute trade: Broker not connected")
-        return None
-    if state.paused:
-        log.error("❌ Cannot execute trade: Bot is paused")
-        return None
-    if state.block_trading:
-        log.error(f"❌ Cannot execute trade: Trading blocked - {state.block_reason}")
-        return None
-
-    direction = signal["direction"]
-    amount = signal["stake"]
-    contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
-
-    contract_params = {
-        "buy": 1,
-        "price": round(amount, 2),
-        "parameters": {
-            "contract_type": contract_type,
-            "symbol": state.active_symbol or PAIR_REGISTRY[state.pair_key][0],
-            "amount": round(amount, 2),
-            "currency": state.account_currency,
-            "multiplier": 10,
-            "basis": "stake",
-            "stop_out": 1
-        }
-    }
-
-    log.info(f"🚀 EXECUTING TRADE: {direction} {amount:.2f} {state.account_currency}")
-    try:
-        response = await send_req(contract_params)
-        if "error" in response:
-            log.error(f"❌ Trade execution FAILED: {response['error'].get('message','Unknown')}")
-            return None
-        if "buy" not in response:
-            log.error(f"❌ Unexpected response: {response}")
-            return None
-        contract_id = str(response["buy"]["contract_id"])
-        log.info(f"✅ Trade EXECUTED! Contract ID: {contract_id}")
-        state.open_contracts[contract_id] = {
-            "direction": direction,
-            "entry": state.current_price,
-            "amount": amount,
-            "signal": signal,
-            "be_moved": False,
-            "opened_at": time.time()
-        }
-        state.trade_count += 1
-        return contract_id
-    except Exception as e:
-        log.error(f"❌ Trade execution EXCEPTION: {e}")
-        return None
-
-async def close_contract(cid: str) -> bool:
-    try:
-        r = await send_req({"sell": cid, "price": 0})
-        if "error" in r:
-            log.error(f"Close: {r['error']['message']}")
-            return False
-        state.open_contracts.pop(cid, None)
-        log.info(f"🔴 Closed {cid}")
-        return True
-    except Exception as e:
-        log.error(f"close_contract: {e}")
-        return False
-
-async def close_all() -> int:
-    ids = list(state.open_contracts.keys())
-    for cid in ids:
-        await close_contract(cid)
-    return len(ids)
-
 # ==================================================
-# 17. WEBSOCKET MESSAGE HANDLER (with duplicate candle fix)
+# 17. WEBSOCKET MESSAGE HANDLER (with duplicate fix & data freshness logging)
 # ==================================================
 def _update_buf(actual_gran: int, rows: list):
     rev = {v:k for k,v in state.gran_actual.items()}
@@ -1512,7 +1440,13 @@ async def handle_msg(msg: dict):
         close = float(c["close"])
         gran = int(c.get("granularity", 0))
 
-        # Update or append based on epoch (duplicate prevention)
+        # Log every received ohlc (for debugging)
+        log.info(f"📡 OHLC {gran}s: epoch={epoch} O={open_} H={high} L={low} C={close}")
+
+        # Update last received time
+        state.last_ohlc_time = time.time()
+
+        # Update or append based on epoch
         if gran == 3600:
             _update_or_append_candle(state.h1_candles, (epoch, open_, high, low, close), 3600)
         elif gran == 900:
@@ -1563,7 +1497,6 @@ async def handle_msg(msg: dict):
             if len(state.trade_history) > 50:
                 state.trade_history.pop(0)
 
-            # Log to Supabase if enabled
             supabase_log_trade(cid, sig, {"exit": exit_s, "pnl": profit})
 
             buf_for_chart = state.m15_candles if state.exec_tf=="M15" else state.m5_candles
@@ -1595,7 +1528,27 @@ async def handle_msg(msg: dict):
         log.warning(f"API: {msg['error'].get('message','?')}")
 
 # ==================================================
-# 18. BACKGROUND LOOPS
+# 18. DATA FRESHNESS MONITOR & AUTO RESUBSCRIBE
+# ==================================================
+async def data_freshness_monitor():
+    """Check if we received ohlc data recently; if not, re-subscribe."""
+    while state.running:
+        await asyncio.sleep(60)  # check every minute
+        if not state.broker_connected:
+            continue
+        if state.last_ohlc_time == 0:
+            continue
+        age = time.time() - state.last_ohlc_time
+        if age > 300:  # 5 minutes without data
+            log.warning(f"No OHLC data for {int(age)} seconds – re-subscribing")
+            try:
+                await subscribe_pair(state.pair_key)
+                log.info("Resubscribed to live data")
+            except Exception as e:
+                log.error(f"Resubscribe failed: {e}")
+
+# ==================================================
+# 19. BACKGROUND LOOPS
 # ==================================================
 async def chart_loop():
     await asyncio.sleep(50)
@@ -1690,7 +1643,6 @@ async def trading_loop():
                         f"Stake: `{sig['stake']:.2f} {state.account_currency}`"
                         f"{' 💎' if state.small_acc_mode else ''}",
                         photo_path=chart)
-                    # Log to Supabase if enabled
                     supabase_log_signal(sig)
                     contract_id = await execute_trade(sig)
                     if contract_id:
@@ -1705,7 +1657,7 @@ async def trading_loop():
         await asyncio.sleep(30)
 
 # ==================================================
-# 19. TELEGRAM POLLING
+# 20. TELEGRAM POLLING (unchanged except for new handlers)
 # ==================================================
 async def tg_poll_loop():
     if not TELEGRAM_TOKEN:
@@ -1808,7 +1760,7 @@ async def _cmd(cmd: str):
         conn = "✅ Connected" if state.broker_connected else "❌ Not connected — tap 🔗 Connect Broker"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.4*\n\n"
+            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.5*\n\n"
             f"Status: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\n"
             f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
             f"Bal: `{state.account_balance:.2f} {state.account_currency}`\n"
@@ -2046,7 +1998,7 @@ async def _cmd(cmd: str):
             await tg_async("⏸ Bot *PAUSED* — press Resume to restart.", reply_markup=kb_main())
 
 # ==================================================
-# 20. WEBSOCKET ENGINE & HEALTH SERVER
+# 21. WEBSOCKET ENGINE & HEALTH SERVER
 # ==================================================
 async def ws_reader(ws):
     async for raw in ws:
@@ -2067,7 +2019,7 @@ async def ws_run(ws):
         acct_icon = "🔴 REAL" if state.account_type=="real" else "🟢 DEMO"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.4 Online*\n"
+            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.5 Online*\n"
             f"Broker: {acct_icon} `{state.account_id}`\nStrategy: `{md_lbl}`\n"
             f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair:`{state.pair_display}` sym:`{state.active_symbol}`\n"
@@ -2113,7 +2065,7 @@ async def ws_loop():
 async def health(req):
     wr = f"{state.wins/(state.wins+state.losses)*100:.1f}" if (state.wins+state.losses)>0 else "0"
     return web.json_response({
-        "version": "5.4",
+        "version": "5.5",
         "status": "running" if state.running else "stopped",
         "paused": state.paused,
         "block_trading": state.block_trading,
@@ -2169,13 +2121,13 @@ async def start_health():
     log.info(f"Health :{PORT}")
 
 # ==================================================
-# 21. ENTRY POINT
+# 22. ENTRY POINT
 # ==================================================
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.4 · Fully Customizable     ║")
+    log.info("║  SMC SNIPER EA v5.5 · Robust Auto‑Reconnect  ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  [DUPLICATE FIX | CHART FIX | CUSTOM SETTINGS]║")
+    log.info("║  [DUPLICATE FIX | DATA MONITOR | CUSTOM]     ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
@@ -2188,6 +2140,7 @@ async def main():
         chart_loop(),
         news_refresh_loop(),
         news_block_monitor(),
+        data_freshness_monitor(),   # <-- new monitor
     )
 
 if __name__ == "__main__":
