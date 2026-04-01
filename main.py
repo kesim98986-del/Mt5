@@ -3,7 +3,7 @@
 ║        SMC SNIPER EA v5.4 — Fully Customizable Trading Bot          ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
 ║   Duplicate Candle Fix | Chart Fix | Supabase | Custom Settings      ║
-║               [Score / Timeframe / Top-Down Analysis]                ║
+║               [Score / Timeframe / Top‑Down Analysis]                ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -223,7 +223,7 @@ class BotState:
         self.account_balance  = 0.0
         self.account_currency = "USD"
         self.awaiting_token   = False
-        self.awaiting_custom_score = False  # for manual score input
+        self.awaiting_custom_score = False
 
         self.running       = True
         self.paused        = False
@@ -236,7 +236,7 @@ class BotState:
         self.trend_tf     = "H1"
         self.exec_tf      = "M15"
         self.conf_tf      = "M5"
-        self.top_down     = True   # enable top-down confirmation by default
+        self.top_down     = True
 
         self.pair_key       = "XAUUSD"
         self.active_symbol  = ""
@@ -442,11 +442,9 @@ def kb_connect():
     ]}
 
 def kb_score():
-    # buttons for 10,20,...,100 and a custom option
     buttons = []
     for i in range(10, 101, 10):
         buttons.append({"text": str(i), "callback_data": f"cmd_score_{i}"})
-    # group in rows of 4
     rows = [buttons[i:i+4] for i in range(0, len(buttons), 4)]
     rows.append([{"text": "✏️ Custom", "callback_data": "cmd_score_custom"}])
     rows.append([{"text": "⬅️ Back", "callback_data": "cmd_settings"}])
@@ -711,7 +709,7 @@ async def news_block_monitor():
         await asyncio.sleep(60)
 
 # ==================================================
-# 13. CHART ENGINE (FIXED: panel indices and ratios)
+# 13. CHART ENGINE (FIXED: panel indices, ratios, duplicate prevention)
 # ==================================================
 BG = "#0d1117"; PB = "#161b22"; GR = "#1e2a38"
 BC = "#00e676"; RC = "#ff1744"
@@ -797,7 +795,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
         add_plots.append(mpf.make_addplot(ema50, color='#78909c', width=1.2, linestyle='--', panel=0))
 
-    # RSI - now placed on panel=1 (since volume=False, panels: 0 = price, 1 = RSI)
+    # RSI - placed on panel=1 (since volume=False, panels: 0 = price, 1 = RSI)
     rsi = _rsi_calc(df["close"].values)
     rsi_series = pd.Series(rsi, index=df.index)
     add_plots.append(mpf.make_addplot(rsi_series, color='#90a4ae', width=1.2, panel=1, ylabel='RSI'))
@@ -1514,7 +1512,7 @@ async def handle_msg(msg: dict):
         close = float(c["close"])
         gran = int(c.get("granularity", 0))
 
-        # Update or append based on epoch
+        # Update or append based on epoch (duplicate prevention)
         if gran == 3600:
             _update_or_append_candle(state.h1_candles, (epoch, open_, high, low, close), 3600)
         elif gran == 900:
