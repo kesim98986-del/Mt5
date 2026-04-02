@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.6 — Fully Fixed Chart & Live Data           ║
+║        SMC SNIPER EA v5.7 — Final Production Version                ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║   Duplicate Candle Fix | Robust Y‑Axis | Custom Settings | Supabase  ║
+║   Deduplication | Robust Chart | Supabase Candle Logging | Logging   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -250,7 +250,8 @@ class BotState:
         self.m5_candles  = deque(maxlen=1000)
         self.m1_candles  = deque(maxlen=1000)
         self.gran_actual = {3600: 3600, 900: 900, 300: 300, 60: 60}
-        self.last_ohlc_time = 0  # timestamp of last received ohlc
+        self.last_ohlc_time = 0
+        self.last_m15_epoch = 0   # track last epoch to detect new 15m bar
 
         self.current_price    = 0.0
         self.trend_bias       = "NEUTRAL"
@@ -786,7 +787,6 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
     raw_min = df["low"].min()
     raw_max = df["high"].max()
     price_range = raw_max - raw_min
-    # Minimum absolute range for each instrument
     if state.pair_key == "XAUUSD":
         min_range = 10.0
     else:
@@ -895,7 +895,7 @@ def generate_chart(candles: deque, tf: str = "M15", entry_price: float = None,
             ax_main.axhline(trap["level"], color='#e040fb', ls=':', lw=1.5, alpha=0.9)
 
     ts_now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    info_text = (f"SMC SNIPER v5.6 [{state.trading_mode}] · {state.pair_display} · "
+    info_text = (f"SMC SNIPER v5.7 [{state.trading_mode}] · {state.pair_display} · "
                  f"Bal:{state.account_balance:.2f}{state.account_currency} · "
                  f"Risk:{state.risk_pct*100:.0f}% · Last {len(df)} candles · {ts_now}")
     fig.text(0.5, 0.01, info_text, ha='center', va='bottom', fontsize=6, color='#8b949e', fontfamily='monospace')
@@ -933,7 +933,7 @@ def generate_history_chart() -> Optional[str]:
     ax2.axhline(0, color=GR, lw=.8)
     ax2.set_ylabel("Cumulative", color="#90a4ae", fontsize=8)
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    fig.text(.99, .01, f"SMC SNIPER v5.6 · {ts}", color="#444d56", fontsize=7, ha="right")
+    fig.text(.99, .01, f"SMC SNIPER v5.7 · {ts}", color="#444d56", fontsize=7, ha="right")
     path = "/tmp/sniper_history.png"
     plt.tight_layout()
     plt.savefig(path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -941,7 +941,7 @@ def generate_history_chart() -> Optional[str]:
     return path
 
 # ==================================================
-# 14. SMC SNIPER BRAIN (All signal functions restored)
+# 14. SMC SNIPER BRAIN (All signal functions)
 # ==================================================
 def _bos_choch(df: pd.DataFrame) -> Optional[dict]:
     H, L = _swing_pts(df)
@@ -1239,7 +1239,7 @@ def check_trade_mgmt():
                     sig["sl"] = t
 
 # ==================================================
-# 15. SUPABASE LOGGING (optional)
+# 15. SUPABASE LOGGING (signals, trades, and candles)
 # ==================================================
 def supabase_log_signal(signal: dict):
     if not supabase:
@@ -1285,6 +1285,26 @@ def supabase_log_trade(contract_id: str, signal: dict, result: dict):
         log.info("💰 Trade result logged to Supabase")
     except Exception as e:
         log.warning(f"Supabase log failed: {e}")
+
+def supabase_log_candle(pair: str, timeframe: str, epoch: int, open_, high, low, close):
+    """Log a completed candle to Supabase (optional)."""
+    if not supabase:
+        return
+    try:
+        data = {
+            "timestamp": datetime.fromtimestamp(epoch, tz=UTC).isoformat(),
+            "pair": pair,
+            "timeframe": timeframe,
+            "epoch": epoch,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close
+        }
+        supabase.table("sniper_candles").insert(data).execute()
+        log.debug(f"📝 Candle logged: {timeframe} {epoch}")
+    except Exception as e:
+        log.warning(f"Supabase candle log failed: {e}")
 
 # ==================================================
 # 16. DERIV WEBSOCKET & TRADE EXECUTION
@@ -1336,6 +1356,10 @@ def _update_or_append_candle(deque_obj: deque, new_candle: tuple, nom: int):
         deque_obj[-1] = new_candle
         log.debug(f"Updated candle epoch {epoch} for granularity {nom}")
     else:
+        # New candle: if we were tracking M15 and this is a new epoch, log the previous candle
+        if nom == 900 and deque_obj and deque_obj[-1][0] != epoch:
+            prev = deque_obj[-1]
+            supabase_log_candle(state.pair_display, "M15", prev[0], prev[1], prev[2], prev[3], prev[4])
         deque_obj.append(new_candle)
         log.debug(f"Appended new candle epoch {epoch} for granularity {nom}")
 
@@ -1450,10 +1474,14 @@ async def execute_trade(signal: dict) -> Optional[str]:
     }
 
     log.info(f"🚀 EXECUTING TRADE: {direction} {amount:.2f} {state.account_currency}")
+    log.info(f"📡 Full request: {json.dumps(contract_params, indent=2)}")
     try:
         response = await send_req(contract_params)
+        log.info(f"📡 Full response: {json.dumps(response, indent=2)}")
         if "error" in response:
-            log.error(f"❌ Trade execution FAILED: {response['error'].get('message','Unknown')}")
+            error_msg = response["error"].get("message", "Unknown error")
+            log.error(f"❌ Trade execution FAILED: {error_msg}")
+            log.error(f"   Error details: {response['error']}")
             return None
         if "buy" not in response:
             log.error(f"❌ Unexpected response: {response}")
@@ -1472,6 +1500,7 @@ async def execute_trade(signal: dict) -> Optional[str]:
         return contract_id
     except Exception as e:
         log.error(f"❌ Trade execution EXCEPTION: {e}")
+        log.error(traceback.format_exc())
         return None
 
 async def close_contract(cid: str) -> bool:
@@ -1519,10 +1548,7 @@ async def handle_msg(msg: dict):
         close = float(c["close"])
         gran = int(c.get("granularity", 0))
 
-        # Log every received ohlc (for debugging)
         log.info(f"📡 OHLC {gran}s: epoch={epoch} O={open_} H={high} L={low} C={close}")
-
-        # Update last received time
         state.last_ohlc_time = time.time()
 
         # Update or append based on epoch
@@ -1610,15 +1636,14 @@ async def handle_msg(msg: dict):
 # 18. DATA FRESHNESS MONITOR & AUTO RESUBSCRIBE
 # ==================================================
 async def data_freshness_monitor():
-    """Check if we received ohlc data recently; if not, re-subscribe."""
     while state.running:
-        await asyncio.sleep(60)  # check every minute
+        await asyncio.sleep(60)
         if not state.broker_connected:
             continue
         if state.last_ohlc_time == 0:
             continue
         age = time.time() - state.last_ohlc_time
-        if age > 300:  # 5 minutes without data
+        if age > 300:
             log.warning(f"No OHLC data for {int(age)} seconds – re-subscribing")
             try:
                 await subscribe_pair(state.pair_key)
@@ -1736,7 +1761,7 @@ async def trading_loop():
         await asyncio.sleep(30)
 
 # ==================================================
-# 20. TELEGRAM POLLING (unchanged except for new handlers)
+# 20. TELEGRAM POLLING (full, but we keep existing handlers)
 # ==================================================
 async def tg_poll_loop():
     if not TELEGRAM_TOKEN:
@@ -1833,13 +1858,14 @@ async def _process_token(token: str):
 
 async def _cmd(cmd: str):
     cmd = cmd.lower().strip()
+    # ========== EXISTING COMMANDS (unchanged) ==========
     if cmd in ("/start","/help","cmd_back"):
         mkt = market_header()
         bl = ("🚫 "+state.block_reason if state.block_trading else ("🛑 PAUSED" if state.paused else "🟢 AUTONOMOUS"))
         conn = "✅ Connected" if state.broker_connected else "❌ Not connected — tap 🔗 Connect Broker"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.6*\n\n"
+            f"{mkt}\n\n🤖 *SMC SNIPER EA v5.7*\n\n"
             f"Status: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\n"
             f"Acct: `{state.account_id}` ({state.account_type.upper()})\n"
             f"Bal: `{state.account_balance:.2f} {state.account_currency}`\n"
@@ -2098,7 +2124,7 @@ async def ws_run(ws):
         acct_icon = "🔴 REAL" if state.account_type=="real" else "🟢 DEMO"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
         await tg_async(
-            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.6 Online*\n"
+            f"{market_header()}\n\n🤖 *SMC SNIPER EA v5.7 Online*\n"
             f"Broker: {acct_icon} `{state.account_id}`\nStrategy: `{md_lbl}`\n"
             f"Bal:`{state.account_balance:.2f} {state.account_currency}`\n"
             f"Pair:`{state.pair_display}` sym:`{state.active_symbol}`\n"
@@ -2144,7 +2170,7 @@ async def ws_loop():
 async def health(req):
     wr = f"{state.wins/(state.wins+state.losses)*100:.1f}" if (state.wins+state.losses)>0 else "0"
     return web.json_response({
-        "version": "5.6",
+        "version": "5.7",
         "status": "running" if state.running else "stopped",
         "paused": state.paused,
         "block_trading": state.block_trading,
@@ -2204,9 +2230,9 @@ async def start_health():
 # ==================================================
 async def main():
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  SMC SNIPER EA v5.6 · Fully Fixed           ║")
+    log.info("║  SMC SNIPER EA v5.7 — Final Production       ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
-    log.info("║  [DUPLICATE FIX | CHART FIX | DATA MONITOR]  ║")
+    log.info("║  [DEDUPE | CHART FIX | LOGGING | SUPABASE]   ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
