@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.9 — COMPLETE PRODUCTION VERSION             ║
+║        SMC SNIPER EA v5.11 — Massive.com Price Source               ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║   Price from API Ninjas | Trade on Deriv | Full Telegram Support     ║
+║   Price via Massive.com API | Trade on Deriv | Full Bot              ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -29,29 +29,40 @@ from aiohttp import web
 from bs4 import BeautifulSoup
 
 # ----------------------------------------------------------------------
-# API Ninjas configuration
+# Configuration – read from environment
 # ----------------------------------------------------------------------
-API_NINJAS_KEY = "bK4d0rGjIDSRQiA7hTWiEJvzRcBBhBkkl6aDM00z"
-API_NINJAS_BASE = "https://api.api-ninjas.com/v1"
+DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "3c117e91-14b1-45a1-8d60-4220d3aa1d59")
+MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
+CHART_INTERVAL = int(os.getenv("CHART_INTERVAL", "300"))
+PORT = int(os.getenv("PORT", "8080"))
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
+DERIV_WS_BASE = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-PAIR_API_MAP = {
-    "XAUUSD": {"type": "commodity", "name": "gold", "multiplier": 1.0},
-    "EURUSD": {"type": "forex", "pair": "EURUSD", "multiplier": 1.0},
-    "GBPUSD": {"type": "forex", "pair": "GBPUSD", "multiplier": 1.0},
-    "US100":  {"type": "index", "name": "nasdaq100", "multiplier": 1.0},
+# ----------------------------------------------------------------------
+# Massive.com API settings – adjust URL and response format as needed
+# ----------------------------------------------------------------------
+MASSIVE_API_BASE = "https://massive.com/api/v1/price"
+# Map our pair symbols to Massive.com symbols (assumed)
+PAIR_SYMBOL_MAP = {
+    "XAUUSD": "XAUUSD",
+    "EURUSD": "EURUSD",
+    "GBPUSD": "GBPUSD",
+    "US100":  "NAS100",
 }
 
 # ----------------------------------------------------------------------
 # Optional Supabase
 # ----------------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client, Client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        log.info("✅ Supabase client initialized")
     except Exception as e:
         print(f"Supabase init failed: {e}")
 
@@ -93,7 +104,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
 DERIV_WS_BASE = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ----------------------------------------------------------------------
-# Helper classes
+# Helper classes (NewsEvent, TradeReason)
 # ----------------------------------------------------------------------
 class NewsEvent:
     __slots__ = ("time_et","currency","impact","title","actual","forecast","prev","dt_utc")
@@ -212,33 +223,31 @@ class BotState:
 state = BotState()
 
 # ----------------------------------------------------------------------
-# API Ninjas functions
+# Massive.com price fetcher
 # ----------------------------------------------------------------------
 def get_current_price() -> float:
+    """Fetch current price from Massive.com API."""
     try:
-        info = PAIR_API_MAP.get(state.pair_key)
-        if not info:
-            return 0.0
-        if info["type"] == "commodity":
-            url = f"{API_NINJAS_BASE}/commodityprice?name={info['name']}"
-        elif info["type"] == "forex":
-            url = f"{API_NINJAS_BASE}/exchangerate?pair={info['pair']}"
-        else:
-            return 0.0
-        headers = {"X-Api-Key": API_NINJAS_KEY}
+        symbol = PAIR_SYMBOL_MAP.get(state.pair_key, state.pair_key)
+        url = f"{MASSIVE_API_BASE}?symbol={symbol}"
+        headers = {"X-API-Key": MASSIVE_API_KEY}
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            if info["type"] == "commodity":
-                price = float(data.get("price", 0))
+            # Common response formats: {"price": 2350.50} or {"data":{"price":2350.50}}
+            price = data.get("price")
+            if price is None and "data" in data:
+                price = data["data"].get("price")
+            if price and isinstance(price, (int, float)):
+                return float(price)
             else:
-                price = float(data.get("exchange_rate", 0))
-            return price * info.get("multiplier", 1.0)
+                log.warning(f"Unexpected response format: {data}")
+                return 0.0
         else:
-            log.warning(f"API Ninjas error {resp.status_code}")
+            log.warning(f"Massive.com error {resp.status_code}: {resp.text[:200]}")
             return 0.0
     except Exception as e:
-        log.error(f"API Ninjas price error: {e}")
+        log.error(f"Massive.com price error: {e}")
         return 0.0
 
 # ----------------------------------------------------------------------
@@ -291,7 +300,7 @@ def _rsi_calc(p: np.ndarray, n: int = 14) -> np.ndarray:
     return np.concatenate([np.full(len(p)-len(rsi), 50.), rsi])
 
 # ----------------------------------------------------------------------
-# Chart generation (simple matplotlib, no mplfinance issues)
+# Chart generation (simple matplotlib)
 # ----------------------------------------------------------------------
 def generate_chart(candles, tf="M15", entry_price=None, exit_price=None, direction=None, pnl=None, chart_type="live", reason=None):
     if len(candles) < 10:
@@ -500,7 +509,7 @@ async def news_block_monitor():
         await asyncio.sleep(60)
 
 # ----------------------------------------------------------------------
-# Telegram keyboards
+# Telegram keyboards (abbreviated – full version from previous code)
 # ----------------------------------------------------------------------
 def kb_main():
     block_lbl = ("🚫 Blocked" if state.block_trading else ("🛑 Paused" if state.paused else "🟢 Active"))
@@ -614,7 +623,7 @@ async def tg_async(text, photo_path=None, reply_markup=None):
     await loop.run_in_executor(None, lambda: tg_send(text, photo_path, reply_markup))
 
 # ----------------------------------------------------------------------
-# SMC signal functions (fully restored)
+# SMC signal functions (full – same as before)
 # ----------------------------------------------------------------------
 def _swing_pts(df, n=5):
     H, L = [], []
@@ -846,7 +855,7 @@ def check_trade_mgmt():
                 if t < sig["sl"]: sig["sl"] = t
 
 # ----------------------------------------------------------------------
-# Deriv WebSocket and trade execution (only for trading, not for OHLC)
+# Deriv WebSocket and trade execution
 # ----------------------------------------------------------------------
 async def send_req(payload):
     if state.ws is None: raise RuntimeError("WS not connected")
@@ -977,7 +986,7 @@ async def close_all():
     return len(state.open_contracts)
 
 # ----------------------------------------------------------------------
-# Price updater using API Ninjas (updates last candle every 10 seconds)
+# Price updater using Massive.com API
 # ----------------------------------------------------------------------
 async def price_updater_loop():
     while state.running:
@@ -991,9 +1000,9 @@ async def price_updater_loop():
                         last = buf[-1]
                         new_candle = (last[0], last[1], max(last[2], price), min(last[3], price), price)
                         buf[-1] = new_candle
-                log.debug(f"Price updated via API Ninjas: {price}")
+                log.debug(f"Price updated via Massive.com: {price}")
             else:
-                log.warning("API Ninjas returned 0 price")
+                log.warning("Massive.com returned 0 price")
         except Exception as e:
             log.error(f"Price updater error: {e}")
         await asyncio.sleep(10)
@@ -1047,7 +1056,7 @@ async def handle_msg(msg):
         log.warning(f"API error: {msg['error']}")
 
 # ----------------------------------------------------------------------
-# WebSocket reader and loop (only for trade execution)
+# WebSocket reader and loop
 # ----------------------------------------------------------------------
 async def ws_reader(ws):
     async for raw in ws:
@@ -1061,7 +1070,7 @@ async def ws_run(ws):
         await authorize()
         await get_balance()
         await subscribe_pair(state.pair_key)
-        await tg_async(f"{market_header()}\n🤖 *SMC SNIPER EA v5.9 (API Ninjas)*\nBalance: {state.account_balance:.2f} {state.account_currency}\nPair: {state.pair_display}", reply_markup=kb_main())
+        await tg_async(f"{market_header()}\n🤖 *SMC SNIPER EA v5.11 (Massive.com)*\nBalance: {state.account_balance:.2f} {state.account_currency}\nPair: {state.pair_display}", reply_markup=kb_main())
     task = asyncio.ensure_future(setup())
     try: await ws_reader(ws)
     finally: task.cancel()
@@ -1212,7 +1221,7 @@ async def _cmd(cmd):
         bl = ("🚫 "+state.block_reason if state.block_trading else ("🛑 PAUSED" if state.paused else "🟢 AUTONOMOUS"))
         conn = "✅ Connected" if state.broker_connected else "❌ Not connected — tap 🔗 Connect Broker"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
-        await tg_async(f"{mkt}\n\n🤖 *SMC SNIPER EA v5.9*\n\nStatus: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\nAcct: `{state.account_id}` ({state.account_type.upper()})\nBal: `{state.account_balance:.2f} {state.account_currency}`\nPair: `{state.pair_display}` Risk:`{state.risk_pct*100:.0f}%`\nMin Score: `{state.min_score}/100`\nH1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}` M1:`{len(state.m1_candles)}`", reply_markup=kb_main())
+        await tg_async(f"{mkt}\n\n🤖 *SMC SNIPER EA v5.11*\n\nStatus: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\nAcct: `{state.account_id}` ({state.account_type.upper()})\nBal: `{state.account_balance:.2f} {state.account_currency}`\nPair: `{state.pair_display}` Risk:`{state.risk_pct*100:.0f}%`\nMin Score: `{state.min_score}/100`\nH1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}` M1:`{len(state.m1_candles)}`", reply_markup=kb_main())
     elif cmd in ("/status","cmd_status"):
         mkt = market_header()
         bl = ("🚫 "+state.block_reason if state.block_trading else ("🛑 PAUSED" if state.paused else "🟢 SCANNING"))
@@ -1367,7 +1376,7 @@ async def _cmd(cmd):
 # Health server
 # ----------------------------------------------------------------------
 async def health(req):
-    return web.json_response({"status":"running","version":"5.9","source":"API Ninjas + Deriv"})
+    return web.json_response({"status":"running","version":"5.11","source":"Massive.com + Deriv"})
 
 async def start_health():
     app = web.Application()
@@ -1380,7 +1389,7 @@ async def start_health():
 # Entry point
 # ----------------------------------------------------------------------
 async def main():
-    log.info("Starting SMC SNIPER EA v5.9 with API Ninjas price source")
+    log.info("Starting SMC SNIPER EA v5.11 with Massive.com price source")
     _load_saved_token()
     await asyncio.gather(
         start_health(),
