@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMC SNIPER EA v5.11 — Massive.com Price Source               ║
+║        SMC SNIPER EA v5.12 — iTick Price + Deriv Execution          ║
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
-║   Price via Massive.com API | Trade on Deriv | Full Bot              ║
+║   iTick API for real-time & historical candles | Full Chart Annotations║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import requests
@@ -36,7 +37,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "3c117e91-14b1-45a1-8d60-4220d3aa1d59")
+ITICK_API_TOKEN = os.getenv("ITICK_API_TOKEN", "bb42e24746784dc0af821abdd1188861d945a07051c8414a8337697a752de1eb")
 MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
 CHART_INTERVAL = int(os.getenv("CHART_INTERVAL", "300"))
 PORT = int(os.getenv("PORT", "8080"))
@@ -44,15 +45,18 @@ DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 DERIV_WS_BASE = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ----------------------------------------------------------------------
-# Massive.com API settings – adjust URL and response format as needed
+# iTick API endpoints
 # ----------------------------------------------------------------------
-MASSIVE_API_BASE = "https://massive.com/api/v1/price"
-# Map our pair symbols to Massive.com symbols (assumed)
+ITICK_BASE = "https://api.itick.org"
+ITICK_TICK = f"{ITICK_BASE}/forex/tick"      # live price
+ITICK_KLINE = f"{ITICK_BASE}/forex/kline"    # historical OHLC
+
+# Map our pair keys to iTick symbols (they use 'XAUUSD' etc.)
 PAIR_SYMBOL_MAP = {
     "XAUUSD": "XAUUSD",
     "EURUSD": "EURUSD",
     "GBPUSD": "GBPUSD",
-    "US100":  "NAS100",
+    "US100":  "NAS100",      # iTick may use NAS100 for Nasdaq
 }
 
 # ----------------------------------------------------------------------
@@ -223,32 +227,63 @@ class BotState:
 state = BotState()
 
 # ----------------------------------------------------------------------
-# Massive.com price fetcher
+# iTick API functions (price + historical candles)
 # ----------------------------------------------------------------------
 def get_current_price() -> float:
-    """Fetch current price from Massive.com API."""
+    """Fetch live price from iTick API."""
     try:
         symbol = PAIR_SYMBOL_MAP.get(state.pair_key, state.pair_key)
-        url = f"{MASSIVE_API_BASE}?symbol={symbol}"
-        headers = {"X-API-Key": MASSIVE_API_KEY}
+        url = f"{ITICK_TICK}?region=gb&code={symbol}"
+        headers = {"accept": "application/json", "token": ITICK_API_TOKEN}
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            # Common response formats: {"price": 2350.50} or {"data":{"price":2350.50}}
-            price = data.get("price")
-            if price is None and "data" in data:
-                price = data["data"].get("price")
-            if price and isinstance(price, (int, float)):
-                return float(price)
-            else:
-                log.warning(f"Unexpected response format: {data}")
-                return 0.0
+            # iTick returns: {"code":"XAUUSD","price":2350.50,...}
+            price = float(data.get("price", 0))
+            return price
         else:
-            log.warning(f"Massive.com error {resp.status_code}: {resp.text[:200]}")
+            log.warning(f"iTick price error {resp.status_code}: {resp.text[:200]}")
             return 0.0
     except Exception as e:
-        log.error(f"Massive.com price error: {e}")
+        log.error(f"iTick price error: {e}")
         return 0.0
+
+def fetch_historical_candles(symbol: str, interval_minutes: int, limit: int = 200) -> List[dict]:
+    """
+    Fetch OHLC candles from iTick.
+    interval_minutes: 1,5,15,30,60,240,1440 (iTick supports many)
+    Returns list of dicts with keys: time (timestamp), open, high, low, close.
+    """
+    try:
+        # iTick kline endpoint parameters
+        url = f"{ITICK_KLINE}?region=gb&code={symbol}&type={interval_minutes}&limit={limit}"
+        headers = {"accept": "application/json", "token": ITICK_API_TOKEN}
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Expected format: {"code":"XAUUSD","data":[[timestamp,open,high,low,close],...]}
+            if "data" in data and isinstance(data["data"], list):
+                candles = []
+                for item in data["data"]:
+                    # item: [timestamp, open, high, low, close]
+                    if len(item) >= 5:
+                        candles.append({
+                            "time": int(item[0]),      # epoch seconds
+                            "open": float(item[1]),
+                            "high": float(item[2]),
+                            "low": float(item[3]),
+                            "close": float(item[4])
+                        })
+                return candles
+            else:
+                log.warning(f"iTick kline unexpected format: {data}")
+                return []
+        else:
+            log.warning(f"iTick kline error {resp.status_code}: {resp.text[:200]}")
+            return []
+    except Exception as e:
+        log.error(f"iTick kline error: {e}")
+        return []
 
 # ----------------------------------------------------------------------
 # Market & session helpers
@@ -300,7 +335,7 @@ def _rsi_calc(p: np.ndarray, n: int = 14) -> np.ndarray:
     return np.concatenate([np.full(len(p)-len(rsi), 50.), rsi])
 
 # ----------------------------------------------------------------------
-# Chart generation (simple matplotlib)
+# Chart generation with full annotations (candlestick, entry, analysis text)
 # ----------------------------------------------------------------------
 def generate_chart(candles, tf="M15", entry_price=None, exit_price=None, direction=None, pnl=None, chart_type="live", reason=None):
     if len(candles) < 10:
@@ -311,10 +346,11 @@ def generate_chart(candles, tf="M15", entry_price=None, exit_price=None, directi
     df = df[(df["open"]>0) & (df["high"]>0) & (df["low"]>0) & (df["close"]>0)]
     df["date"] = pd.to_datetime(df["time"], unit="s")
     df.set_index("date", inplace=True)
-    df = df.tail(40)
+    df = df.tail(50)  # show last 50 candles for better view
     if len(df) < 5:
         return None
 
+    # Y-axis scaling
     price_range = df["high"].max() - df["low"].min()
     if state.pair_key == "XAUUSD":
         min_padding = 10.0
@@ -324,19 +360,54 @@ def generate_chart(candles, tf="M15", entry_price=None, exit_price=None, directi
     y_min = df["low"].min() - padding
     y_max = df["high"].max() + padding
 
-    fig, ax = plt.subplots(figsize=(12,6))
+    fig, ax = plt.subplots(figsize=(14, 8))
+    # Draw candlesticks
     for i in range(len(df)):
         o = df["open"].iloc[i]
         c = df["close"].iloc[i]
         h = df["high"].iloc[i]
         l = df["low"].iloc[i]
         color = '#00c853' if c >= o else '#d50000'
+        # Wick
         ax.plot([i,i], [l,h], color=color, linewidth=1)
-        ax.add_patch(plt.Rectangle((i-0.3, min(o,c)), 0.6, abs(c-o), facecolor=color, edgecolor=color))
+        # Body
+        body_height = abs(c-o)
+        if body_height < 0.001 * price_range:  # very small body
+            body_height = 0.001 * price_range
+        ax.add_patch(plt.Rectangle((i-0.3, min(o,c)), 0.6, body_height, facecolor=color, edgecolor=color))
+
+    # Entry line (if provided)
+    if entry_price:
+        ax.axhline(y=entry_price, color='#00e5ff', linestyle='-', linewidth=2, label=f'Entry: {entry_price:.2f}')
+        ax.text(len(df)-1, entry_price, f' Entry {entry_price:.2f}', color='#00e5ff', fontsize=8, va='bottom')
+
+    # SL line
+    if state.last_signal and state.last_signal.get("sl"):
+        sl = state.last_signal["sl"]
+        ax.axhline(y=sl, color='#ff5252', linestyle='--', linewidth=1.5, label=f'SL: {sl:.2f}')
+        ax.text(len(df)-1, sl, f' SL {sl:.2f}', color='#ff5252', fontsize=8, va='top')
+
+    # TP lines
+    if state.last_signal:
+        for tp, color, label in [("tp1",'#69f0ae','TP1'), ("tp2",'#b2ff59','TP2'), ("tp3",'#eeff41','TP3')]:
+            if tp in state.last_signal:
+                tp_val = state.last_signal[tp]
+                ax.axhline(y=tp_val, color=color, linestyle='-.', linewidth=1, label=f'{label}: {tp_val:.2f}')
+                ax.text(len(df)-1, tp_val, f' {label}', color=color, fontsize=8, va='bottom')
+
+    # Analysis text box (top-left)
+    analysis_text = f"Bias: {state.trend_bias}\nZone: {state.premium_discount}\nScore: {state.ob_score}/100\nSession: {state.session_now}\nATR: {'OK' if state.atr_filter_ok else 'LOW'}"
+    props = dict(boxstyle='round', facecolor='#1e2a38', alpha=0.8)
+    ax.text(0.02, 0.98, analysis_text, transform=ax.transAxes, fontsize=9, verticalalignment='top', bbox=props, color='#cdd9e5', fontfamily='monospace')
+
+    # Title
+    ax.set_title(f"{state.pair_display} {tf} · {chart_type.upper()}", fontsize=12, color='#cdd9e5')
     ax.set_ylim(y_min, y_max)
-    ax.set_title(f"{state.pair_display} {tf} · {chart_type}")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.3)
+
     path = f"/tmp/sniper_chart_{chart_type}.png"
-    plt.savefig(path, dpi=100, bbox_inches="tight")
+    plt.savefig(path, dpi=120, bbox_inches="tight", facecolor='#0d1117')
     plt.close()
     return path
 
@@ -509,7 +580,7 @@ async def news_block_monitor():
         await asyncio.sleep(60)
 
 # ----------------------------------------------------------------------
-# Telegram keyboards (abbreviated – full version from previous code)
+# Telegram keyboards (full)
 # ----------------------------------------------------------------------
 def kb_main():
     block_lbl = ("🚫 Blocked" if state.block_trading else ("🛑 Paused" if state.paused else "🟢 Active"))
@@ -893,100 +964,38 @@ async def get_balance():
         state.account_balance = r["balance"]["balance"]
         state.account_currency = r["balance"]["currency"]
 
-async def _fetch_initial_candles(sym, nom):
-    lbl = {3600:"H1",900:"M15",300:"M5",60:"M1"}
-    for ag in GRAN_FALLBACKS.get(nom, [nom]):
-        try:
-            r = await send_req({"ticks_history":sym,"end":"latest","count":200,"granularity":ag,"style":"candles"})
-            if "error" in r: continue
-            raw = r.get("candles",[])
-            if not raw: continue
-            rows = [(int(c["epoch"]), float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])) for c in raw]
-            state.gran_actual[nom] = ag
-            if nom == 3600: state.h1_candles.extend(rows)
-            elif nom == 900: state.m15_candles.extend(rows)
-            elif nom == 300: state.m5_candles.extend(rows)
-            elif nom == 60: state.m1_candles.extend(rows)
-            log.info(f"✅ Initial {len(rows)} {lbl.get(nom,'?')} candles from Deriv")
-            return len(rows)
-        except Exception as e:
-            log.warning(f"Initial fetch {nom} failed: {e}")
-    return 0
+# ----------------------------------------------------------------------
+# iTick-based candle fetching for all timeframes
+# ----------------------------------------------------------------------
+async def fetch_and_store_candles(tf_minutes: int, target_deque: deque, limit: int = 200):
+    """Fetch OHLC from iTick and replace the deque contents."""
+    symbol = PAIR_SYMBOL_MAP.get(state.pair_key, state.pair_key)
+    candles = await asyncio.get_event_loop().run_in_executor(
+        None, fetch_historical_candles, symbol, tf_minutes, limit
+    )
+    if candles:
+        # Convert to tuple format (time, open, high, low, close) and sort by time
+        rows = [(c["time"], c["open"], c["high"], c["low"], c["close"]) for c in candles]
+        rows.sort(key=lambda x: x[0])
+        target_deque.clear()
+        target_deque.extend(rows)
+        log.info(f"iTick: loaded {len(rows)} candles for {tf_minutes}m")
+        return len(rows)
+    else:
+        log.warning(f"iTick: failed to fetch candles for {tf_minutes}m")
+        return 0
 
-async def _resolve_sym(key):
-    pri, otc = PAIR_REGISTRY[key][0], PAIR_REGISTRY[key][1]
-    return pri
-
-async def subscribe_pair(key):
-    state.h1_candles.clear(); state.m15_candles.clear(); state.m5_candles.clear(); state.m1_candles.clear()
-    state.last_signal = None
-    state.active_ob = state.active_fvg = state.active_trap = state.active_idm = None
-    state.current_price = 0.
-    state.trend_bias = "NEUTRAL"
-    state.ob_score = 0
-    state.premium_discount = "NEUTRAL"
-    sym = await _resolve_sym(key)
-    state.active_symbol = sym
-    h = await _fetch_initial_candles(sym,3600)
-    m = await _fetch_initial_candles(sym,900)
-    f = await _fetch_initial_candles(sym,300)
-    o = await _fetch_initial_candles(sym,60)
-    log.info(f"Initial candles loaded: H1:{h} M15:{m} M5:{f} M1:{o}")
-    return h,m,f,o
-
-async def execute_trade(signal):
-    if not state.broker_connected: log.error("Broker not connected"); return None
-    if state.paused: log.error("Bot paused"); return None
-    if state.block_trading: log.error(f"Trading blocked: {state.block_reason}"); return None
-    direction = signal["direction"]
-    amount = signal["stake"]
-    contract_type = "MULTUP" if direction=="BUY" else "MULTDOWN"
-    params = {
-        "buy":1, "price":round(amount,2),
-        "parameters": {
-            "contract_type":contract_type,
-            "symbol":state.active_symbol or PAIR_REGISTRY[state.pair_key][0],
-            "amount":round(amount,2),
-            "currency":state.account_currency,
-            "multiplier":10, "basis":"stake", "stop_out":1
-        }
-    }
-    log.info(f"🚀 EXECUTING TRADE: {direction} {amount:.2f} {state.account_currency}")
-    log.info(f"📡 Full request: {json.dumps(params)}")
-    try:
-        resp = await send_req(params)
-        log.info(f"📡 Full response: {json.dumps(resp)}")
-        if "error" in resp:
-            log.error(f"❌ Trade execution FAILED: {resp['error'].get('message')}")
-            return None
-        if "buy" not in resp: return None
-        cid = str(resp["buy"]["contract_id"])
-        log.info(f"✅ Trade EXECUTED! Contract ID: {cid}")
-        state.open_contracts[cid] = {
-            "direction":direction, "entry":state.current_price, "amount":amount,
-            "signal":signal, "be_moved":False, "opened_at":time.time()
-        }
-        state.trade_count += 1
-        return cid
-    except Exception as e:
-        log.error(f"Trade execution EXCEPTION: {e}")
-        return None
-
-async def close_contract(cid):
-    try:
-        r = await send_req({"sell":cid,"price":0})
-        if "error" in r: return False
-        state.open_contracts.pop(cid, None)
-        return True
-    except: return False
-
-async def close_all():
-    for cid in list(state.open_contracts.keys()):
-        await close_contract(cid)
-    return len(state.open_contracts)
+async def update_all_candles():
+    """Fetch fresh candles for all timeframes from iTick."""
+    await asyncio.gather(
+        fetch_and_store_candles(60, state.m1_candles, 300),     # 1min
+        fetch_and_store_candles(300, state.m5_candles, 300),   # 5min
+        fetch_and_store_candles(900, state.m15_candles, 300),  # 15min
+        fetch_and_store_candles(3600, state.h1_candles, 200),  # 1hour
+    )
 
 # ----------------------------------------------------------------------
-# Price updater using Massive.com API
+# Price updater using iTick (every 10 seconds)
 # ----------------------------------------------------------------------
 async def price_updater_loop():
     while state.running:
@@ -994,15 +1003,16 @@ async def price_updater_loop():
             price = get_current_price()
             if price > 0:
                 state.current_price = price
-                # Update the last candle in each timeframe
-                for buf, gran in [(state.m1_candles,60), (state.m5_candles,300), (state.m15_candles,900), (state.h1_candles,3600)]:
+                # Update the last candle in each timeframe (just close & high/low)
+                for buf in [state.m1_candles, state.m5_candles, state.m15_candles, state.h1_candles]:
                     if buf:
                         last = buf[-1]
+                        # new candle: same time, same open, update high/low/close
                         new_candle = (last[0], last[1], max(last[2], price), min(last[3], price), price)
                         buf[-1] = new_candle
-                log.debug(f"Price updated via Massive.com: {price}")
+                log.debug(f"Price updated via iTick: {price}")
             else:
-                log.warning("Massive.com returned 0 price")
+                log.warning("iTick returned 0 price")
         except Exception as e:
             log.error(f"Price updater error: {e}")
         await asyncio.sleep(10)
@@ -1056,7 +1066,7 @@ async def handle_msg(msg):
         log.warning(f"API error: {msg['error']}")
 
 # ----------------------------------------------------------------------
-# WebSocket reader and loop
+# WebSocket reader and loop (only for trade execution)
 # ----------------------------------------------------------------------
 async def ws_reader(ws):
     async for raw in ws:
@@ -1069,8 +1079,9 @@ async def ws_run(ws):
         await asyncio.sleep(0.1)
         await authorize()
         await get_balance()
-        await subscribe_pair(state.pair_key)
-        await tg_async(f"{market_header()}\n🤖 *SMC SNIPER EA v5.11 (Massive.com)*\nBalance: {state.account_balance:.2f} {state.account_currency}\nPair: {state.pair_display}", reply_markup=kb_main())
+        # Load initial candles from iTick
+        await update_all_candles()
+        await tg_async(f"{market_header()}\n🤖 *SMC SNIPER EA v5.12 (iTick)*\nBalance: {state.account_balance:.2f} {state.account_currency}\nPair: {state.pair_display}\nCandles loaded from iTick.", reply_markup=kb_main())
     task = asyncio.ensure_future(setup())
     try: await ws_reader(ws)
     finally: task.cancel()
@@ -1210,7 +1221,7 @@ async def _process_token(token: str):
         await get_balance()
         acct_icon = "🔴 REAL" if state.account_type=="real" else "🟢 DEMO"
         await tg_async(f"✅ *Broker Connected Successfully!*\n\nAccount: `{state.account_id}`\nType: {acct_icon}\nBalance: `{state.account_balance:.2f} {state.account_currency}`\n\n_Sniper Brain active._", reply_markup=kb_main())
-        await subscribe_pair(state.pair_key)
+        await update_all_candles()
     except Exception as e:
         await tg_async(f"❌ Authentication failed: `{e}`", reply_markup=kb_connect())
 
@@ -1221,7 +1232,7 @@ async def _cmd(cmd):
         bl = ("🚫 "+state.block_reason if state.block_trading else ("🛑 PAUSED" if state.paused else "🟢 AUTONOMOUS"))
         conn = "✅ Connected" if state.broker_connected else "❌ Not connected — tap 🔗 Connect Broker"
         md_lbl = "🎯 Sniper" if state.trading_mode=="SNIPER" else "⚡ Scalper"
-        await tg_async(f"{mkt}\n\n🤖 *SMC SNIPER EA v5.11*\n\nStatus: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\nAcct: `{state.account_id}` ({state.account_type.upper()})\nBal: `{state.account_balance:.2f} {state.account_currency}`\nPair: `{state.pair_display}` Risk:`{state.risk_pct*100:.0f}%`\nMin Score: `{state.min_score}/100`\nH1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}` M1:`{len(state.m1_candles)}`", reply_markup=kb_main())
+        await tg_async(f"{mkt}\n\n🤖 *SMC SNIPER EA v5.12 (iTick)*\n\nStatus: {bl}\nBroker: {conn}\nStrategy: `{md_lbl}`\nAcct: `{state.account_id}` ({state.account_type.upper()})\nBal: `{state.account_balance:.2f} {state.account_currency}`\nPair: `{state.pair_display}` Risk:`{state.risk_pct*100:.0f}%`\nMin Score: `{state.min_score}/100`\nH1:`{len(state.h1_candles)}` M15:`{len(state.m15_candles)}` M5:`{len(state.m5_candles)}` M1:`{len(state.m1_candles)}`", reply_markup=kb_main())
     elif cmd in ("/status","cmd_status"):
         mkt = market_header()
         bl = ("🚫 "+state.block_reason if state.block_trading else ("🛑 PAUSED" if state.paused else "🟢 SCANNING"))
@@ -1302,7 +1313,7 @@ async def _cmd(cmd):
             if state.ws:
                 try:
                     await tg_async(f"⏳ Switching to `{PAIR_REGISTRY[key][4]}`...", reply_markup=kb_main())
-                    await subscribe_pair(key)
+                    await update_all_candles()
                     await tg_async(f"💱 Switched → `{state.pair_display}` ✅", reply_markup=kb_main())
                 except Exception as e:
                     state.pair_key = old
@@ -1321,7 +1332,7 @@ async def _cmd(cmd):
             else:
                 state.pair_key="GBPUSD"; state.risk_pct=0.05; state.tp1_r,state.tp2_r,state.tp3_r = 1.5,3.,4.5
                 note = "GBP/USD 5% risk"
-            if state.ws: await subscribe_pair(state.pair_key)
+            if state.ws: await update_all_candles()
             await tg_async(f"💎 *Small Acc ON*\n{note}", reply_markup=kb_settings())
     elif cmd == "cmd_risk_1":
         state.risk_pct=0.01; state.small_acc_mode=False; await tg_async("✅ Risk → 1%", reply_markup=kb_settings())
@@ -1376,7 +1387,7 @@ async def _cmd(cmd):
 # Health server
 # ----------------------------------------------------------------------
 async def health(req):
-    return web.json_response({"status":"running","version":"5.11","source":"Massive.com + Deriv"})
+    return web.json_response({"status":"running","version":"5.12","source":"iTick + Deriv"})
 
 async def start_health():
     app = web.Application()
@@ -1389,7 +1400,7 @@ async def start_health():
 # Entry point
 # ----------------------------------------------------------------------
 async def main():
-    log.info("Starting SMC SNIPER EA v5.11 with Massive.com price source")
+    log.info("Starting SMC SNIPER EA v5.12 with iTick price source")
     _load_saved_token()
     await asyncio.gather(
         start_health(),
