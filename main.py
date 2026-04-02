@@ -4,6 +4,7 @@
 ║     Senior Quant SMC | Sniper Brain | News Shield | Broker Connect   ║
 ║       Zero-Noise | Post-Trade Reasoning | Amharic | Railway-Ready    ║
 ║              [COMPLETE REWRITE — 3 BUGS PERMANENTLY FIXED]          ║
+║         Back4App Integration (replaces Supabase)                     ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 FIXES APPLIED (v5.2):
@@ -76,7 +77,7 @@ GRAN_FALLBACKS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════
-# FIX #3: GAPLESS SESSION DICT (24-hour cycle, zero gaps)
+# GAPLESS SESSION DICT (24-hour cycle, zero gaps)
 # ══════════════════════════════════════════════════════════════════════
 SESSIONS = {
     "ASIAN":   (0,  8),   # 00:00–08:00 UTC
@@ -107,6 +108,98 @@ DERIV_APP_ID     = os.getenv("DERIV_APP_ID", "1089")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DERIV_WS_BASE    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+# ══════════════════════════════════════════════════════════════════════
+# BACK4APP CONFIGURATION (replaces Supabase)
+# ══════════════════════════════════════════════════════════════════════
+BACK4APP_APP_ID = os.getenv("BACK4APP_APP_ID", "")
+BACK4APP_API_KEY = os.getenv("BACK4APP_API_KEY", "")
+BACK4APP_SERVER_URL = os.getenv("BACK4APP_SERVER_URL", "https://parseapi.back4app.com")
+BACK4APP_ENABLED = bool(BACK4APP_APP_ID and BACK4APP_API_KEY)
+
+if BACK4APP_ENABLED:
+    log.info("✅ Back4App logging enabled")
+else:
+    log.info("ℹ️ Back4App not configured (optional)")
+
+def _b4a_headers():
+    return {
+        "X-Parse-Application-Id": BACK4APP_APP_ID,
+        "X-Parse-REST-API-Key": BACK4APP_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+def _b4a_date(dt: datetime = None):
+    if dt is None:
+        dt = datetime.now(UTC)
+    return {"__type": "Date", "iso": dt.isoformat()}
+
+def back4app_log_signal(signal: dict):
+    if not BACK4APP_ENABLED:
+        return
+    try:
+        data = {
+            "pair": state.pair_key,
+            "direction": signal["direction"],
+            "score": signal["ob_score"],
+            "entry": signal["entry"],
+            "sl": signal["sl"],
+            "tp1": signal["tp1"],
+            "tp2": signal["tp2"],
+            "tp3": signal["tp3"],
+            "session": signal["session"],
+            "pd_zone": signal["pd_zone"],
+            "structure": signal["struct"],
+            "tv_confirmed": signal.get("tv_confirmed", False),
+            "executed": False,
+            "timestamp": _b4a_date()
+        }
+        url = f"{BACK4APP_SERVER_URL}/classes/Signals"
+        requests.post(url, json=data, headers=_b4a_headers(), timeout=5)
+        log.info("📊 Signal logged to Back4App")
+    except Exception as e:
+        log.warning(f"Back4App signal log failed: {e}")
+
+def back4app_log_trade(contract_id: str, signal: dict, result: dict):
+    if not BACK4APP_ENABLED:
+        return
+    try:
+        data = {
+            "contract_id": contract_id,
+            "pair": state.pair_key,
+            "direction": signal["direction"],
+            "entry": signal["entry"],
+            "exit": result.get("exit", 0),
+            "pnl": result.get("pnl", 0),
+            "score": signal["ob_score"],
+            "is_win": result.get("pnl", 0) > 0,
+            "timestamp": _b4a_date()
+        }
+        url = f"{BACK4APP_SERVER_URL}/classes/Trades"
+        requests.post(url, json=data, headers=_b4a_headers(), timeout=5)
+        log.info("💰 Trade result logged to Back4App")
+    except Exception as e:
+        log.warning(f"Back4App trade log failed: {e}")
+
+def back4app_log_candle(pair: str, timeframe: str, epoch: int, open_, high, low, close):
+    if not BACK4APP_ENABLED:
+        return
+    try:
+        data = {
+            "pair": pair,
+            "timeframe": timeframe,
+            "epoch": epoch,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "timestamp": _b4a_date()
+        }
+        url = f"{BACK4APP_SERVER_URL}/classes/Candles"
+        requests.post(url, json=data, headers=_b4a_headers(), timeout=5)
+        log.debug(f"📝 Candle logged: {timeframe} {epoch}")
+    except Exception as e:
+        log.warning(f"Back4App candle log failed: {e}")
 
 # ══════════════════════════════════════════════════════════════════════
 # DATA CLASSES
@@ -708,35 +801,6 @@ def _swing_pts(df: pd.DataFrame, n: int = 5):
 
 # ══════════════════════════════════════════════════════════════════════
 # CHART ENGINE — permanent fixes for all visual bugs
-#
-# PROBLEM SUMMARY (from chart image analysis):
-#
-# 1. ALL CANDLES RED BRICKS
-#    doji_min = actual_range * 0.002
-#    With range=10 pts → doji_min=0.02 pts. Real M5 Gold bodies are
-#    0.03-0.15 pts, so doji_min was BIGGER than real bodies. Every
-#    candle was forced to the same giant height. Fix: use a fixed
-#    price-relative minimum of 0.5 pip = price * 0.000005.
-#
-# 2. CANDLES CRUSHED INTO TOP 20% OF CHART
-#    MIN_RANGE = 10.0 pts triggered on tight M5 data (range 2-3 pts),
-#    forcing a 10-pt window. Candles occupied only 2-3 pts of 10.
-#    Fix: MIN_RANGE = 2.0 pts. Pad = flat 1.0 pt each side for Gold.
-#
-# 3. PHANTOM RIGHT Y-AXIS (28.5-31.5 on RSI panel)
-#    matplotlib auto-creates twin axes when sharex panels have
-#    different tick label sizes. Fix: explicitly disable right ticks
-#    and right spine on every subplot.
-#
-# 4. VOLUME BARS INVISIBLE
-#    In tight consolidation high-low ≈ 0.10 pts → after /vmax bars
-#    were < 0.08 tall inside ylim(0,1.3) → invisible.
-#    Fix: enforce MIN_VOL_BAR = 0.08 floor.
-#
-# 5. DEDUP GUARD
-#    Even with upsert in _store(), old snapshots in deque can still
-#    have runs of identical OHLC from history-load overlap.
-#    Fix: drop consecutive identical OHLC rows before charting.
 # ══════════════════════════════════════════════════════════════════════
 
 def _resolve_min_range(avg_price: float) -> float:
@@ -1048,7 +1112,7 @@ def generate_chart(
               if nxt and nxt.dt_utc else "")
     sc_s = f"Score:{state.ob_score}/100 " if state.ob_score else ""
     ar.text(0.0, -0.42,
-            f"SMC SNIPER v5.9 [{state.trading_mode}] · "
+            f"SMC SNIPER v5.2 [{state.trading_mode}] · "
             f"{state.pair_display}  sym:{state.active_symbol}"
             f"  Bal:{state.account_balance:.2f}{state.account_currency}"
             f"  Risk:{state.risk_pct*100:.0f}%  {sc_s}"
@@ -1069,6 +1133,8 @@ def generate_chart(
     plt.savefig(path, dpi=130, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
     return path
+
+
 def generate_history_chart() -> Optional[str]:
     h = state.trade_history[-20:]
     if not h:
@@ -1515,21 +1581,6 @@ async def get_balance():
 
 # ══════════════════════════════════════════════════════════════════════
 # _store() — PERMANENT FIX: upsert-in-place for live ticks
-#
-# WHY CANDLES WERE CREATED EVERY SECOND:
-#   Deriv streams "ohlc" WebSocket messages every ~1 second for the
-#   CURRENT bar. Each message has the SAME open-epoch (bar start time)
-#   but updated high/low/close values. The old extend() call appended
-#   a brand-new deque entry for every message, so one 15-minute bar
-#   produced up to 900 duplicate-epoch rows before it even closed.
-#   The chart showed hundreds of micro-candles at the same price.
-#
-# THE FIX:
-#   _upsert_candle() checks the epoch of the incoming row against the
-#   last entry in the deque:
-#     - Same epoch  → REPLACE last entry in-place (live bar update)
-#     - New epoch   → APPEND a new entry (new bar started)
-#   Bulk historical loads (len > 1) always extend as before.
 # ══════════════════════════════════════════════════════════════════════
 def _upsert_candle(buf: deque, row: tuple) -> None:
     """
@@ -1769,6 +1820,9 @@ async def handle_msg(msg: dict):
             if len(state.trade_history) > 50:
                 state.trade_history.pop(0)
 
+            # Log trade to Back4App
+            back4app_log_trade(cid, sig, {"exit": exit_s, "pnl": profit})
+
             buf_for_chart = (state.m15_candles if state.exec_tf == "M15"
                              else state.m5_candles)
             chart = generate_chart(
@@ -1886,6 +1940,9 @@ async def trading_loop():
                     log.info(
                         f"🎯 AUTO EXECUTE {sig['direction']} "
                         f"score:{sig['ob_score']} Mode:{state.trading_mode}")
+                    # Log signal to Back4App
+                    back4app_log_signal(sig)
+
                     reason       = sig.get("reason")
                     buf_for_chart = (state.m15_candles
                                      if state.exec_tf == "M15"
@@ -2451,6 +2508,7 @@ async def main():
     log.info("║  SMC SNIPER EA v5.2 · Multi-Strategy Auto    ║")
     log.info("║ News Shield | Broker Connect | Post-Reports  ║")
     log.info("║  [COMPLETE REWRITE — 3 BUGS FIXED FOREVER]  ║")
+    log.info("║         Back4App Integration Active          ║")
     log.info("╚══════════════════════════════════════════════╝")
     _load_saved_token()
     if not state.deriv_token:
