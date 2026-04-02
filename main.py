@@ -707,56 +707,48 @@ def _swing_pts(df: pd.DataFrame, n: int = 5):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CHART ENGINE v5.9 — 4 bugs fixed from image diagnosis
-# ──────────────────────────────────────────────────────────────────────
-# BUG 1 — Giant red brick candles
-#   Cause: doji_min = actual_range * 0.002  (e.g. 10 * 0.002 = 0.02 pts)
-#   This is LARGER than real M5 Gold bodies (0.05-0.20 pts) so every
-#   candle body was forced up to 0.02 — looked like a thick filled block.
-#   Fix: doji_min = price * 0.000005 (0.5 pip of price, e.g. 0.023 for Gold)
-#        plus BODY_WIDTH reduced to 0.6 so candles have breathing room.
+# CHART ENGINE — permanent fixes for all visual bugs
 #
-# BUG 2 — Volume panel empty / invisible bars
-#   Cause: vol = high - low; in tight M5 consolidation all bars had
-#   high-low range of ~0.10 pts → after /vmax normalisation all bars
-#   had height < 0.01 → invisible at av.set_ylim(0, 1.3).
-#   Fix: Use absolute wick-range values but raise the ylim ceiling and
-#        add a minimum visible bar height of 0.05.
+# PROBLEM SUMMARY (from chart image analysis):
 #
-# BUG 3 — Phantom right-side Y-axis on RSI (28.5-31.5)
-#   Cause: The RSI subplot `ar` shares x-axis with `am`. Matplotlib
-#   auto-creates a secondary y-axis when tick label sizes differ between
-#   sharex panels. The `_ax_s` function styled spines but not twin axes.
-#   Fix: Explicitly call ar.yaxis.set_tick_params + hide right spine.
-#        Also removed sharex linkage for the RSI panel — it doesn't
-#        need time-sync since it's already aligned by index.
+# 1. ALL CANDLES RED BRICKS
+#    doji_min = actual_range * 0.002
+#    With range=10 pts → doji_min=0.02 pts. Real M5 Gold bodies are
+#    0.03-0.15 pts, so doji_min was BIGGER than real bodies. Every
+#    candle was forced to the same giant height. Fix: use a fixed
+#    price-relative minimum of 0.5 pip = price * 0.000005.
 #
-# BUG 4 — Y-axis zoom 10-pt floor crushes candles into thin band
-#   Cause: MIN_RANGE = 10.0 for Gold. On tight M5 data (range = 2 pts)
-#   the floor triggers and forces a 10-pt window. Candles occupy only
-#   2 pts of 10 → all compressed into top 20% of the price panel.
-#   Fix: MIN_RANGE = 2.0 for Gold. Actual zoom = raw_range + 1.0 pt pad
-#        each side. This gives a clean tight view exactly like TradingView.
+# 2. CANDLES CRUSHED INTO TOP 20% OF CHART
+#    MIN_RANGE = 10.0 pts triggered on tight M5 data (range 2-3 pts),
+#    forcing a 10-pt window. Candles occupied only 2-3 pts of 10.
+#    Fix: MIN_RANGE = 2.0 pts. Pad = flat 1.0 pt each side for Gold.
+#
+# 3. PHANTOM RIGHT Y-AXIS (28.5-31.5 on RSI panel)
+#    matplotlib auto-creates twin axes when sharex panels have
+#    different tick label sizes. Fix: explicitly disable right ticks
+#    and right spine on every subplot.
+#
+# 4. VOLUME BARS INVISIBLE
+#    In tight consolidation high-low ≈ 0.10 pts → after /vmax bars
+#    were < 0.08 tall inside ylim(0,1.3) → invisible.
+#    Fix: enforce MIN_VOL_BAR = 0.08 floor.
+#
+# 5. DEDUP GUARD
+#    Even with upsert in _store(), old snapshots in deque can still
+#    have runs of identical OHLC from history-load overlap.
+#    Fix: drop consecutive identical OHLC rows before charting.
 # ══════════════════════════════════════════════════════════════════════
 
 def _resolve_min_range(avg_price: float) -> float:
-    """
-    Tight Y-axis floor.
-    Gold/Indices ≥ 1000 → 2.0 pts  (was 10.0 — caused flat-line crush)
-    Forex         ≥ 1   → 0.002
-    Micro         < 1   → 0.0002
-    """
-    if avg_price >= 1000: return 2.0    # XAU/USD: 1-pt pad each side
+    """Tight Y-axis floor. Gold → 2.0 pts (was 10.0 → crushed candles)."""
+    if avg_price >= 1000: return 2.0    # XAU/USD, US100
     if avg_price >= 10:   return 0.5
     if avg_price >= 1:    return 0.002  # EUR/USD, GBP/USD
     return 0.0002
 
 
-def _dedupe_candles(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Drop consecutive rows where all four OHLC values are identical.
-    Prevents microscopic candles from stale live-tick injections.
-    """
+def _drop_dupe_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop consecutive rows with identical OHLC values."""
     mask = ~(
         (df["open"]  == df["open"].shift(1)) &
         (df["high"]  == df["high"].shift(1)) &
@@ -779,41 +771,37 @@ def generate_chart(
     if len(candles) < 20:
         return None
 
-    # ── Last 60 candles — enough context without crowding ──
+    # ── Last 60 candles ──────────────────────────────────────────────
     df = pd.DataFrame(list(candles)[-60:])
     df.columns = ["time", "open", "high", "low", "close"]
     df = df.astype({"open": float, "high": float,
                     "low":  float, "close": float})
     df.reset_index(drop=True, inplace=True)
 
-    # ── Remove bad / outlier rows ──
+    # ── Remove invalid rows ──
     df = df[(df["open"] > 0) & (df["high"] > 0) &
             (df["low"]  > 0) & (df["close"] > 0)]
     med = df["close"].median()
     df  = df[(df["close"] > med * 0.5) & (df["close"] < med * 2.0)]
-    df  = _dedupe_candles(df)
+    df  = _drop_dupe_rows(df)
     if len(df) < 10:
         return None
     df.reset_index(drop=True, inplace=True)
 
-    # ── Figure layout — 3 rows: price | volume | RSI ──
-    # (removed 4th info-text subplot that caused phantom axis)
+    # ── Layout: 3 panels (price, volume, RSI) ────────────────────────
     fig = plt.figure(figsize=(16, 9), facecolor=BG)
-    gs  = gridspec.GridSpec(
-        3, 1, figure=fig, hspace=0.06,
-        height_ratios=[6, 1.0, 1.4])
-    am = fig.add_subplot(gs[0])            # price / candles
-    av = fig.add_subplot(gs[1], sharex=am) # volume
-    ar = fig.add_subplot(gs[2], sharex=am) # RSI
+    gs  = gridspec.GridSpec(3, 1, figure=fig, hspace=0.06,
+                            height_ratios=[6, 1.0, 1.5])
+    am = fig.add_subplot(gs[0])
+    av = fig.add_subplot(gs[1], sharex=am)
+    ar = fig.add_subplot(gs[2], sharex=am)
     for a in (am, av, ar):
         _ax_s(a)
-
-    # ── BUG 3 FIX: explicitly remove phantom right-side axes ──
-    for a in (am, av, ar):
+        # Fix 3: disable phantom right-side axis on every panel
         a.yaxis.set_tick_params(right=False, labelright=False)
         a.spines["right"].set_visible(False)
 
-    # ── BUG 4 FIX: tight Y-axis — ±1 pt pad for Gold ──────────────────
+    # ── Fix 2: tight Y-axis — 1.0 pt pad each side for Gold ──────────
     raw_min   = df["low"].min()
     raw_max   = df["high"].max()
     raw_range = raw_max - raw_min
@@ -826,7 +814,6 @@ def generate_chart(
         chart_max    = mid + MIN_RANGE / 2.0
         actual_range = MIN_RANGE
     else:
-        # Tight pad: 1.0 pt each side for Gold, 5% for Forex
         pad          = 1.0 if avg_price >= 100 else raw_range * 0.05
         chart_min    = raw_min - pad
         chart_max    = raw_max + pad
@@ -847,10 +834,11 @@ def generate_chart(
         am.add_collection(mc.LineCollection(
             _wick_segs(bear_idx), colors=RC, linewidths=1.1, zorder=2))
 
-    # ── BUG 1 FIX: candle bodies ──
+    # ── Fix 1: candle bodies ──────────────────────────────────────────
     BODY_WIDTH = 0.6
-    # doji_min = 0.5 pip of price (NOT a fraction of chart range)
-    doji_min = avg_price * 0.000005  # 0.5 pip for Gold ≈ 0.023 pts
+    # price * 0.000005 = 0.5 pip (e.g. Gold@4640 → 0.023 pts)
+    # Never bigger than a real candle body — no more brick effect
+    doji_min = avg_price * 0.000005
     for i in bull_idx:
         bot = min(df.loc[i, "open"], df.loc[i, "close"])
         ht  = max(abs(df.loc[i, "close"] - df.loc[i, "open"]), doji_min)
@@ -862,7 +850,7 @@ def generate_chart(
         am.bar(i, ht, bottom=bot, color=RC, width=BODY_WIDTH,
                edgecolor="#d50000", linewidth=0.4, alpha=0.95, zorder=3)
 
-    # Lock y-axis AFTER all bars are drawn
+    # Set axes AFTER drawing all bars (prevents auto-expansion bug)
     am.set_xlim(-1, len(df) + 3)
     am.set_ylim(chart_min, chart_max)
 
@@ -871,54 +859,47 @@ def generate_chart(
 
     # ── EMA 21 + EMA 50 ──
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
-    if (ema21.min() >= chart_min * 0.99 and
-            ema21.max() <= chart_max * 1.01):
+    if ema21.min() >= chart_min * 0.99 and ema21.max() <= chart_max * 1.01:
         am.plot(xs, ema21.values, color="#ffeb3b", lw=1.4,
                 alpha=0.85, zorder=4, label="EMA21")
     if len(df) >= 50:
         ema50 = df["close"].ewm(span=50, adjust=False).mean()
-        if (ema50.min() >= chart_min * 0.99 and
-                ema50.max() <= chart_max * 1.01):
+        if ema50.min() >= chart_min * 0.99 and ema50.max() <= chart_max * 1.01:
             am.plot(xs, ema50.values, color="#78909c", lw=1.2,
                     ls="--", alpha=0.75, zorder=4, label="EMA50")
 
-    # ── BUG 2 FIX: volume bars — absolute range, min visible height ──
-    vol  = (df["high"] - df["low"]).values          # absolute pts
+    # ── Fix 4: volume with minimum bar height ──
+    vol  = (df["high"] - df["low"]).values
     vmax = vol.max() if vol.max() > 0 else 1.0
-    MIN_BAR = 0.08                                   # minimum bar height
+    MIN_V = 0.08
     if bull_idx:
         av.bar(bull_idx,
-               [max(vol[i] / vmax, MIN_BAR) for i in bull_idx],
+               [max(vol[i]/vmax, MIN_V) for i in bull_idx],
                color=BC, alpha=0.75, width=0.65)
     if bear_idx:
         av.bar(bear_idx,
-               [max(vol[i] / vmax, MIN_BAR) for i in bear_idx],
+               [max(vol[i]/vmax, MIN_V) for i in bear_idx],
                color=RC, alpha=0.75, width=0.65)
     av.set_ylim(0, 1.4)
-    av.set_ylabel("Vol", color="#555d68", fontsize=7)
-    av.yaxis.set_tick_params(right=False, labelright=False)
+    av.set_ylabel("Vol", color="#555d68", fontsize=6)
 
     # ── RSI ──
     rsi = _rsi_calc(df["close"].values)
-    ar.plot(xs, rsi, color="#90a4ae", lw=1.3)
-    ar.fill_between(xs, rsi, 70, where=(rsi >= 70),
-                    alpha=0.25, color=RC)
-    ar.fill_between(xs, rsi, 30, where=(rsi <= 30),
-                    alpha=0.25, color=BC)
-    ar.axhline(70, color=RC, lw=0.7, ls="--", alpha=0.7)
+    ar.plot(xs, rsi, color="#90a4ae", lw=1.2)
+    ar.fill_between(xs, rsi, 70, where=(rsi >= 70), alpha=0.2, color=RC)
+    ar.fill_between(xs, rsi, 30, where=(rsi <= 30), alpha=0.2, color=BC)
+    ar.axhline(70, color=RC, lw=0.6, ls="--", alpha=0.6)
     ar.axhline(50, color=GR, lw=0.5, alpha=0.5)
-    ar.axhline(30, color=BC, lw=0.7, ls="--", alpha=0.7)
+    ar.axhline(30, color=BC, lw=0.6, ls="--", alpha=0.6)
     ar.set_ylim(0, 100)
-    ar.set_ylabel("RSI", color="#555d68", fontsize=7)
-    # BUG 3 FIX: explicit left-only ticks, hide right axis
-    ar.yaxis.set_tick_params(right=False, labelright=False)
-    ar.set_yticks([30, 50, 70])
+    ar.set_ylabel("RSI", color="#555d68", fontsize=6)
+    ar.set_yticks([30, 50, 70])   # Fix 3: prevents ghost tick labels
     rsi_v = float(rsi[-1])
     rsi_c = RC if rsi_v > 70 else (BC if rsi_v < 30 else "#90a4ae")
-    ar.text(len(df) - 1, rsi_v, f" {rsi_v:.0f}", color=rsi_c,
+    ar.text(len(df)-1, rsi_v, f" {rsi_v:.0f}", color=rsi_c,
             fontsize=7, va="center", fontfamily="monospace")
 
-    # ── SMC Overlays — OB as filled Rectangle, FVG as hatched box ──
+    # ── SMC overlays — OB as filled Rectangle, FVG as hatched box ──
     from matplotlib.patches import Rectangle
 
     if state.active_ob:
@@ -935,13 +916,12 @@ def generate_chart(
                     color=oc, lw=1.1, alpha=0.9, zorder=5)
             am.plot([xs0, len(df)+2], [ob["low"],  ob["low"]],
                     color=oc, lw=1.1, alpha=0.9, zorder=5)
-            am.text(xs0 + 0.5, ob["high"],
+            am.text(xs0+0.5, ob["high"],
                     f" {ob['type']} OB  {state.ob_score}/100",
                     color=oc, fontsize=7, va="bottom",
                     fontfamily="monospace", zorder=6,
                     bbox=dict(boxstyle="round,pad=0.15",
-                              fc="#0d1117", ec=oc,
-                              alpha=0.80, lw=0.7))
+                              fc="#0d1117", ec=oc, alpha=0.80, lw=0.7))
 
     if state.active_fvg:
         fvg = state.active_fvg
@@ -951,28 +931,23 @@ def generate_chart(
             am.add_patch(Rectangle(
                 (xs0, fvg["low"]), xw, fvg["high"] - fvg["low"],
                 linewidth=1.0, edgecolor=FC, facecolor=FC,
-                alpha=0.13, zorder=3, hatch="///",
-                linestyle="--"))
-            am.text(xs0 + 0.5,
-                    (fvg["high"] + fvg["low"]) / 2,
+                alpha=0.13, zorder=3, hatch="///", linestyle="--"))
+            am.text(xs0+0.5, (fvg["high"]+fvg["low"])/2,
                     " FVG", color=FC, fontsize=7, va="center",
                     fontfamily="monospace", zorder=6)
 
     if state.active_idm:
         idm = state.active_idm
         if _in_range(idm["level"]):
-            am.axhline(idm["level"], color=IC, ls=":", lw=1.3,
-                       alpha=0.9)
+            am.axhline(idm["level"], color=IC, ls=":", lw=1.3, alpha=0.9)
             sw = "SWEPT ✓" if idm.get("swept") else "PENDING"
-            am.text(1, idm["level"], f" IDM {sw}",
-                    color=IC, fontsize=7, va="bottom",
-                    fontfamily="monospace")
+            am.text(1, idm["level"], f" IDM {sw}", color=IC,
+                    fontsize=7, va="bottom", fontfamily="monospace")
 
     if state.active_trap:
         trap = state.active_trap
         if _in_range(trap["level"]):
-            am.axhline(trap["level"], color=TC, ls=":", lw=1.5,
-                       alpha=0.9)
+            am.axhline(trap["level"], color=TC, ls=":", lw=1.5, alpha=0.9)
             am.text(1, trap["level"], f" TRAP {trap['side']}",
                     color=TC, fontsize=7, va="bottom",
                     fontfamily="monospace")
@@ -981,48 +956,40 @@ def generate_chart(
         sig = state.last_signal
         if _in_range(sig["fib_lo"]) and _in_range(sig["fib_hi"]):
             mid2 = (sig["fib_hi"] + sig["fib_lo"]) / 2
-            am.axhline(mid2, color="#78909c", ls="-.", lw=0.6,
-                       alpha=0.4)
+            am.axhline(mid2, color="#78909c", ls="-.", lw=0.6, alpha=0.4)
             am.axhspan(sig["fib_lo"], mid2, alpha=0.04, color=BC)
             am.axhspan(mid2, sig["fib_hi"], alpha=0.04, color=RC)
-            am.text(len(df) - 2, mid2, " 0.5 EQ",
-                    color="#78909c", fontsize=6, ha="right",
-                    fontfamily="monospace")
+            am.text(len(df)-2, mid2, " 0.5 EQ", color="#78909c",
+                    fontsize=6, ha="right", fontfamily="monospace")
 
     if state.last_signal:
         sig = state.last_signal
         if _in_range(sig["entry"]):
-            am.axhline(sig["entry"], color=EC, lw=1.6, ls="-",
-                       zorder=6)
+            am.axhline(sig["entry"], color=EC, lw=1.6, ls="-", zorder=6)
             am.text(len(df)+0.3, sig["entry"],
                     f" E:{sig['entry']:.2f}", color=EC,
                     fontsize=7, va="center", fontfamily="monospace")
         if _in_range(sig["sl"]):
-            am.axhline(sig["sl"], color=SC, lw=1.0, ls="--",
-                       zorder=6)
+            am.axhline(sig["sl"], color=SC, lw=1.0, ls="--", zorder=6)
             am.text(len(df)+0.3, sig["sl"],
                     f" SL:{sig['sl']:.2f}", color=SC,
                     fontsize=7, va="center", fontfamily="monospace")
-        for tk, tc_ in zip(["tp1", "tp2", "tp3"], TPC):
+        for tk, tc_ in zip(["tp1","tp2","tp3"], TPC):
             if tk in sig and _in_range(sig[tk]):
-                am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.",
-                           zorder=5)
+                am.axhline(sig[tk], color=tc_, lw=0.8, ls="-.", zorder=5)
                 am.text(len(df)+0.3, sig[tk],
-                        f" {tk.upper()}:{sig[tk]:.2f}",
-                        color=tc_, fontsize=6.5, va="center",
-                        fontfamily="monospace")
+                        f" {tk.upper()}:{sig[tk]:.2f}", color=tc_,
+                        fontsize=6.5, va="center", fontfamily="monospace")
 
     if entry_price and _in_range(entry_price):
-        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9,
-                   zorder=7)
+        am.axhline(entry_price, color=EC, lw=2.2, alpha=0.9, zorder=7)
         am.annotate(f"▶ ENTRY {entry_price:.2f}",
                     xy=(len(df)-1, entry_price), color=EC,
                     fontsize=8, ha="right", fontfamily="monospace")
 
     if exit_price and _in_range(exit_price):
         xc = BC if (pnl and pnl > 0) else RC
-        am.axhline(exit_price, color=xc, lw=2.0, ls="--",
-                   alpha=0.9, zorder=7)
+        am.axhline(exit_price, color=xc, lw=2.0, ls="--", alpha=0.9, zorder=7)
         ps = f"+{pnl:.2f}" if (pnl and pnl > 0) else f"{pnl:.2f}"
         am.annotate(f"◀ EXIT {exit_price:.2f} P&L:{ps}",
                     xy=(len(df)-1, exit_price), color=xc,
@@ -1051,11 +1018,9 @@ def generate_chart(
 
     # ── Title ──
     tc_ = (BC if state.trend_bias == "BULLISH"
-           else (RC if state.trend_bias == "BEARISH"
-                 else "#90a4ae"))
-    tl  = {"live":  "📡 LIVE",
-           "entry": "🎯 ENTRY",
-           "exit":  "🏁 CLOSED"}.get(chart_type, "")
+           else (RC if state.trend_bias == "BEARISH" else "#90a4ae"))
+    tl  = {"live":"📡 LIVE","entry":"🎯 ENTRY",
+           "exit":"🏁 CLOSED"}.get(chart_type,"")
     blk = " 🚫NEWS" if state.block_trading else ""
     mkt = "🟢" if is_market_open() else "🔴"
     am.set_title(
@@ -1072,23 +1037,25 @@ def generate_chart(
                 f"  Sess:{reason.session}",
                 transform=am.transAxes, fontsize=7, va="top",
                 fontfamily="monospace", color="#cdd9e5",
-                bbox=dict(boxstyle="round,pad=.3",
-                          fc="#161b22", ec="#30363d", alpha=0.88))
+                bbox=dict(boxstyle="round,pad=.3", fc="#161b22",
+                          ec="#30363d", alpha=0.88))
 
-    # ── Info text on RSI panel bottom ──
+    # ── Info bar (on x-axis of RSI panel) ──
     ts_now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     nxt    = state.next_red_event
     nxt_s  = (f" | 🔴{nxt.title[:18]}@"
               f"{nxt.dt_utc.astimezone(NY_TZ).strftime('%H:%Mh')}"
               if nxt and nxt.dt_utc else "")
-    sc_s   = f"Score:{state.ob_score}/100 " if state.ob_score else ""
-    ar.text(0.01, -0.35,
+    sc_s = f"Score:{state.ob_score}/100 " if state.ob_score else ""
+    ar.text(0.0, -0.42,
             f"SMC SNIPER v5.9 [{state.trading_mode}] · "
             f"{state.pair_display}  sym:{state.active_symbol}"
             f"  Bal:{state.account_balance:.2f}{state.account_currency}"
             f"  Risk:{state.risk_pct*100:.0f}%  {sc_s}"
-            f"H1:{len(state.h1_candles)} M15:{len(state.m15_candles)}"
-            f" M5:{len(state.m5_candles)} M1:{len(state.m1_candles)}"
+            f"H1:{len(state.h1_candles)} "
+            f"M15:{len(state.m15_candles)} "
+            f"M5:{len(state.m5_candles)} "
+            f"M1:{len(state.m1_candles)}"
             f"{nxt_s}  {ts_now}",
             transform=ar.transAxes,
             color="#444d56", fontsize=6, va="top",
@@ -1096,12 +1063,10 @@ def generate_chart(
 
     plt.setp(am.get_xticklabels(), visible=False)
     plt.setp(av.get_xticklabels(), visible=False)
-    # Show time labels only on RSI panel
     ar.tick_params(axis="x", labelsize=6, labelcolor="#555d68")
 
     path = f"/tmp/sniper_chart_{chart_type}.png"
-    plt.savefig(path, dpi=130, bbox_inches="tight",
-                facecolor=BG)
+    plt.savefig(path, dpi=130, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
     return path
 def generate_history_chart() -> Optional[str]:
@@ -1549,30 +1514,61 @@ async def get_balance():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# FIX #1: _store() — APPENDS one candle at a time to the persistent deque
-# The deque's maxlen=1000 automatically evicts the oldest candle when full.
-# Historical bulk loads also use extend() so all past data is retained.
+# _store() — PERMANENT FIX: upsert-in-place for live ticks
+#
+# WHY CANDLES WERE CREATED EVERY SECOND:
+#   Deriv streams "ohlc" WebSocket messages every ~1 second for the
+#   CURRENT bar. Each message has the SAME open-epoch (bar start time)
+#   but updated high/low/close values. The old extend() call appended
+#   a brand-new deque entry for every message, so one 15-minute bar
+#   produced up to 900 duplicate-epoch rows before it even closed.
+#   The chart showed hundreds of micro-candles at the same price.
+#
+# THE FIX:
+#   _upsert_candle() checks the epoch of the incoming row against the
+#   last entry in the deque:
+#     - Same epoch  → REPLACE last entry in-place (live bar update)
+#     - New epoch   → APPEND a new entry (new bar started)
+#   Bulk historical loads (len > 1) always extend as before.
 # ══════════════════════════════════════════════════════════════════════
-def _store(nom: int, rows: list):
+def _upsert_candle(buf: deque, row: tuple) -> None:
     """
-    Append candle rows to the correct deque buffer.
-    Using append() (not assignment) ensures the deque never loses history.
-    maxlen=1000 handles automatic eviction of the oldest candle.
+    row = (epoch, open, high, low, close)
+    If last entry has same epoch → update in-place (same bar, new tick).
+    Otherwise → append (new bar started).
     """
+    if buf and buf[-1][0] == row[0]:
+        buf[-1] = row   # same bar: update OHLC in-place
+    else:
+        buf.append(row) # new bar: append fresh entry
+
+
+def _store(nom: int, rows: list) -> None:
+    """
+    Route rows to the correct candle buffer.
+    Single row  (live tick) → upsert (update-in-place if same epoch).
+    Multiple rows (history) → extend as before.
+    """
+    if not rows:
+        return
+
+    def _put(buf: deque) -> None:
+        if len(rows) == 1:
+            _upsert_candle(buf, rows[0])
+        else:
+            buf.extend(rows)
+
     if nom == 3600:
-        state.h1_candles.extend(rows)
+        _put(state.h1_candles)
     elif nom == 900:
-        state.m15_candles.extend(rows)
-        if rows:
-            state.current_price = float(rows[-1][4])
+        _put(state.m15_candles)
+        state.current_price = float(rows[-1][4])
     elif nom == 300:
-        state.m5_candles.extend(rows)
-        if rows:
-            state.current_price = float(rows[-1][4])
+        _put(state.m5_candles)
+        state.current_price = float(rows[-1][4])
     elif nom == 60:
-        state.m1_candles.extend(rows)
-        if rows:
-            state.current_price = float(rows[-1][4])
+        _put(state.m1_candles)
+        state.current_price = float(rows[-1][4])
 
 
 async def _fetch(sym: str, nom: int) -> int:
